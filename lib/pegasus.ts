@@ -166,28 +166,34 @@ export interface SegmentDefinition {
 }
 
 /**
- * The user's EXACT 4 segment definitions (from the TwelveLabs playground
- * screenshots). ONLY the PART A / PART B timings are interpolated — everything
- * else is verbatim. All four are required: segment_1–3 are supporting context
- * that make segment_4 (the only one that decides Gemini minutes) accurate.
+ * ACCURACY-FIRST two-task design (playground test analysis se sudhara):
+ *
+ * TASK A (short video ONLY — tiny input, time-bound violations impossible):
+ *   segment_1 shot cuts, segment_2 person tracking, segment_3 text overlays.
+ *
+ * TASK B (merged video — FULL token budget sirf matching ke liye):
+ *   segment_4 PART A → PART B frame matching. Playground me example
+ *   timestamp "(e.g. 00:05:52)" ne model ko anchor kar diya tha (pehle ~47
+ *   matches sab wahi value the) — is liye example REMOVED, strict format
+ *   rules + anti-anchoring instructions added, faltu fields (type_part,
+ *   confidence) hataye taaki tokens matching par kharch hon.
  */
-export function buildSegmentDefinitions(shortEndSec: number, mergedEndSec: number): SegmentDefinition[] {
+
+/** Segments 1–3 — run on the SHORT (PART A) video alone. */
+export function buildPartADefinitions(shortEndSec: number): SegmentDefinition[] {
   const shortEnd = hms(shortEndSec)
-  const partBStart = hms(shortEndSec + 1)
-  const mergedEnd = hms(mergedEndSec)
   return [
     {
       id: 'segment_1',
-      description: `Detect every shot cut in PART A only (00:00 to ${shortEnd}). Find real editorial cuts where image changes to new shot. Output each shot with start/end time.`,
+      description: `Detect every shot cut in this video (00:00:00 to ${shortEnd}). Find real editorial cuts where the image changes to a new shot. Output each shot with its start/end time. Segments must have IRREGULAR durations matching the real cuts - do not output uniform fixed-length segments.`,
       fields: [
         { name: 'type_angle_type', type: 'string', description: 'Camera angle: wide, medium, close_up, overhead, aerial' },
         { name: 'type_description', type: 'string', description: 'Who is in frame, action, background' },
-        { name: 'type_part', type: 'string', description: 'PART A or PART B' },
       ],
     },
     {
       id: 'segment_2',
-      description: `Track every person visible in PART A (00:00 to ${shortEnd}). For each new person appearing on screen create a new segment.`,
+      description: `Track every person visible in this video (00:00:00 to ${shortEnd}). For each new person appearing on screen create a new segment.`,
       fields: [
         { name: 'person', type: 'string', description: 'Physical description of person - clothing, hair, distinguishing features' },
         { name: 'activity', type: 'string', description: 'What the person is doing in this segment' },
@@ -196,20 +202,32 @@ export function buildSegmentDefinitions(shortEndSec: number, mergedEndSec: numbe
     },
     {
       id: 'segment_3',
-      description: `Detect all burned-in text overlays visible in PART A (00:00 to ${shortEnd}). These are text captions added on top of movie frames by the uploader. Ignore original movie subtitles.`,
+      description: `Detect all burned-in text overlays visible in this video (00:00:00 to ${shortEnd}). These are text captions added on top of movie frames by the uploader. Ignore original movie subtitles.`,
       fields: [
         { name: 'text_content', type: 'string', description: 'Exact text visible on screen as overlay' },
         { name: 'is_overlay', type: 'boolean', description: 'Is this text burned on top of video by uploader (not original movie text)' },
         { name: 'position', type: 'string', description: 'Where on screen is the text' },
       ],
     },
+  ]
+}
+
+/** segment_4 ALONE — run on the MERGED video with the full token budget. */
+export function buildMatchDefinitions(shortEndSec: number, mergedEndSec: number): SegmentDefinition[] {
+  const shortEnd = hms(shortEndSec)
+  const partBStart = hms(shortEndSec + 1)
+  const mergedEnd = hms(mergedEndSec)
+  return [
     {
       id: 'segment_4',
-      description: `This video has TWO parts. PART A (00:00 to ${shortEnd}) is a short edited reel. PART B (${partBStart} to ${mergedEnd}) is the full original movie. For each PART A clip, find matching frames in PART B. Output part_b_timestamp in format hh:mm:ss (e.g. 00:05:52). Segments must have IRREGULAR durations — real cuts only. Jo match ho`,
+      description:
+        `This video has TWO parts. PART A (00:00:00 to ${shortEnd}) is a short edited reel made from clips of a movie. PART B (${partBStart} to ${mergedEnd}) is the full original movie. ` +
+        `Create segments ONLY inside PART A (every segment start_time and end_time must be between 00:00:00 and ${shortEnd}). Each segment is one editorial cut / continuous shot of PART A. Segments must have IRREGULAR durations matching the real cuts. ` +
+        `For each PART A segment, visually search PART B and report the timestamp in PART B where the SAME frames appear (same actors, same action, same background). Ignore any burned-in text overlays when matching - compare the underlying movie frames only. ` +
+        `part_b_timestamp rules: format strictly hh:mm:ss with leading zeros; the value MUST be between ${partBStart} and ${mergedEnd}; each segment's timestamp must come from actually locating that scene in PART B - different PART A scenes normally map to DIFFERENT PART B timestamps, so never repeat one timestamp as a filler. If you cannot find the scene in PART B, output NO_MATCH instead of guessing.`,
       fields: [
-        { name: 'part_b_timestamp', type: 'string', description: 'Matching timestamp in PART B movie where same frames appear' },
-        { name: 'match_type', type: 'string', description: 'Type of match found' },
-        { name: 'confidence', type: 'string', description: 'Confidence level of match' },
+        { name: 'part_b_timestamp', type: 'string', description: 'Timestamp in PART B (hh:mm:ss) where the same frames appear, or NO_MATCH if not found' },
+        { name: 'match_type', type: 'string', description: 'exact / near-duplicate / NO_MATCH' },
         { name: 'proof', type: 'string', description: '5 words describing what makes these frames identical - actor, action, background' },
       ],
     },
@@ -327,21 +345,58 @@ export async function pollSegmentationTask(
 
 // ---------- segment_4 → minute suggestions ----------
 
+/** A timestamp value repeated this many+ times = anchoring/filler spam. */
+const REPEAT_SPAM_THRESHOLD = 5
+
 /**
  * Build the "in movie minutes ko check karna hai" list from segment_4.
  * part_b_timestamp is MERGED-video time — original-movie seconds =
- * mergedSec − shortDuration. Values already inside PART A (< shortDuration)
- * are skipped (model confusion) — caller logs how many were dropped.
+ * mergedSec − shortDuration.
+ *
+ * Validation (playground failure modes se seekha):
+ * - NO_MATCH / empty → skip
+ * - Segment jo PART A ke bahar start hota hai (model PART B me wander) → skip
+ * - Timestamp PART A ke andar ya movie duration ke bahar → skip
+ * - Ek hi exact timestamp REPEAT_SPAM_THRESHOLD+ baar (anchoring spam,
+ *   e.g. playground me "00:05:52" ×47) → un sab entries ko suspicious
+ *   maan kar drop karo
  */
 export function buildMinuteSuggestions(
   segment4: PegasusSegment[],
   shortDuration: number,
-): { suggestions: MinuteSuggestion[]; skipped: number } {
-  const buckets = new Map<number, { count: number; confidences: string[]; windows: { start: number; end: number }[] }>()
-  let skipped = 0
+  movieDuration?: number,
+): { suggestions: MinuteSuggestion[]; skipped: number; suspicious: number } {
+  // Pass 1: count exact timestamp values to detect anchoring/filler spam.
+  const tsCounts = new Map<string, number>()
   for (const seg of segment4) {
     const ts = seg.metadata?.part_b_timestamp
-    if (ts === undefined || ts === null || ts === '') {
+    if (ts === undefined || ts === null) continue
+    const key = String(ts).trim()
+    if (key === '' || key.toUpperCase() === 'NO_MATCH') continue
+    tsCounts.set(key, (tsCounts.get(key) || 0) + 1)
+  }
+  const spamValues = new Set<string>()
+  for (const [key, count] of tsCounts) {
+    if (count >= REPEAT_SPAM_THRESHOLD) spamValues.add(key)
+  }
+
+  const buckets = new Map<number, { count: number; confidences: string[]; windows: { start: number; end: number }[] }>()
+  let skipped = 0
+  let suspicious = 0
+  for (const seg of segment4) {
+    const tsRaw = seg.metadata?.part_b_timestamp
+    const ts = tsRaw === undefined || tsRaw === null ? '' : String(tsRaw).trim()
+    if (ts === '' || ts.toUpperCase() === 'NO_MATCH') {
+      skipped++
+      continue
+    }
+    if (spamValues.has(ts)) {
+      // Same value spammed across many segments — anchored/filler, not a real match.
+      suspicious++
+      continue
+    }
+    if (seg.start >= shortDuration) {
+      // Segment PART A ke bahar hai — model ne bound ignore kiya, trust nahi.
       skipped++
       continue
     }
@@ -352,10 +407,15 @@ export function buildMinuteSuggestions(
       skipped++
       continue
     }
+    if (movieDuration !== undefined && movieSec > movieDuration + 60) {
+      // Movie ke end se aage ka timestamp — hallucination, skip.
+      skipped++
+      continue
+    }
     const minute = Math.floor(movieSec / 60)
     const bucket = buckets.get(minute) || { count: 0, confidences: [], windows: [] }
     bucket.count++
-    const conf = seg.metadata?.confidence
+    const conf = seg.metadata?.confidence ?? seg.metadata?.match_type
     if (conf !== undefined && conf !== null && String(conf).trim() !== '') bucket.confidences.push(String(conf))
     // PART A window this scene came from (short seconds, clamped to PART A).
     const wStart = Math.max(0, Math.min(seg.start, shortDuration))
@@ -371,5 +431,5 @@ export function buildMinuteSuggestions(
       confidences: b.confidences,
       shortWindows: b.windows,
     }))
-  return { suggestions, skipped }
+  return { suggestions, skipped, suspicious }
 }
