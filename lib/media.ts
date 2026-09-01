@@ -7,6 +7,7 @@ import { getScan, saveScan, addLog, scanMediaDir } from './store'
 import type { Scan } from './types'
 import { probeDuration, chunkShort, cleanupSegments } from './ffmpeg'
 import { CHUNK_SECONDS } from './models'
+import { deleteEmbeddings } from './twelvelabs'
 
 export type MediaKind = 'short' | 'movie'
 
