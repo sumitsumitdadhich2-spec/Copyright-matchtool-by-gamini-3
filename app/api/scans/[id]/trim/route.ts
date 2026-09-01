@@ -4,6 +4,9 @@ import { getScan, saveScan, addLog, scanMediaDir } from '@/lib/store'
 import { ensureLocalMedia } from '@/lib/media'
 import { chunkMovie } from '@/lib/ffmpeg'
 import { CHUNK_SECONDS } from '@/lib/models'
+import { getSession } from '@/lib/users'
+import { getUserTwelveLabsKey } from '@/lib/user-keys'
+import { startMergePipeline, pipelineReady, isPipelineRunning } from '@/lib/merge-pipeline'
 
 export const runtime = 'nodejs'
 export const maxDuration = 300
@@ -57,6 +60,29 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
       : `Trim confirmed: ${fmtDur(start)} → ${fmtDur(end)} (${fmtDur(rangeDur)}) — cutting ONLY this range into ${count} chunk(s); reported movie timestamps stay absolute to the original`,
   )
   saveScan(scan)
+
+  // AUTO MERGE PIPELINE trigger: trim confirm hone ke baad, agar short bhi
+  // uploaded hai + user ki TwelveLabs key set hai → merge → upload → index →
+  // Pegasus segmentation pipeline apne aap chalti hai (fire-and-forget).
+  // Merge HAMESHA full movie par hota hai — trim sirf Gemini chunks ke liye.
+  try {
+    if (pipelineReady(scan) && !isPipelineRunning(id)) {
+      const st = scan.mergePipeline?.status
+      // Fresh trims only — running/complete/error states need explicit UI action.
+      if (!st || st === 'idle') {
+        const session = await getSession()
+        const tlKey = session ? await getUserTwelveLabsKey(session.username) : null
+        if (!tlKey) {
+          addLog(scan, 'info', 'TwelveLabs key nahi — auto merge pipeline skip, app normal flow me chalega')
+          saveScan(scan)
+        } else {
+          startMergePipeline(id, tlKey)
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[trim] merge pipeline auto-trigger failed:', err instanceof Error ? err.message : err)
+  }
 
   const mediaDir = scanMediaDir(id)
   const dest = path.join(mediaDir, 'movie.mp4')

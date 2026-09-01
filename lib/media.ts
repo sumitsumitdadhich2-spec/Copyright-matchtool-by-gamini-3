@@ -102,6 +102,23 @@ export async function finalizeUploadedMedia(
   const size = fs.statSync(/*turbopackIgnore: true*/ dest).size
   const mediaDir = scanMediaDir(id)
 
+  // A fresh short/movie upload invalidates any previous auto-merge pipeline
+  // output — stale merged.mp4 / asset / embeddings / segmentation must never
+  // be reused (dono kinds ki embeddings ek hi merged index se aati hain).
+  try {
+    const staleMerged = path.join(mediaDir, 'merged.mp4')
+    if (fs.existsSync(/*turbopackIgnore: true*/ staleMerged)) fs.unlinkSync(staleMerged)
+  } catch {
+    // ignore cleanup failure
+  }
+  if (scan.mergePipeline && scan.mergePipeline.status !== 'idle') {
+    scan.mergePipeline = { status: 'idle' }
+  }
+  await Promise.all([deleteEmbeddings(id, 'short'), deleteEmbeddings(id, 'movie')])
+  if (scan.twelveLabs && scan.twelveLabs.status !== 'none') {
+    scan.twelveLabs = { status: 'none' }
+  }
+
   let duration: number
   try {
     duration = await probeDuration(dest)

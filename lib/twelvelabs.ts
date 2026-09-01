@@ -3,7 +3,7 @@ import 'server-only'
 import fs from 'node:fs'
 import path from 'node:path'
 import { openAsBlob } from 'node:fs'
-import { put, get } from '@vercel/blob'
+import { put, get, del } from '@vercel/blob'
 import { scanMediaDir } from './store'
 import { normalizeForTwelveLabs } from './ffmpeg'
 import { CHUNK_SECONDS } from './models'
@@ -271,6 +271,22 @@ export async function saveEmbeddings(scanId: string, kind: 'movie' | 'short', da
     })
   } catch {
     // Blob backup is best-effort — the local copy still works this session
+  }
+}
+
+/** Delete saved embeddings (local + Blob) — used when a video is re-uploaded
+ *  so a stale merged-index split can never be reused. Best-effort. */
+export async function deleteEmbeddings(scanId: string, kind: 'movie' | 'short'): Promise<void> {
+  try {
+    const local = embFile(scanId, kind)
+    if (fs.existsSync(local)) fs.unlinkSync(local)
+  } catch {
+    // best-effort
+  }
+  try {
+    await del(embBlobPath(scanId, kind))
+  } catch {
+    // best-effort
   }
 }
 
