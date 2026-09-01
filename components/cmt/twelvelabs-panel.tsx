@@ -1,89 +1,103 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import useSWR from 'swr'
-import { Layers, Loader2, Check, AlertTriangle, Filter, Clock, Zap } from 'lucide-react'
-import type { Scan, TwelveLabsState, PrefilterInfo } from '@/lib/types'
+import { Layers, Loader2, Check, AlertTriangle, Filter, Zap, RotateCcw, Play } from 'lucide-react'
+import type { Scan, TwelveLabsState, PrefilterInfo, MergePipelineState, MergePipelineStatus } from '@/lib/types'
 import { fetcher } from '@/lib/format'
+import { MinuteApproval } from './minute-approval'
 
-interface TLStatusResponse {
+interface PipelineResponse {
   hasKey: boolean
+  ready: boolean
+  running: boolean
+  pipeline: MergePipelineState
   twelveLabs: TwelveLabsState
-  embeddingsSaved: boolean
-  embeddingsCount: number
   prefilter: PrefilterInfo | null
 }
 
-/** Stage-based indexing progress (TL koi % nahi deta — stage se estimate). */
-function stagePct(progress?: string): number {
-  if (!progress) return 5
-  const p = progress.toLowerCase()
-  if (p.includes('download')) return 90
-  if (p.includes('indexing')) return 55
-  if (p.includes('upload')) return 18
-  return 8
+/** Ordered pipeline steps for the timeline UI. */
+const STEPS: { key: MergePipelineStatus; label: string }[] = [
+  { key: 'checking', label: 'Compat check' },
+  { key: 'merging', label: 'Merge' },
+  { key: 'uploading', label: 'Upload' },
+  { key: 'indexing', label: 'Index' },
+  { key: 'splitting', label: 'Split' },
+  { key: 'segmenting', label: 'Segmentation' },
+  { key: 'suggesting', label: 'Minute list' },
+]
+
+const ACTIVE_STATUSES: MergePipelineStatus[] = [
+  'checking',
+  'merging',
+  'uploading',
+  'indexing',
+  'splitting',
+  'segmenting',
+  'suggesting',
+]
+
+function stepIndex(status: MergePipelineStatus): number {
+  const i = STEPS.findIndex((s) => s.key === status)
+  if (i >= 0) return i
+  if (status === 'awaiting_approval' || status === 'approved') return STEPS.length
+  return -1
 }
 
-function fmtDur(ms: number): string {
-  const totalSec = Math.max(0, Math.round(ms / 1000))
-  const m = Math.floor(totalSec / 60)
-  const s = totalSec % 60
-  return m > 0 ? `${m}m ${s}s` : `${s}s`
+function fmtDur(sec: number): string {
+  const s = Math.round(sec)
+  const h = Math.floor(s / 3600)
+  const m = Math.floor((s % 3600) / 60)
+  const ss = s % 60
+  return h > 0 ? `${h}h ${String(m).padStart(2, '0')}m ${String(ss).padStart(2, '0')}s` : `${m}m ${ss}s`
 }
 
-/** SEPARATE optional section at the top of the app. Twelve Labs is a pure
- *  pre-filter — without a key (or on any error) the existing Gemini flow
- *  runs 100% unchanged (normal full scan). */
+/** AUTO PIPELINE panel: merge → TwelveLabs upload → Marengo index →
+ *  Pegasus segmentation → minute list → user approval → Gemini scan.
+ *  Replaces the old manual "Index Movie on Twelve Labs" flow. Without a
+ *  TwelveLabs key the section hides and the app runs 100% as before. */
 export function TwelveLabsPanel({ scan }: { scan: Scan }) {
-  const [starting, setStarting] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  // 1s tick for the live elapsed timer during indexing.
-  const [, setTick] = useState(0)
+  const [acting, setActing] = useState(false)
+  const [actionError, setActionError] = useState<string | null>(null)
 
-  const { data, mutate } = useSWR<TLStatusResponse>(
-    scan.id ? `/api/scans/${scan.id}/twelvelabs` : null,
+  const { data, mutate } = useSWR<PipelineResponse>(
+    scan.id ? `/api/scans/${scan.id}/merge-pipeline` : null,
     fetcher,
     {
-      refreshInterval: (latest) => (latest?.twelveLabs?.status === 'indexing' ? 3000 : 15000),
+      refreshInterval: (latest) =>
+        latest && (ACTIVE_STATUSES.includes(latest.pipeline?.status) || latest.running) ? 3000 : 15000,
     },
   )
 
-  const tl = data?.twelveLabs ?? scan.twelveLabs ?? { status: 'none' as const }
-  const hasKey = data?.hasKey ?? false
-  const indexed = tl.status === 'ready' || (data?.embeddingsSaved ?? false)
-  const indexing = tl.status === 'indexing'
-  const prefilter = data?.prefilter ?? scan.prefilter ?? null
-  const movieReady = Boolean(scan.movieDuration) && !scan.awaitingTrim
+  // Key na ho to section bilkul na dikhe — app 100% normal chalta hai.
+  if (!data || !data.hasKey) return null
 
-  useEffect(() => {
-    if (!indexing) return
-    const t = setInterval(() => setTick((x) => x + 1), 1000)
-    return () => clearInterval(t)
-  }, [indexing])
+  const pipeline = data.pipeline ?? { status: 'idle' as const }
+  const status = pipeline.status
+  const prefilter = data.prefilter ?? scan.prefilter ?? null
+  const isActive = ACTIVE_STATUSES.includes(status) || data.running
+  const currentStep = stepIndex(status)
+  const isError = status === 'error'
+  const isDone = status === 'awaiting_approval' || status === 'approved'
 
-  // Key na ho (ya status abhi load ho raha ho) to section bilkul na dikhe —
-  // app 100% normal dikhta aur chalta hai. Key dalte hi section aa jata hai.
-  if (!data || !hasKey) return null
-
-  async function startIndexing() {
-    setStarting(true)
-    setError(null)
-    const res = await fetch(`/api/scans/${scan.id}/twelvelabs`, { method: 'POST' })
-    setStarting(false)
+  async function post(action: 'start' | 'retry') {
+    setActing(true)
+    setActionError(null)
+    const res = await fetch(`/api/scans/${scan.id}/merge-pipeline`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action }),
+    })
+    setActing(false)
     if (!res.ok) {
-      const j = await res.json().catch(() => ({}))
-      setError(j.error || 'Indexing start failed')
+      const j = (await res.json().catch(() => ({}))) as { error?: string }
+      setActionError(j.error || 'Pipeline start failed')
     }
     void mutate()
   }
 
-  const elapsed = tl.startedAt ? Date.now() - tl.startedAt : 0
-  // Rough estimate: upload + indexing time roughly scales with movie length.
-  const estimateMin = scan.movieDuration ? Math.max(3, Math.round((scan.movieDuration / 60) * 0.15)) : null
-  const pct = stagePct(tl.progress)
-
-  // PER-MINUTE PLAN (Twelve Labs): har short minute ke liye kitne chunks scan/verify
-  // honge, kitne windows expected hain, kitne match mile, early-stop ne kitne bachaye.
+  // PER-MINUTE PLAN (Twelve Labs pre-filter): har short minute me kitne chunks
+  // scan/verify honge + live progress (unchanged from the old panel).
   const minuteRows = (scan.shortSegments || [])
     .filter((s) => s.selected !== false && Array.isArray(s.prefilterChunks) && s.prefilterChunks.length > 0)
     .map((s) => {
@@ -102,94 +116,142 @@ export function TwelveLabsPanel({ scan }: { scan: Scan }) {
     })
 
   return (
-    <section aria-label="Twelve Labs pre-filter" className="panel">
+    <section aria-label="Auto merge pipeline" className="panel">
       <div className="flex flex-wrap items-center gap-2">
         <Layers className="size-4 text-primary" aria-hidden />
         <h2 className="text-sm font-semibold">
-          Twelve Labs Pre-Filter <span className="font-normal text-muted-foreground">(Optional)</span>
+          Auto Pipeline <span className="font-normal text-muted-foreground">(Merge → Index → Segmentation)</span>
         </h2>
         <div className="ml-auto flex flex-wrap items-center gap-2">
-          {!hasKey ? (
-            <span className="rounded-full bg-secondary px-2.5 py-0.5 text-xs text-muted-foreground">
-              key not set — normal full scan
-            </span>
-          ) : indexed ? (
-            <span className="flex items-center gap-1 rounded-full bg-success/15 px-2.5 py-0.5 text-xs text-success">
-              <Check className="size-3" aria-hidden />
-              Movie indexed{tl.segmentCount ? ` — ${tl.segmentCount} segments` : ''}
-            </span>
-          ) : indexing ? (
+          {isActive ? (
             <span className="flex items-center gap-1 rounded-full border border-primary/30 bg-primary/15 px-2.5 py-0.5 text-xs text-primary">
               <Loader2 className="size-3 animate-spin" aria-hidden />
-              Indexing...
+              Running...
             </span>
+          ) : status === 'awaiting_approval' ? (
+            <span className="rounded-full border border-warning/40 bg-warning/15 px-2.5 py-0.5 text-xs text-warning">
+              Approval ka wait
+            </span>
+          ) : status === 'approved' ? (
+            <span className="flex items-center gap-1 rounded-full bg-success/15 px-2.5 py-0.5 text-xs text-success">
+              <Check className="size-3" aria-hidden />
+              Approved — Gemini chal raha hai
+            </span>
+          ) : isError ? (
+            <span className="rounded-full bg-destructive/15 px-2.5 py-0.5 text-xs text-destructive">Error</span>
           ) : (
-            <span className="rounded-full bg-secondary px-2.5 py-0.5 text-xs text-muted-foreground">not indexed</span>
+            <span className="rounded-full bg-secondary px-2.5 py-0.5 text-xs text-muted-foreground">
+              {data.ready ? 'ready to start' : 'short + movie + trim ka wait'}
+            </span>
           )}
-          {hasKey && !indexed && (
+          {status === 'idle' && data.ready && !isActive && (
             <button
               type="button"
-              onClick={() => startIndexing()}
-              disabled={starting || indexing || !movieReady}
-              title={!movieReady ? 'Pehle movie upload/trim complete karo' : 'Index the movie on Twelve Labs'}
-              className="btn-press rounded-lg bg-primary px-3 py-1.5 text-xs font-semibold text-primary-foreground shadow-sm disabled:opacity-40"
+              onClick={() => post('start')}
+              disabled={acting}
+              className="btn-press flex items-center gap-1 rounded-lg bg-primary px-3 py-1.5 text-xs font-semibold text-primary-foreground shadow-sm disabled:opacity-40"
             >
-              {starting || indexing ? 'Indexing...' : 'Index Movie on Twelve Labs'}
+              <Play className="size-3" aria-hidden />
+              {acting ? 'Starting...' : 'Start Auto Pipeline'}
+            </button>
+          )}
+          {isError && !isActive && (
+            <button
+              type="button"
+              onClick={() => post('retry')}
+              disabled={acting}
+              className="btn-press flex items-center gap-1 rounded-lg bg-primary px-3 py-1.5 text-xs font-semibold text-primary-foreground shadow-sm disabled:opacity-40"
+            >
+              <RotateCcw className="size-3" aria-hidden />
+              {acting ? 'Retrying...' : 'Retry'}
             </button>
           )}
         </div>
       </div>
 
-      {/* LIVE INDEXING TRACKING: stage progress bar + elapsed + rough estimate */}
-      {indexing && (
-        <div className="mt-3 space-y-1.5">
-          <div className="flex items-center justify-between gap-2 text-xs">
-            <span className="flex items-center gap-1.5 text-muted-foreground">
-              <Loader2 className="size-3 animate-spin text-primary" aria-hidden />
-              {tl.progress || 'Working...'}
-            </span>
-            <span className="flex items-center gap-1 tabular-nums text-muted-foreground">
-              <Clock className="size-3" aria-hidden />
-              {tl.startedAt ? fmtDur(elapsed) : '--'}
-              {estimateMin ? ` / ~${estimateMin}m estimate` : ''}
-            </span>
-          </div>
-          <div
-            role="progressbar"
-            aria-valuenow={pct}
-            aria-valuemin={0}
-            aria-valuemax={100}
-            aria-label="Twelve Labs indexing progress"
-            className="h-1.5 w-full overflow-hidden rounded-full bg-secondary"
-          >
-            <div className="h-full rounded-full bg-primary transition-all duration-700" style={{ width: `${pct}%` }} />
-          </div>
+      {/* STEP TIMELINE */}
+      {(isActive || isDone || isError) && (
+        <ol className="mt-3 flex flex-wrap items-center gap-x-1 gap-y-2" aria-label="Pipeline steps">
+          {STEPS.map((step, i) => {
+            const done = currentStep > i || (isDone && i < STEPS.length)
+            const active = isActive && currentStep === i
+            const failed = isError && currentStep === i
+            return (
+              <li key={step.key} className="flex items-center gap-1">
+                <span
+                  className={`flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] ${
+                    done
+                      ? 'bg-success/15 text-success'
+                      : active
+                        ? 'border border-primary/30 bg-primary/15 text-primary'
+                        : failed
+                          ? 'bg-destructive/15 text-destructive'
+                          : 'bg-secondary text-muted-foreground'
+                  }`}
+                >
+                  {done ? (
+                    <Check className="size-3" aria-hidden />
+                  ) : active ? (
+                    <Loader2 className="size-3 animate-spin" aria-hidden />
+                  ) : failed ? (
+                    <AlertTriangle className="size-3" aria-hidden />
+                  ) : null}
+                  {step.label}
+                </span>
+                {i < STEPS.length - 1 && <span className="text-muted-foreground/50" aria-hidden>{'→'}</span>}
+              </li>
+            )
+          })}
+        </ol>
+      )}
+
+      {/* LIVE PROGRESS NOTE */}
+      {isActive && pipeline.progress && (
+        <p className="mt-2 flex items-center gap-1.5 text-xs text-muted-foreground">
+          <Loader2 className="size-3 animate-spin text-primary" aria-hidden />
+          {pipeline.progress}
+        </p>
+      )}
+
+      {/* MERGE INFO */}
+      {pipeline.mergedDuration ? (
+        <p className="mt-2 text-xs text-muted-foreground">
+          Merged: PART A (short {pipeline.shortEnd ? fmtDur(pipeline.shortEnd) : '--'}) + PART B (movie) = total{' '}
+          {fmtDur(pipeline.mergedDuration)} — ek hi upload, ek hi index.
+        </p>
+      ) : null}
+
+      {/* ERROR + FALLBACK HINT */}
+      {isError && pipeline.error && (
+        <div className="mt-2 space-y-1">
+          <p className="flex items-start gap-1.5 text-xs text-destructive">
+            <AlertTriangle className="mt-0.5 size-3 shrink-0" aria-hidden />
+            <span>{pipeline.error}</span>
+          </p>
           <p className="text-[11px] text-muted-foreground">
-            Stage: {pct < 30 ? 'Upload' : pct < 80 ? 'Indexing (Marengo embeddings)' : 'Embeddings download'} — ye
-            one-time kaam hai, har scan me reuse hota hai.
+            Fallback: neeche minute-select panel se manual {'"Full scan"'} hamesha chala sakte ho — wo is pipeline par
+            depend nahi karta.
           </p>
         </div>
       )}
 
-      {/* DONE: kitna time laga pura kaam hone me */}
-      {indexed && tl.totalMs ? (
-        <p className="mt-2 flex items-center gap-1.5 text-xs text-muted-foreground">
-          <Clock className="size-3" aria-hidden />
-          Indexing me total {fmtDur(tl.totalMs)} laga (upload → index → embeddings download).
-        </p>
-      ) : null}
+      {actionError && <p className="mt-2 text-xs text-destructive">{actionError}</p>}
 
-      {tl.status === 'error' && tl.error && (
-        <p className="mt-2 flex items-start gap-1.5 text-xs text-warning">
-          <AlertTriangle className="mt-0.5 size-3 shrink-0" aria-hidden />
-          <span>
-            Indexing error: {tl.error} — koi problem nahi, scan normal FULL mode me chalega (accuracy 100% safe).
-          </span>
+      {/* APPROVAL STEP: Pegasus segment_4 minute list */}
+      {status === 'awaiting_approval' && pipeline.minuteSuggestions && pipeline.minuteSuggestions.length > 0 && (
+        <MinuteApproval scanId={scan.id} suggestions={pipeline.minuteSuggestions} onApproved={() => void mutate()} />
+      )}
+
+      {/* APPROVED SUMMARY */}
+      {status === 'approved' && pipeline.approvedMinutes && pipeline.approvedMinutes.length > 0 && (
+        <p className="mt-2 flex items-center gap-1.5 text-xs text-success">
+          <Check className="size-3" aria-hidden />
+          Approved minutes: {pipeline.approvedMinutes.map((m) => m + 1).join(', ')} — Gemini sirf inhi par compare kar
+          raha hai.
         </p>
       )}
 
-      {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
-
+      {/* PRE-FILTER RESULT (existing lower section, unchanged) */}
       {prefilter && (
         <p className="mt-2 flex items-center gap-1.5 text-xs">
           <Filter className="size-3 text-primary" aria-hidden />
@@ -254,10 +316,10 @@ export function TwelveLabsPanel({ scan }: { scan: Scan }) {
       )}
 
       <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
-        Optional: movie ko ek baar index karo — har scan me embeddings reuse hoti hain aur sirf matching chunks Gemini ko
-        jaate hain (threshold 0.82 — strong matches only, quota saver + buffer chunks). Har expected window ka match
-        milte hi aur har matched chunk ka 1 segment verify hote hi bache chunks skip ho jaate hain (early-stop). Key ya
-        index na ho, ya koi error aaye — app automatically normal full scan chalata hai.
+        Auto flow: short + movie upload aur trim confirm hote hi dono ek video me merge hote hain (no re-encode), merged
+        video TwelveLabs par EK baar upload + Marengo index hota hai (embeddings short/movie me time-split), phir Pegasus
+        1.5 segmentation se segment_4 matching nikalti hai. Uski minute list yahan aati hai — approve karte hi Gemini
+        sirf unhi minutes par compare karta hai.
       </p>
     </section>
   )
