@@ -215,6 +215,60 @@ export interface PrefilterInfo {
   at: number
 }
 
+// ---------- Auto Merge → Index → Pegasus Segmentation pipeline ----------
+
+export type MergePipelineStatus =
+  | 'idle'
+  | 'checking' // ffprobe codec/resolution compat check
+  | 'merging' // stream-copy concat (short + movie)
+  | 'uploading' // merged video → TwelveLabs asset
+  | 'indexing' // Marengo index via indexed-assets + embeddings download
+  | 'splitting' // time-split embeddings at short-end into short/movie sets
+  | 'segmenting' // Pegasus 1.5 segmentation (analyze/tasks)
+  | 'suggesting' // building the minute list from segment_4
+  | 'awaiting_approval' // minute list shown — waiting for the user
+  | 'approved' // user approved — Gemini scan kicked off
+  | 'error'
+
+/** One suggested movie minute to check (built from Pegasus segment_4). */
+export interface MinuteSuggestion {
+  /** ORIGINAL-movie minute number (0-based: minute 30 = 30:00–31:00) */
+  minute: number
+  /** how many segment_4 scenes pointed at this minute */
+  sceneCount: number
+  /** confidence strings straight from segment_4 metadata */
+  confidences: string[]
+  /** PART A (short) windows these scenes came from (ABSOLUTE short seconds) */
+  shortWindows: { start: number; end: number }[]
+}
+
+/** One raw Pegasus segment (for UI/debug display). */
+export interface PegasusSegment {
+  start: number
+  end: number
+  metadata: Record<string, unknown>
+}
+
+export interface MergePipelineState {
+  status: MergePipelineStatus
+  /** live human-readable progress note for the current step */
+  progress?: string
+  /** PART A boundary = short duration in seconds */
+  shortEnd?: number
+  mergedDuration?: number
+  assetId?: string
+  segTaskId?: string
+  /** merged > 2h — Pegasus segmentation was skipped (index still completed) */
+  segmentationSkipped?: boolean
+  minuteSuggestions?: MinuteSuggestion[]
+  /** raw Pegasus segmentation output per definition id (debug/UI) */
+  segments?: Record<string, PegasusSegment[]>
+  approvedMinutes?: number[]
+  error?: string | null
+  startedAt?: number | null
+  finishedAt?: number | null
+}
+
 export interface ModelLiveState {
   state: 'idle' | 'active' | 'cooling' | 'exhausted' | 'waiting'
   currentChunk: number | null
@@ -279,6 +333,8 @@ export interface Scan {
   twelveLabs?: TwelveLabsState
   /** pre-filter decision of the LAST scan run (for the UI) */
   prefilter?: PrefilterInfo
+  /** AUTO pipeline: merge → TL asset → Marengo index → Pegasus segmentation → minute approval */
+  mergePipeline?: MergePipelineState
   logs: LogEntry[]
   startedAt: number | null
   finishedAt: number | null
