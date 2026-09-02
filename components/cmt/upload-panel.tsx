@@ -2,6 +2,7 @@
 
 import { useRef, useState, type DragEvent } from 'react'
 import { upload as blobUpload } from '@vercel/blob/client'
+import { fastBlobUpload } from '@/lib/fast-blob-upload'
 import { Film, Clapperboard, Loader2, CheckCircle2 } from 'lucide-react'
 import type { Scan } from '@/lib/types'
 import { fmtTime, fmtBytes } from '@/lib/format'
@@ -102,23 +103,55 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
    * Errors from the finalize step are real errors and are thrown.
    */
   async function uploadDirectToBlob(id: string, kind: Kind, file: File): Promise<boolean> {
-    const startedAt = performance.now()
+    const contentType = file.type || 'application/octet-stream'
+    let transferred = false
+
+    // 1) FASTEST: our own multipart uploader with 12 parts in flight and a
+    //    rolling speed readout. Needs a scoped client token from the server.
     try {
-      await blobUpload(`media/${id}/${kind}.mp4`, file, {
-        access: 'private',
-        handleUploadUrl: `/api/scans/${id}/upload/token`,
-        contentType: file.type || 'application/octet-stream',
-        multipart: true,
-        onUploadProgress: ({ loaded, percentage }) => {
-          const elapsed = (performance.now() - startedAt) / 1000
-          if (elapsed > 0.5) setSpeed(loaded / elapsed)
+      const tokRes = await fetch(`/api/scans/${id}/upload/token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'direct', kind, contentType }),
+      })
+      if (!tokRes.ok) throw new Error(`token ${tokRes.status}`)
+      const { token, pathname } = (await tokRes.json()) as { token: string; pathname: string }
+      await fastBlobUpload(file, {
+        token,
+        pathname,
+        contentType,
+        onProgress: ({ percentage, speed: bps }) => {
+          if (bps !== null) setSpeed(bps)
           // Cap at 99 — the server-side ffmpeg finalize is the real 100%.
           setProgress(Math.min(99, Math.round(percentage)))
         },
       })
+      transferred = true
     } catch (err) {
-      console.warn('[upload] direct Blob upload failed, falling back to chunked upload:', err instanceof Error ? err.message : err)
-      return false
+      console.warn('[upload] fast multipart upload failed, trying stock Blob upload:', err instanceof Error ? err.message : err)
+    }
+
+    // 2) Stock @vercel/blob upload() (6 parallel parts) as a safety net.
+    if (!transferred) {
+      setProgress(0)
+      setSpeed(null)
+      const startedAt = performance.now()
+      try {
+        await blobUpload(`media/${id}/${kind}.mp4`, file, {
+          access: 'private',
+          handleUploadUrl: `/api/scans/${id}/upload/token`,
+          contentType,
+          multipart: true,
+          onUploadProgress: ({ loaded, percentage }) => {
+            const elapsed = (performance.now() - startedAt) / 1000
+            if (elapsed > 0.5) setSpeed(loaded / elapsed)
+            setProgress(Math.min(99, Math.round(percentage)))
+          },
+        })
+      } catch (err) {
+        console.warn('[upload] direct Blob upload failed, falling back to chunked upload:', err instanceof Error ? err.message : err)
+        return false
+      }
     }
 
     // Finalize: server downloads from Blob (datacenter speed) + ffmpeg probe.
