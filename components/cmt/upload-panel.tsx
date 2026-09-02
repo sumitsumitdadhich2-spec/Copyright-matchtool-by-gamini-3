@@ -56,6 +56,22 @@ function readLocalDuration(file: File): Promise<number | null> {
   })
 }
 
+/** Rolling-window speed meter (bytes/s over the last ~6 s). A cumulative
+ *  average hides stalls and a per-event delta is far too noisy — this is the
+ *  middle ground that reads steady on screen. */
+function createSpeedMeter(windowMs = 6000) {
+  const samples: { t: number; loaded: number }[] = []
+  return (loaded: number): number | null => {
+    const now = performance.now()
+    samples.push({ t: now, loaded })
+    while (samples.length > 2 && now - samples[0].t > windowMs) samples.shift()
+    if (samples.length < 2) return null
+    const dt = (now - samples[0].t) / 1000
+    if (dt < 1) return null
+    return Math.max(0, (loaded - samples[0].loaded) / dt)
+  }
+}
+
 // ---- FALLBACK path only (browser → app server → disk). The primary path is a
 // DIRECT browser → Vercel Blob multipart upload that bypasses the server hop.
 const CHUNK_BYTES = 4 * 1024 * 1024
@@ -66,6 +82,8 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
   const [uploading, setUploading] = useState<Kind | null>(null)
   const [progress, setProgress] = useState(0)
   const [speed, setSpeed] = useState<number | null>(null)
+  /** Parts currently on the wire (adaptive uploader) — 0 when not applicable. */
+  const [inFlight, setInFlight] = useState(0)
   const [error, setError] = useState<string | null>(null)
   const [local, setLocal] = useState<Partial<Record<Kind, LocalPick>>>({})
   const scanIdRef = useRef<string | null>(selectedScanId)
@@ -120,8 +138,9 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
         token,
         pathname,
         contentType,
-        onProgress: ({ percentage, speed: bps }) => {
+        onProgress: ({ percentage, speed: bps, inFlight }) => {
           if (bps !== null) setSpeed(bps)
+          setInFlight(inFlight)
           // Cap at 99 — the server-side ffmpeg finalize is the real 100%.
           setProgress(Math.min(99, Math.round(percentage)))
         },
@@ -135,7 +154,8 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
     if (!transferred) {
       setProgress(0)
       setSpeed(null)
-      const startedAt = performance.now()
+      setInFlight(0)
+      const meter = createSpeedMeter()
       try {
         await blobUpload(`media/${id}/${kind}.mp4`, file, {
           access: 'private',
@@ -143,8 +163,8 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
           contentType,
           multipart: true,
           onUploadProgress: ({ loaded, percentage }) => {
-            const elapsed = (performance.now() - startedAt) / 1000
-            if (elapsed > 0.5) setSpeed(loaded / elapsed)
+            const bps = meter(loaded)
+            if (bps !== null) setSpeed(bps)
             setProgress(Math.min(99, Math.round(percentage)))
           },
         })
@@ -156,6 +176,7 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
 
     // Finalize: server downloads from Blob (datacenter speed) + ffmpeg probe.
     setSpeed(null)
+    setInFlight(0)
     const res = await fetch(`/api/scans/${id}/upload/complete`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -182,6 +203,7 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
     setUploading(kind)
     setProgress(0)
     setSpeed(null)
+    setInFlight(0)
 
     // 1) INSTANT: show the file in the card right away from local metadata.
     setLocal((prev) => ({ ...prev, [kind]: { name: file.name, size: file.size, duration: null } }))
@@ -219,7 +241,7 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
         let sentBytes = 0
         let done = false
         let failed: Error | null = null
-        const startedAt = performance.now()
+        const meter = createSpeedMeter()
         let next = 0
 
         async function sendChunk(offset: number) {
@@ -237,8 +259,8 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
                 const j = (await res.json().catch(() => ({}))) as { done?: boolean }
                 if (j.done) done = true
                 sentBytes += piece.size
-                const elapsed = (performance.now() - startedAt) / 1000
-                if (elapsed > 0.5) setSpeed(sentBytes / elapsed)
+                const bps = meter(sentBytes)
+                if (bps !== null) setSpeed(bps)
                 // Cap at 99 — server-side ffmpeg probe finishing is the real 100%.
                 setProgress(Math.min(99, Math.round((sentBytes / file.size) * 100)))
                 return
@@ -323,6 +345,7 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
           uploading={uploading === 'short'}
           progress={progress}
           speed={uploading === 'short' ? speed : null}
+          inFlight={uploading === 'short' ? inFlight : 0}
           disabled={uploading !== null}
           onFile={(f) => uploadFile('short', f)}
           extraInfo={
@@ -342,6 +365,7 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
           uploading={uploading === 'movie'}
           progress={progress}
           speed={uploading === 'movie' ? speed : null}
+          inFlight={uploading === 'movie' ? inFlight : 0}
           disabled={uploading !== null}
           onFile={(f) => uploadFile('movie', f)}
         />
@@ -390,6 +414,7 @@ function Dropzone(props: {
   uploading: boolean
   progress: number
   speed: number | null
+  inFlight: number
   disabled: boolean
   onFile: (f: File) => void
   extraInfo?: string
@@ -446,6 +471,11 @@ function Dropzone(props: {
           <span className="ml-auto flex items-center gap-1 font-mono text-xs text-primary">
             <Loader2 className="size-3 animate-spin" aria-hidden /> {props.progress}%
             {props.speed ? <span className="text-muted-foreground">· {fmtBytes(props.speed)}/s</span> : null}
+            {props.inFlight > 0 ? (
+              <span className="text-muted-foreground" title="Parts uploading in parallel (auto-tuned to your connection)">
+                · {props.inFlight}×
+              </span>
+            ) : null}
           </span>
         )}
       </div>
