@@ -1,6 +1,7 @@
 'use client'
 
 import { useRef, useState, type DragEvent } from 'react'
+import { upload as blobUpload } from '@vercel/blob/client'
 import { Film, Clapperboard, Loader2, CheckCircle2 } from 'lucide-react'
 import type { Scan } from '@/lib/types'
 import { fmtTime, fmtBytes } from '@/lib/format'
@@ -54,9 +55,11 @@ function readLocalDuration(file: File): Promise<number | null> {
   })
 }
 
+// ---- FALLBACK path only (browser → app server → disk). The primary path is a
+// DIRECT browser → Vercel Blob multipart upload that bypasses the server hop.
 const CHUNK_BYTES = 4 * 1024 * 1024
 /** How many chunks fly at once. Keeps the pipe full on high-latency links. */
-const PARALLEL = 4
+const PARALLEL = 6
 
 export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Props) {
   const [uploading, setUploading] = useState<Kind | null>(null)
@@ -89,6 +92,54 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
     return j.id
   }
 
+  /**
+   * Direct browser → Vercel Blob upload, then a small /complete call so the
+   * server pulls the file down and runs ffmpeg.
+   *
+   * Returns true when everything succeeded. Returns false ONLY when the Blob
+   * upload itself could not even start / transfer (token endpoint unreachable,
+   * network blocked, etc.) — the caller then falls back to the chunked route.
+   * Errors from the finalize step are real errors and are thrown.
+   */
+  async function uploadDirectToBlob(id: string, kind: Kind, file: File): Promise<boolean> {
+    const startedAt = performance.now()
+    try {
+      await blobUpload(`media/${id}/${kind}.mp4`, file, {
+        access: 'private',
+        handleUploadUrl: `/api/scans/${id}/upload/token`,
+        contentType: file.type || 'application/octet-stream',
+        multipart: true,
+        onUploadProgress: ({ loaded, percentage }) => {
+          const elapsed = (performance.now() - startedAt) / 1000
+          if (elapsed > 0.5) setSpeed(loaded / elapsed)
+          // Cap at 99 — the server-side ffmpeg finalize is the real 100%.
+          setProgress(Math.min(99, Math.round(percentage)))
+        },
+      })
+    } catch (err) {
+      console.warn('[upload] direct Blob upload failed, falling back to chunked upload:', err instanceof Error ? err.message : err)
+      return false
+    }
+
+    // Finalize: server downloads from Blob (datacenter speed) + ffmpeg probe.
+    setSpeed(null)
+    const res = await fetch(`/api/scans/${id}/upload/complete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind, name: file.name }),
+    })
+    if (!res.ok) {
+      let msg = 'Upload finished but processing failed. Please try again.'
+      try {
+        msg = ((await res.json()) as { error?: string }).error || msg
+      } catch {
+        // keep default
+      }
+      throw new Error(msg)
+    }
+    return true
+  }
+
   function uploadFile(kind: Kind, file: File) {
     if (!isAllowedVideo(file)) {
       setError('Only MP4, MOV, MKV or WebM video files are supported')
@@ -105,10 +156,27 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
       setLocal((prev) => (prev[kind]?.name === file.name ? { ...prev, [kind]: { ...prev[kind]!, duration: d } } : prev))
     })
 
-    // 2) BACKGROUND: parallel chunked upload.
+    // 2) BACKGROUND upload.
     void (async () => {
       try {
         const id = await ensureScan()
+
+        // FAST PATH: direct browser → Vercel Blob multipart upload. The bytes
+        // never touch the app server, so the user's full uplink is used
+        // (Blob uploads parts in parallel with automatic retries).
+        const direct = await uploadDirectToBlob(id, kind, file)
+        if (direct) {
+          setProgress(100)
+          setUploading(null)
+          setSpeed(null)
+          setError(null)
+          refresh()
+          return
+        }
+
+        // FALLBACK: parallel chunked upload through the app server.
+        setProgress(0)
+        setSpeed(null)
         const session = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`
         const base = `/api/scans/${id}/upload?kind=${kind}&name=${encodeURIComponent(file.name)}&total=${file.size}&session=${session}`
 
