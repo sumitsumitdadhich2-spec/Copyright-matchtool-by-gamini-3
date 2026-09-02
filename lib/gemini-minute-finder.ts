@@ -3,7 +3,7 @@ import 'server-only'
 import fs from 'node:fs'
 import path from 'node:path'
 import type { GoogleGenAI } from '@google/genai'
-import { getScan, saveScan, addLog, scanMediaDir, apiKeyHash, incrementModelUsage, setModelExhausted } from './store'
+import { getScan, saveScan, addLog, scanMediaDir, apiKeyHash, getModelUsage, incrementModelUsage, setModelExhausted } from './store'
 import { ensureLocalMedia, localMediaPath } from './media'
 import { preparePrescanMovieCopy } from './ffmpeg'
 import { CHUNK_MODEL_POOL, MODEL_MIN_INTERVAL_MS, RATE_COOLDOWN_MS, type ModelSpec } from './models'
@@ -107,6 +107,10 @@ function fmtMB(bytes: number): string {
  *  concurrent writers (chunking progress etc.) are never clobbered. */
 function persist(id: string, ctrl: Ctrl, patch?: Partial<GeminiPrescanState>) {
   if (patch) Object.assign(ctrl.state, patch)
+  // A stopped controller that has already been replaced by a newer run must
+  // never overwrite the newer run's state (late in-flight window result).
+  const current = ctrls.get(id)
+  if (current && current !== ctrl) return
   const s = getScan(id)
   if (!s) return
   s.geminiPrescan = ctrl.state
@@ -228,6 +232,25 @@ export function stopGeminiMinuteFinder(scanId: string): { ok: boolean; error?: s
   return { ok: true }
 }
 
+/**
+ * Stop a running minute finder (if any) and wait until its controller is gone,
+ * so a follow-up action (manual Start, new trim, scan delete) never races the
+ * finder's own `scheduler.start` / state writes. Resolves `true` when idle.
+ */
+export async function stopAndWaitMinuteFinder(scanId: string, reason: string, timeoutMs = 15_000): Promise<boolean> {
+  const ctrl = ctrls.get(scanId)
+  if (!ctrl) return true
+  if (!ctrl.stopping) {
+    ctrl.stopping = true
+    for (const w of ctrl.state.windows) if (w.status === 'running') w.status = 'pending'
+    persist(scanId, ctrl, { status: 'error', error: `Stopped: ${reason}`, progress: undefined, finishedAt: Date.now() })
+    log(scanId, 'warn', `Minute finder stopped — ${reason}`)
+  }
+  const deadline = Date.now() + timeoutMs
+  while (ctrls.has(scanId) && Date.now() < deadline) await sleep(250)
+  return !ctrls.has(scanId)
+}
+
 // ---------------------------------------------------------------------------
 
 async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser): Promise<void> {
@@ -299,18 +322,37 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
   const copyDuration = ctrl.state.movieCopy!.durationSec
 
   // ---- [2] Uploads: short + movie copy, ONCE PER API KEY (parallel) ----
-  const lanesByKey = apiKeys.map((k, i) => ({ keyIdx: i + 1, apiKey: k, keyId: apiKeyHash(k), ai: getClient(k) }))
-  persist(id, ctrl, { status: 'uploading', progress: `Uploading to Gemini (0/${lanesByKey.length} keys)...` })
+  // A key whose upload fails (bad key, storage quota, network) is DROPPED from
+  // the lane set instead of killing the whole run — the other keys carry on.
+  const allKeys = apiKeys.map((k, i) => ({ keyIdx: i + 1, apiKey: k, keyId: apiKeyHash(k), ai: getClient(k) }))
+  persist(id, ctrl, { status: 'uploading', progress: `Uploading to Gemini (0/${allKeys.length} keys)...` })
   let uploadedKeys = 0
-  await Promise.all(
-    lanesByKey.map(async (k) => {
-      await ensureUploads(id, ctrl, k.keyId, k.keyIdx, k.ai, shortFile, copyPath)
-      uploadedKeys += 1
-      persist(id, ctrl, { progress: `Uploading to Gemini (${uploadedKeys}/${lanesByKey.length} keys)...` })
+  const uploadResults = await Promise.all(
+    allKeys.map(async (k) => {
+      try {
+        await ensureUploads(id, ctrl, k.keyId, k.keyIdx, k.ai, shortFile, copyPath)
+        uploadedKeys += 1
+        persist(id, ctrl, { progress: `Uploading to Gemini (${uploadedKeys}/${allKeys.length} keys)...` })
+        return true
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        log(id, 'error', `Key ${k.keyIdx}: upload failed — is key ko skip kar rahe hain: ${msg.slice(0, 160)}`)
+        return false
+      }
     }),
   )
   if (ctrl.stopping) return
-  log(id, 'success', `Uploads ready on ${lanesByKey.length} key(s) (short + movie copy, Files API)`)
+  const lanesByKey = allKeys.filter((_, i) => uploadResults[i])
+  if (lanesByKey.length === 0) {
+    throw new Error('Kisi bhi API key par upload nahi hua (short + movie copy) — key/quota check karke Retry karo.')
+  }
+  log(
+    id,
+    'success',
+    `Uploads ready on ${lanesByKey.length}/${allKeys.length} key(s) (short + movie copy, Files API)${
+      lanesByKey.length < allKeys.length ? ` — ${allKeys.length - lanesByKey.length} key(s) skipped` : ''
+    }`,
+  )
 
   // ---- Windows: fixed 20-minute slices of the movie copy ----
   if (ctrl.state.windows.length === 0) {
@@ -331,11 +373,24 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
   )
 
   // ---- [3] Lanes: every key × both chunk models pull from the shared queue ----
+  // Same daily counter as the chunk scan (data/counters.json) — a lane whose
+  // model is already at its RPD cap for today is not created at all, exactly
+  // like the scheduler skips exhausted models.
   const lanes: Lane[] = []
+  const skipped: string[] = []
   for (const k of lanesByKey) {
     for (const m of CHUNK_MODEL_POOL) {
-      lanes.push({ ...k, model: m, label: `key ${k.keyIdx} · ${m.id}`, dead: false })
+      const label = `key ${k.keyIdx} · ${m.id}`
+      if (getModelUsage(m.id, k.apiKey) >= m.rpd) {
+        skipped.push(label)
+        continue
+      }
+      lanes.push({ ...k, model: m, label, dead: false })
     }
+  }
+  if (skipped.length > 0) log(id, 'warn', `${skipped.length} lane(s) already at daily cap (RPD) — skipped: ${skipped.join(', ')}`)
+  if (lanes.length === 0) {
+    throw new Error('Saari lanes ki daily quota (RPD) khatam hai — kal Retry karo ya manual Full scan use karo.')
   }
   await Promise.all(lanes.map((lane) => laneWorker(id, ctrl, lane, shortFile, copyPath, trimStart, trimEnd)))
   if (ctrl.stopping) return
@@ -521,6 +576,17 @@ async function laneWorker(
       }
       const up = ctrl.state.uploads[lane.keyId]
       if (!up?.shortUri || !up?.movieUri) throw new Error('files/ missing upload for this key')
+
+      // Daily cap reached during the run (shared counter with the chunk scan) —
+      // retire this lane, hand the window back to the queue for another lane.
+      if (getModelUsage(lane.model.id, lane.apiKey) >= lane.model.rpd) {
+        lane.dead = true
+        w.status = 'pending'
+        ctrl.queue.unshift(idx)
+        persist(id, ctrl)
+        log(id, 'warn', `${lane.label}: daily cap (${lane.model.rpd} RPD) reached — lane retired, window #${w.index} re-queued`)
+        return
+      }
 
       ctrl.nextFreeAt[rk] = Date.now() + MODEL_MIN_INTERVAL_MS
       incrementModelUsage(lane.model.id, lane.apiKey)

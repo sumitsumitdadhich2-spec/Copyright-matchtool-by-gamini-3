@@ -1,12 +1,12 @@
 import { NextResponse } from 'next/server'
 import path from 'node:path'
 import { getScan, saveScan, addLog, scanMediaDir } from '@/lib/store'
-import { ensureLocalMedia } from '@/lib/media'
 import { chunkMovie } from '@/lib/ffmpeg'
 import { CHUNK_SECONDS } from '@/lib/models'
 import { getSession } from '@/lib/users'
 import { pipelineReady } from '@/lib/merge-pipeline'
 import { dispatchMinuteFinder } from '@/lib/minute-finder-dispatch'
+import { isMinuteFinderRunning, stopAndWaitMinuteFinder } from '@/lib/gemini-minute-finder'
 
 export const runtime = 'nodejs'
 export const maxDuration = 300
@@ -23,6 +23,9 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   if (scan.status === 'scanning' || scan.status === 'verifying') {
     return NextResponse.json({ error: 'Cannot change the trim while a scan is running' }, { status: 409 })
   }
+  // A Gemini Minute Finder run on the OLD trim range is stale now — stop it
+  // before the chunk layout is reset (the dispatcher below starts a fresh run).
+  if (isMinuteFinderRunning(id)) await stopAndWaitMinuteFinder(id, 'trim range badla', 10_000)
 
   const dur = scan.movieDuration
   const body = (await req.json().catch(() => ({}))) as { start?: number; end?: number }
