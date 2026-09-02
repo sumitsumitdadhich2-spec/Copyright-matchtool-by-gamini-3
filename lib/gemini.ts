@@ -126,6 +126,251 @@ Na milne par:
 
 Poore answer me sirf HISSA 1 aur HISSA 2 do, aur kuch nahi.`
 
+// ---------- Gemini Minute Finder (20-minute window pre-scan) ----------
+
+/** Model ids allowed for the minute finder — exactly the two chunk-map models. */
+export const MINUTE_FINDER_SHORT_FPS = 5
+
+/** Window version of the chunk-map prompt. `{{WINDOW_START}}` / `{{WINDOW_END}}`
+ * are replaced per window (movie-copy clock, mm:ss). Goal: RECALL — which MINUTES
+ * of the movie hold the short's footage; the 24 fps chunk scan verifies later. */
+export const MINUTE_FINDER_PROMPT = `You are a forensic video analyst. You are given TWO videos:
+- Video 1: a SHORT VIDEO that was edited together from clips of a movie (sampled at 5 fps).
+- Video 2: a 20-MINUTE WINDOW of the original movie, covering movie time {{WINDOW_START}} to {{WINDOW_END}} (sampled at 1 fps).
+
+Tumhara kaam frame-perfect mapping NAHI hai. Tumhara kaam ye batana hai ki Video 1 ke kaun se scenes Video 2 ke andar hain, aur movie ke KAUN SE MINUTE(S) par hain — taaki agla step un minutes ko 24 fps par frame-by-frame check kar sake.
+
+Respond in Hinglish (Hindi written in Latin script). Spoken dialogue must always be QUOTED VERBATIM in its original language.
+
+Your answer has exactly THREE parts:
+
+=====================
+HISSA 1 — SHORT VIDEO SCENE MAP
+=====================
+Watch Video 1 from start to finish and break it into SCENES (shot/scene changes par cut karo):
+- Har scene 1 se ~10 second ka ho. Jab bhi location, camera setup, ya action clearly badle to naya scene shuru karo. Ek lambi continuous shot ko bhi 5-6 second ke tukdon me todo.
+- Scenes contiguous hone chahiye: har scene ka start = pichle scene ka end. Pehla scene 00:00 se shuru ho, aakhri scene video ki total duration par khatam ho. Koi gap nahi, koi overlap nahi.
+- Har line ka format:
+  S<n>: mm:ss - mm:ss | <location + kaun kya kar raha hai, max 15 words> | DIALOGUE: "<exact quoted words>" ya NONE
+- Dialogue sabse strong fingerprint hai — kabhi summarize mat karo, hamesha exact words quote karo. Agar audio mute/music se daba hua hai to DIALOGUE: MUTED likho.
+- Description lambi mat karo — output token budget limited hai.
+
+=====================
+HISSA 2 — MOVIE LOCATION HUNT
+=====================
+Ab HISSA 1 ke HAR EK scene ke liye Video 2 (movie window) me EXACT wahi footage dhundho (same recording — sirf similar scene nahi).
+
+Search method (har scene ke liye follow karo):
+- PASS 1 (AUDIO LOCATE): Agar scene me dialogue hai, to sabse pehle Video 2 ke audio me wahi exact words dhundho. Dialogue sabse tez aur sabse reliable locator hai. Jahan words mile, us position ke frames dekho.
+- PASS 2 (VISUAL LOCATE): Dialogue na ho (ya MUTED ho) to Video 2 ko shuru se aakhir tak scan karo aur wo jagah dhundho jahan same location + same actors + same costume + same action ho. Mile to +-5 second ke frames dekh kar confirm karo ki action ka ORDER bhi same hai.
+- PASS 3 (CONFIRM): Match tab hi hai jab (a) dialogue words same hain YA (b) actions ka sequence same hai. Sirf "same actor, same location" MATCH nahi hai — wo alag moment ho sakta hai.
+
+STRICT RULES:
+1. Movie timestamps Video 2 ki APNI clock se aane chahiye — frames/audio ko actually dekh-sun kar. Short video ke timestamps copy karke movie column me daalna FORBIDDEN hai.
+2. NO EXTRAPOLATION (CRITICAL): Ek scene ka offset mil jane ke baad "short_time + offset" formula se baaki scenes AUTOMATICALLY map karna STRICTLY FORBIDDEN hai. Short video EDITED hai — uske scenes movie me alag-alag jagah se, alag order me aa sakte hain. Har scene ko independently dhundho aur independently verify karo. Agar tumhare consecutive matches ek fixed offset follow kar rahe hain, RUK JAO aur har ek dobara verify karo.
+3. DIALOGUE VERIFICATION: Dialogue wale scene ka match tab hi valid hai jab WAHI words Video 2 ke audio me us position par actually SUNAI dein. Words alag = NOT FOUND (ya POSSIBLE agar audio unclear ho).
+4. QUALITY DIFFERENCE IS NOT DIFFERENT: crop, zoom, letterbox, aspect-ratio change, compression, blur, color-grade, brightness, watermark, text overlay, subtitles, added music, original audio replaced/muted, mirrored image, thoda speed-up/slow-down — ye sab IGNORE karo. Underlying footage same hai to wo MATCH hai. In wajahon se match reject karna FORBIDDEN hai.
+5. WINDOW KA END = FOOTAGE KA END: Ye window poori movie ka sirf 20-minute tukda hai. Short ke bahut se scenes is window me honge hi NAHI — wo movie ke doosre hisse me hain. Ye NORMAL aur EXPECTED hai. Agar POORA short is window me na mile to saaf likho — zabardasti match banana FORBIDDEN hai.
+6. SIMILAR IS NOT SAME: same actors, same location, same costume par DIFFERENT moment (alag dialogue, alag action) = NOT FOUND. Lekin agar tumhe strong shak hai ki footage yahi minute ke aas-paas hai par tum confirm nahi kar paaye (audio unclear, fast cuts, low fps), to use NOT FOUND mat likho — POSSIBLE likho with reason. POSSIBLE minutes agle step me 24 fps par check ho jayenge, isliye miss karne se behtar hai POSSIBLE dena.
+7. Har scene ke liye movie ka minute do tarah likho:
+   - WINDOW time: Video 2 ki apni clock (00:00 se 20:00)
+   - MOVIE time: WINDOW time + {{WINDOW_START}} (absolute movie time)
+   Agar Video 2 ka player/clock already absolute movie time dikha raha hai (e.g. {{WINDOW_START}} se shuru), to WINDOW aur MOVIE dono me wahi absolute time likho aur ek line me note karo: "CLOCK: absolute".
+8. Ek short scene movie me EK jagah hi hoti hai. Agar tumhe do jagah lag rahi hain, to jo dialogue/action se zyada confirm hai use MATCH aur doosri ko POSSIBLE likho.
+9. FINAL SELF-CHECK: Answer dene se pehle har MATCH dobara dekho — (a) kya dialogue ya action sequence sach me same hai? (b) kya movie timestamp Video 2 ki apni clock se aaya hai, formula se nahi? Jo match sirf "pichle match ke baad aata hai isliye" bana hai, use POSSIBLE ya NOT FOUND me badlo.
+
+Har scene ki line ka format (teen me se ek):
+  S<n> --> MATCH | WINDOW mm:ss - mm:ss | MOVIE mm:ss - mm:ss | EVIDENCE: <dialogue words jo sune / action jo dikha, max 15 words>
+  S<n> --> POSSIBLE | WINDOW mm:ss - mm:ss | MOVIE mm:ss - mm:ss | REASON: <kya same laga, kya confirm nahi hua>
+  S<n> --> NOT FOUND — <chhota reason: is window me ye scene nahi hai / alag moment hai>
+
+=====================
+HISSA 3 — MINUTE LIST (FINAL)
+=====================
+HISSA 2 ke saare MATCH aur POSSIBLE se movie ke minutes nikaalo (MOVIE time ke hisaab se, absolute). Har wo minute jisme matched footage ka koi bhi hissa aata hai, list me aayega (e.g. MOVIE 23:50 - 24:10 => minute 23 aur 24 dono).
+
+Exact format, aur kuch nahi:
+MATCH MINUTES: <comma separated minute numbers, ascending, e.g. 23, 24, 31> (ya NONE)
+POSSIBLE MINUTES: <comma separated minute numbers> (ya NONE)
+WINDOW VERDICT: FOUND (agar kam se kam ek MATCH) / POSSIBLE ONLY / NOT IN THIS WINDOW
+
+Poore answer me sirf HISSA 1, HISSA 2 aur HISSA 3 do, aur kuch nahi.`
+
+/** mm:ss (or h:mm:ss) for the prompt's window clock. */
+export function fmtClock(sec: number): string {
+  const s = Math.max(0, Math.round(sec))
+  const h = Math.floor(s / 3600)
+  const m = Math.floor((s % 3600) / 60)
+  const r = s % 60
+  return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${String(r).padStart(2, '0')}` : `${String(m).padStart(2, '0')}:${String(r).padStart(2, '0')}`
+}
+
+/** Fill the window placeholders (movie-copy clock, seconds). */
+export function buildMinuteFinderPrompt(startOffsetSec: number, endOffsetSec: number): string {
+  return MINUTE_FINDER_PROMPT.replaceAll('{{WINDOW_START}}', fmtClock(startOffsetSec)).replaceAll(
+    '{{WINDOW_END}}',
+    fmtClock(endOffsetSec),
+  )
+}
+
+/** One minute-finder request: whole short @ 5 fps + one 20-minute movie window
+ * (default 1 fps, selected with startOffset/endOffset on the SAME uploaded movie
+ * copy). Same GEN_CONFIG as the chunk scan (thinking HIGH, max output tokens). */
+export async function runMinuteFinderWindow(
+  ai: GoogleGenAI,
+  model: string,
+  shortUri: string,
+  movieUri: string,
+  startOffsetSec: number,
+  endOffsetSec: number,
+): Promise<{ text: string; tokens: number | null }> {
+  try {
+    const resp = await ai.models.generateContent({
+      model,
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            { fileData: { fileUri: shortUri, mimeType: 'video/mp4' }, videoMetadata: { fps: MINUTE_FINDER_SHORT_FPS } },
+            {
+              fileData: { fileUri: movieUri, mimeType: 'video/mp4' },
+              // NO fps here — default 1 fps for the movie window.
+              videoMetadata: { startOffset: `${Math.floor(startOffsetSec)}s`, endOffset: `${Math.ceil(endOffsetSec)}s` },
+            },
+            { text: buildMinuteFinderPrompt(startOffsetSec, endOffsetSec) },
+          ] as never,
+        },
+      ],
+      config: GEN_CONFIG,
+    })
+    const text = resp.text
+    if (!text) throw new Error('Empty minute-finder response')
+    const tokens = resp.usageMetadata?.totalTokenCount ?? null
+    return { text, tokens }
+  } catch (err) {
+    throw classifyError(err)
+  }
+}
+
+/** Parse "h:mm:ss(.mmm)" / "mm:ss(.mmm)" / "m:ss" into seconds. */
+function parseTsFlexible(ts: string): number | null {
+  const t = ts.trim()
+  const m3 = t.match(/^(\d+):(\d{1,2}):(\d{1,2}(?:\.\d+)?)$/)
+  if (m3) return Number(m3[1]) * 3600 + Number(m3[2]) * 60 + Number(m3[3])
+  const m2 = t.match(/^(\d+):(\d{1,2}(?:\.\d+)?)$/)
+  if (m2) return Number(m2[1]) * 60 + Number(m2[2])
+  return null
+}
+
+export interface MinuteFinderHit {
+  scene: number
+  kind: 'match' | 'possible'
+  /** seconds within the SHORT video (from HISSA 1), if the scene line was found */
+  shortStart: number | null
+  shortEnd: number | null
+  /** seconds within the MOVIE COPY file (window offset already resolved) */
+  fileStart: number
+  fileEnd: number
+  evidence: string
+}
+
+/**
+ * Parse one minute-finder response into hits with MOVIE-COPY-file times.
+ *
+ * CLOCK RESOLUTION (relative vs absolute): the prompt asks for both a WINDOW
+ * time (Video 2's own clock) and a MOVIE time (WINDOW + window start).
+ *  - "CLOCK: absolute" in the output => WINDOW column is already file time.
+ *  - WINDOW value inside [0, windowLen] => relative: file = startOffset + t.
+ *  - WINDOW value inside [startOffset, endOffset] (beyond the window length)
+ *    => the model reported file-absolute times despite the clip range.
+ *  - Otherwise fall back to the MOVIE column when it lands inside the window.
+ * `assumeRelative` is the default when the two readings are ambiguous
+ * (window 0 — both are identical anyway).
+ */
+export function parseMinuteFinderOutput(
+  raw: string,
+  startOffset: number,
+  endOffset: number,
+  assumeRelative: boolean,
+): { hits: MinuteFinderHit[]; matchMinutes: number[]; possibleMinutes: number[]; clockAbsolute: boolean } {
+  const windowLen = endOffset - startOffset
+  const clockAbsolute = /CLOCK\s*:\s*absolute/i.test(raw)
+
+  // HISSA 1: S<n>: mm:ss - mm:ss | ...
+  const shortMap = new Map<number, { start: number; end: number }>()
+  const sceneRe = /^\s*S(\d+)\s*:\s*(\d+:\d{1,2}(?::\d{1,2})?(?:\.\d+)?)\s*-\s*(\d+:\d{1,2}(?::\d{1,2})?(?:\.\d+)?)/gim
+  let sm: RegExpExecArray | null
+  while ((sm = sceneRe.exec(raw)) !== null) {
+    const s = parseTsFlexible(sm[2])
+    const e = parseTsFlexible(sm[3])
+    if (s === null || e === null || e <= s) continue
+    if (!shortMap.has(Number(sm[1]))) shortMap.set(Number(sm[1]), { start: s, end: e })
+  }
+
+  const inWindow = (t: number) => t >= startOffset - 5 && t <= endOffset + 5
+  const inRelative = (t: number) => t >= -1 && t <= windowLen + 5
+  const resolve = (win: number | null, mov: number | null): number | null => {
+    if (win !== null) {
+      if (clockAbsolute) return inWindow(win) ? win : inRelative(win) ? startOffset + win : null
+      if (inRelative(win) && (assumeRelative || !inWindow(win) || startOffset === 0)) return startOffset + win
+      if (inWindow(win)) return win
+      if (inRelative(win)) return startOffset + win
+    }
+    if (mov !== null) {
+      if (inWindow(mov)) return mov
+      if (inRelative(mov)) return startOffset + mov
+    }
+    return null
+  }
+
+  // HISSA 2: S<n> --> MATCH | WINDOW a - b | MOVIE c - d | EVIDENCE: ...
+  const hits: MinuteFinderHit[] = []
+  const TS = String.raw`(\d+:\d{1,2}(?::\d{1,2})?(?:\.\d+)?)`
+  const hitRe = new RegExp(
+    String.raw`S(\d+)\s*-->\s*(MATCH|POSSIBLE)\b([^\n]*)`,
+    'gi',
+  )
+  const winRe = new RegExp(String.raw`WINDOW\s+${TS}\s*-\s*${TS}`, 'i')
+  const movRe = new RegExp(String.raw`MOVIE\s+${TS}\s*-\s*${TS}`, 'i')
+  const evRe = /(?:EVIDENCE|REASON)\s*:\s*(.+)$/i
+  let hm: RegExpExecArray | null
+  while ((hm = hitRe.exec(raw)) !== null) {
+    const scene = Number(hm[1])
+    const kind = hm[2].toUpperCase() === 'MATCH' ? 'match' : 'possible'
+    const rest = hm[3] || ''
+    const w = rest.match(winRe)
+    const mv = rest.match(movRe)
+    const winS = w ? parseTsFlexible(w[1]) : null
+    const winE = w ? parseTsFlexible(w[2]) : null
+    const movS = mv ? parseTsFlexible(mv[1]) : null
+    const movE = mv ? parseTsFlexible(mv[2]) : null
+    const fs0 = resolve(winS, movS)
+    const fe0 = resolve(winE, movE)
+    if (fs0 === null || fe0 === null) continue
+    const fileStart = Math.min(Math.max(startOffset, fs0), endOffset)
+    const fileEnd = Math.min(Math.max(startOffset, fe0), endOffset)
+    if (fileEnd < fileStart) continue
+    const sw = shortMap.get(scene) || null
+    hits.push({
+      scene,
+      kind,
+      shortStart: sw?.start ?? null,
+      shortEnd: sw?.end ?? null,
+      fileStart,
+      fileEnd: Math.max(fileEnd, fileStart + 0.5),
+      evidence: (rest.match(evRe)?.[1] || '').trim().slice(0, 160),
+    })
+  }
+
+  // HISSA 3 fallback lists (movie-copy minutes as the model understood them).
+  const listOf = (label: string): number[] => {
+    const m = raw.match(new RegExp(String.raw`${label}\s*MINUTES\s*:\s*([^\n]+)`, 'i'))
+    if (!m || /NONE/i.test(m[1])) return []
+    return [...m[1].matchAll(/\d+/g)].map((x) => Number(x[0])).filter((n) => Number.isFinite(n))
+  }
+  return { hits, matchMinutes: listOf('MATCH'), possibleMinutes: listOf('POSSIBLE'), clockAbsolute }
+}
+
 /** One chunk-map request: whole short video + one movie chunk, the SAME prompt every time.
  * Returns the raw model text (HISSA 1 + HISSA 2) — parsing happens separately. */
 export async function mapChunkRequest(

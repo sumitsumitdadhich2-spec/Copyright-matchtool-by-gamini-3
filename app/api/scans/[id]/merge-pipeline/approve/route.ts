@@ -4,6 +4,7 @@ import { getSession } from '@/lib/users'
 import { getAllUserApiKeys, getUserTwelveLabsKey } from '@/lib/user-keys'
 import { deductTokens, refundTokens, SCAN_TOKEN_COST } from '@/lib/tokens'
 import { scheduler } from '@/lib/scheduler'
+import { applyApprovedMinutes } from '@/lib/minute-ranges'
 
 export const runtime = 'nodejs'
 
@@ -36,54 +37,11 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   if (approved.length === 0) {
     return NextResponse.json({ error: 'Kam se kam ek suggested minute approve karo.' }, { status: 400 })
   }
-  const approvedSet = new Set(approved)
-
-  const segs = scan.shortSegments
-  if (!segs || segs.length === 0) {
-    return NextResponse.json({ error: 'Short video segments missing' }, { status: 400 })
-  }
-
   // Map approved MOVIE minutes back to each SHORT minute via segment_4's
-  // PART A windows. A short minute is scanned only against the approved
-  // movie minutes its scenes pointed at (existing per-minute range system).
-  const trimStart = scan.movieTrimStart ?? 0
-  const trimEnd = scan.movieTrimEnd ?? scan.movieDuration ?? 0
-  const rangeNotes: string[] = []
-  for (const seg of segs) {
-    const relevantMinutes: number[] = []
-    for (const sug of pipeline.minuteSuggestions) {
-      if (!approvedSet.has(sug.minute)) continue
-      const overlaps = sug.shortWindows.some((w) => w.start < seg.end && w.end > seg.start)
-      if (overlaps) relevantMinutes.push(sug.minute)
-    }
-    if (relevantMinutes.length === 0) {
-      seg.selected = false
-      delete seg.movieRangeStart
-      delete seg.movieRangeEnd
-      continue
-    }
-    seg.selected = true
-    // Range = min..max of approved minutes for this short minute, clamped to trim.
-    const rawStart = Math.min(...relevantMinutes) * 60
-    const rawEnd = (Math.max(...relevantMinutes) + 1) * 60
-    const start = Math.max(trimStart, rawStart)
-    const end = Math.min(trimEnd, rawEnd)
-    if (end > start && !(start <= trimStart && end >= trimEnd)) {
-      seg.movieRangeStart = start
-      seg.movieRangeEnd = end
-      rangeNotes.push(`minute ${seg.index + 1} → movie ${Math.round(start)}s–${Math.round(end)}s`)
-    } else {
-      delete seg.movieRangeStart
-      delete seg.movieRangeEnd
-    }
-  }
-
-  if (!segs.some((s) => s.selected !== false)) {
-    return NextResponse.json(
-      { error: 'Approved minutes kisi short minute se map nahi hue — Retry ya manual Full scan use karo.' },
-      { status: 400 },
-    )
-  }
+  // PART A windows (shared helper — same logic the Gemini Minute Finder uses).
+  const applied = applyApprovedMinutes(scan, approved, pipeline.minuteSuggestions)
+  if (!applied.ok) return NextResponse.json({ error: applied.error }, { status: 400 })
+  const { rangeNotes } = applied
 
   scan.mergePipeline = { ...pipeline, status: 'approved', approvedMinutes: approved.sort((a, b) => a - b) }
   addLog(

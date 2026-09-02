@@ -250,6 +250,106 @@ export async function normalizeForTwelveLabs(sourceFile: string): Promise<string
   return outFile
 }
 
+// ---------- Gemini Minute Finder: movie upload copy ----------
+
+/** Gemini Files API hard limit is 2 GB per file — stay safely under it. */
+export const PRESCAN_MAX_BYTES = 1.9 * 1024 * 1024 * 1024
+
+/**
+ * Build the UPLOAD COPY of the movie for the Gemini Minute Finder:
+ *   - cut to the confirmed trim range (absolute original-movie seconds)
+ *   - stream copy (-c copy, fast) when the cut stays ≤ 1.9 GB
+ *   - otherwise a compressed re-encode (480p / 24 fps / CRF 30 / AAC 64k),
+ *     and a second, smaller pass (360p / CRF 32) if it is STILL too big.
+ * Audio is always kept (dialogue is the strongest fingerprint).
+ * Only this copy goes to Gemini — the original, chunks and render are untouched.
+ */
+export async function preparePrescanMovieCopy(
+  movieFile: string,
+  outFile: string,
+  movieDuration: number,
+  trimStart: number,
+  trimEnd: number,
+  onProgress: (pct: number, note: string) => void,
+): Promise<{ durationSec: number; sizeBytes: number; reencoded: boolean }> {
+  const rangeEnd = Math.min(trimEnd, movieDuration)
+  const rangeDur = Math.max(1, rangeEnd - trimStart)
+  const trimmed = trimStart > 0.01 || rangeEnd < movieDuration - 0.01
+  const srcSize = fs.statSync(movieFile).size
+  const estCutSize = trimmed ? srcSize * (rangeDur / Math.max(1, movieDuration)) : srcSize
+
+  const cutArgs = (): string[] => {
+    const a: string[] = ['-y']
+    if (trimStart > 0.01) a.push('-ss', trimStart.toFixed(3))
+    a.push('-i', movieFile)
+    if (trimmed) a.push('-t', rangeDur.toFixed(3))
+    return a
+  }
+  const progress = (note: string) => (line: string) => {
+    const t = parseFfmpegTime(line)
+    if (t !== null) onProgress(Math.min(99, Math.round((t / rangeDur) * 100)), note)
+  }
+
+  const tmp = `${outFile}.tmp.mp4`
+  let reencoded = false
+
+  if (estCutSize <= PRESCAN_MAX_BYTES) {
+    // Fast path: stream copy (no re-encode). -ss before -i seeks to the
+    // nearest keyframe, which may start a few seconds early — the ±1 minute
+    // buffer on the minute list absorbs that.
+    onProgress(0, 'Stream copy (no re-encode)...')
+    await run(getFfmpegPath(), [...cutArgs(), '-c', 'copy', '-movflags', '+faststart', tmp], progress('Stream copy...'))
+    if (fs.statSync(tmp).size > PRESCAN_MAX_BYTES) {
+      // Estimate was off — fall through to re-encode.
+      fs.unlinkSync(tmp)
+    } else {
+      fs.renameSync(tmp, outFile)
+    }
+  }
+
+  if (!fs.existsSync(outFile)) {
+    reencoded = true
+    onProgress(0, 'Re-encoding compressed copy (480p)...')
+    await run(
+      getFfmpegPath(),
+      [
+        ...cutArgs(),
+        '-vf', 'scale=-2:480', '-r', '24',
+        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '30',
+        '-c:a', 'aac', '-b:a', '64k', '-ac', '1',
+        '-movflags', '+faststart',
+        tmp,
+      ],
+      progress('Re-encoding 480p...'),
+    )
+    if (fs.statSync(tmp).size > PRESCAN_MAX_BYTES) {
+      fs.unlinkSync(tmp)
+      onProgress(0, 'Still > 1.9 GB — re-encoding smaller copy (360p)...')
+      await run(
+        getFfmpegPath(),
+        [
+          ...cutArgs(),
+          '-vf', 'scale=-2:360', '-r', '24',
+          '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '32',
+          '-c:a', 'aac', '-b:a', '48k', '-ac', '1',
+          '-movflags', '+faststart',
+          tmp,
+        ],
+        progress('Re-encoding 360p...'),
+      )
+      if (fs.statSync(tmp).size > PRESCAN_MAX_BYTES) {
+        fs.unlinkSync(tmp)
+        throw new Error('Movie copy 360p par bhi 1.9 GB se badi hai — chhota trim range use karo.')
+      }
+    }
+    fs.renameSync(tmp, outFile)
+  }
+
+  onProgress(100, 'Movie copy ready')
+  const durationSec = await probeDuration(outFile)
+  return { durationSec, sizeBytes: fs.statSync(outFile).size, reencoded }
+}
+
 // ---------- Render/export helpers (used by lib/render.ts) ----------
 
 /** Absolute path to a runnable ffmpeg binary (render pipeline spawns its own process for kill support). */

@@ -2,6 +2,7 @@ import 'server-only'
 
 import { put, get } from '@vercel/blob'
 import { MAX_API_KEYS } from './store'
+import type { MinuteFinderMode } from './types'
 
 // ---------------------------------------------------------------------------
 // PER-USER Gemini API keys, stored in Vercel Blob (private store).
@@ -118,6 +119,29 @@ export async function clearUserTwelveLabsKey(username: string): Promise<void> {
   const keys = { ...(await readUserKeys(username)) }
   delete keys[TL_SLOT]
   await writeUserKeys(username, keys)
+}
+
+// ---------------------------------------------------------------------------
+// MINUTE FINDER MODE — per-user preference stored in the same file under a
+// reserved non-numeric slot. Default 'gemini' (Gemini Minute Finder).
+// ---------------------------------------------------------------------------
+
+const MINUTE_FINDER_SLOT = 'minuteFinder'
+
+export function isMinuteFinderMode(v: unknown): v is MinuteFinderMode {
+  return v === 'gemini' || v === 'twelvelabs' || v === 'off'
+}
+
+/** Which minute finder runs for this user after upload + trim (default 'gemini'). */
+export async function getUserMinuteFinderMode(username: string): Promise<MinuteFinderMode> {
+  const keys = await readUserKeys(username)
+  const v = keys[MINUTE_FINDER_SLOT]
+  return isMinuteFinderMode(v) ? v : 'gemini'
+}
+
+export async function setUserMinuteFinderMode(username: string, mode: MinuteFinderMode): Promise<void> {
+  const keys = await readUserKeys(username)
+  await writeUserKeys(username, { ...keys, [MINUTE_FINDER_SLOT]: mode })
 }
 
 /** Delete a user's entire key file (used when the account is deleted). */
