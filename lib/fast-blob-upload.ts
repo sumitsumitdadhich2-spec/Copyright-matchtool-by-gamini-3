@@ -155,14 +155,15 @@ export async function fastBlobUpload(file: File, opts: FastUploadOptions): Promi
       // Multiplicative decrease: the pipe is oversubscribed for this link.
       target = Math.max(MIN_CONCURRENCY, Math.floor(target * 0.6))
       bestRate = rate
-    } else if (rate >= bestRate * 0.92) {
+    } else if (rate >= bestRate * 0.8) {
       // Additive increase while more parallelism still helps (or is neutral).
+      // A 2.5 s window is noisy, so only a CLEAR drop stops the ramp — and a
+      // drop without any stall/error never shrinks the pool (that used to
+      // oscillate the rate up and down every tick).
       bestRate = Math.max(bestRate, rate)
       target = Math.min(maxConcurrency, target + 1)
     } else {
-      // Throughput dropped without errors → we went one step too far.
-      target = Math.max(MIN_CONCURRENCY, target - 1)
-      bestRate = rate
+      bestRate = Math.max(rate, bestRate * 0.9)
     }
     incidents = 0
     void fill()

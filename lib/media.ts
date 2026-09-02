@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
-import { get, list } from '@vercel/blob'
+import { get, list, put } from '@vercel/blob'
 import { getScan, saveScan, addLog, scanMediaDir } from './store'
 import type { Scan } from './types'
 import { probeDuration, chunkShort, cleanupSegments } from './ffmpeg'
@@ -54,6 +54,48 @@ export async function ensureLocalMedia(id: string, kind: MediaKind, force = fals
     }
   })()
   inflight.set(key, job)
+  return job
+}
+
+// ---------- Local → Blob mirror ----------
+// The browser uploads to the APP SERVER (chunked, edge-terminated — by far the
+// fastest path from the user's uplink). The server then pushes the finished
+// file to Blob at datacenter speed so Blob stays the source of truth for
+// cold starts / other instances. Best-effort + de-duplicated per (id, kind).
+
+const mirroring = new Map<string, Promise<boolean>>()
+
+export function mirrorMediaToBlob(id: string, kind: MediaKind, contentType = 'video/mp4'): Promise<boolean> {
+  const key = `${id}/${kind}`
+  const existing = mirroring.get(key)
+  if (existing) return existing
+
+  const job = (async (): Promise<boolean> => {
+    const local = localMediaPath(id, kind)
+    try {
+      if (!process.env.BLOB_READ_WRITE_TOKEN) return false
+      if (!fs.existsSync(/*turbopackIgnore: true*/ local)) return false
+      const size = fs.statSync(local).size
+      if (size === 0) return false
+      const startedAt = Date.now()
+      await put(mediaBlobPath(id, kind), fs.createReadStream(local), {
+        access: 'private',
+        addRandomSuffix: false,
+        allowOverwrite: true,
+        contentType,
+        multipart: size > 8 * 1024 * 1024,
+      })
+      invalidateUsageCache()
+      console.log(`[media] mirrored ${kind} of ${id} to Blob (${(size / 1048576).toFixed(1)} MB in ${((Date.now() - startedAt) / 1000).toFixed(1)}s)`)
+      return true
+    } catch (err) {
+      console.error('[media] mirror to Blob failed:', err instanceof Error ? err.message : err)
+      return false
+    } finally {
+      mirroring.delete(key)
+    }
+  })()
+  mirroring.set(key, job)
   return job
 }
 

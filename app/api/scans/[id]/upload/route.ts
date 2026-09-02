@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server'
 import fs from 'node:fs'
 import { getScan, SCANS_DIR } from '@/lib/store'
 import { restoreScansFromBlob } from '@/lib/scan-blob'
-import { finalizeUploadedMedia, localMediaPath } from '@/lib/media'
+import { finalizeUploadedMedia, localMediaPath, mirrorMediaToBlob } from '@/lib/media'
 import { getSession } from '@/lib/users'
 import { pipelineReady } from '@/lib/merge-pipeline'
 import { dispatchMinuteFinder } from '@/lib/minute-finder-dispatch'
@@ -181,6 +181,10 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   // Probe with ffmpeg and set up segments / trim state right away.
   const result = await finalizeUploadedMedia(scan, kind, name)
   if (!result.ok) return NextResponse.json({ error: result.error }, { status: 400 })
+
+  // Push the finished file to Blob in the background (server → Blob is
+  // datacenter bandwidth) so it survives cold starts. The user never waits.
+  void mirrorMediaToBlob(id, kind, req.headers.get('x-video-type') || 'video/mp4')
 
   // AUTO MINUTE FINDER trigger (short-after-movie order): agar short abhi
   // aaya hai aur movie ka trim pehle se confirmed hai → user ke toggle ke
