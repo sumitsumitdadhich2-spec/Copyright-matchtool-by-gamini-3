@@ -1,0 +1,372 @@
+'use client'
+
+import { useState } from 'react'
+import useSWR from 'swr'
+import { Layers, Loader2, Check, AlertTriangle, RotateCcw, Play, Square, ChevronDown, ChevronRight, Sparkles } from 'lucide-react'
+import type { Scan, GeminiPrescanState, GeminiPrescanStatus, GeminiPrescanWindow, MinuteFinderMode } from '@/lib/types'
+import { fetcher, fmtTime, fmtBytes } from '@/lib/format'
+import { displayModelName } from '@/lib/models'
+import { MinuteFinderToggle } from './minute-finder-toggle'
+
+interface FinderResponse {
+  mode: MinuteFinderMode
+  keyCount: number
+  models: string[]
+  maxShortSec: number
+  ready: boolean
+  running: boolean
+  scanRunning: boolean
+  prescan: GeminiPrescanState
+}
+
+const STEPS: { key: string; label: string }[] = [
+  { key: 'preparing', label: 'Prepare movie copy' },
+  { key: 'uploading', label: 'Upload' },
+  { key: 'scanning', label: 'Scan windows' },
+  { key: 'starting_scan', label: 'Minutes found' },
+  { key: 'done', label: 'Chunk scan started' },
+]
+
+const ACTIVE: GeminiPrescanStatus[] = ['preparing', 'uploading', 'scanning', 'starting_scan']
+
+/** Which step the finder reached — for the running AND the error state. */
+function reachedStep(p: GeminiPrescanState): number {
+  if (p.status === 'done') return STEPS.length
+  const i = STEPS.findIndex((s) => s.key === p.status)
+  if (i >= 0) return i
+  // error / idle: infer from what exists
+  if (p.minuteSuggestions && p.minuteSuggestions.length > 0) return 3
+  if (p.windows.length > 0) return 2
+  if (Object.keys(p.uploads || {}).length > 0) return 1
+  return 0
+}
+
+/** AUTO PIPELINE panel (header + minute-finder toggle). Gemini mode shows the
+ *  Gemini Minute Finder flow; TwelveLabs mode defers to the old panel below;
+ *  Off shows a one-line note. The chunk-time scan itself is untouched. */
+export function MinuteFinderPanel({ scan, mode, onModeChanged }: { scan: Scan; mode: MinuteFinderMode; onModeChanged: (m: MinuteFinderMode) => void }) {
+  const [acting, setActing] = useState<string | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
+  const [openWindow, setOpenWindow] = useState<number | null>(null)
+
+  const { data, mutate } = useSWR<FinderResponse>(scan.id && mode === 'gemini' ? `/api/scans/${scan.id}/minute-finder` : null, fetcher, {
+    refreshInterval: (latest) => (latest && (ACTIVE.includes(latest.prescan?.status) || latest.running) ? 2000 : 10000),
+  })
+
+  const prescan: GeminiPrescanState = data?.prescan ?? scan.geminiPrescan ?? { status: 'idle', windowLen: 1200, uploads: {}, windows: [] }
+  const status = prescan.status
+  const isActive = ACTIVE.includes(status) || Boolean(data?.running)
+  const isError = status === 'error'
+  const isDone = status === 'done'
+  const step = reachedStep(prescan)
+  const trimStart = scan.movieTrimStart ?? 0
+  const keyCount = data?.keyCount ?? 0
+  const uploadedKeys = Object.values(prescan.uploads || {}).filter((u) => u.shortUri && u.movieUri).length
+  const windows = prescan.windows || []
+  const doneWindows = windows.filter((w) => w.status === 'done').length
+  const failedWindows = windows.filter((w) => w.status === 'failed').length
+  const windowsWithHits = windows.filter((w) => (w.matches || 0) > 0).length
+  const minutes = prescan.appliedMinutes ?? prescan.minuteSuggestions?.map((s) => s.minute) ?? []
+  const shortTooLong = Boolean(scan.shortDuration && data?.maxShortSec && scan.shortDuration > data.maxShortSec)
+
+  async function post(action: 'start' | 'retry' | 'rerun') {
+    setActing(action)
+    setActionError(null)
+    const res = await fetch(`/api/scans/${scan.id}/minute-finder`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action }),
+    })
+    setActing(null)
+    if (!res.ok) {
+      const j = (await res.json().catch(() => ({}))) as { error?: string }
+      setActionError(j.error || 'Action failed')
+    }
+    void mutate()
+  }
+
+  async function stop() {
+    setActing('stop')
+    setActionError(null)
+    const res = await fetch(`/api/scans/${scan.id}/minute-finder`, { method: 'DELETE' })
+    setActing(null)
+    if (!res.ok) {
+      const j = (await res.json().catch(() => ({}))) as { error?: string }
+      setActionError(j.error || 'Stop failed')
+    }
+    void mutate()
+  }
+
+  const canStart = mode === 'gemini' && Boolean(data?.ready) && !isActive && !data?.scanRunning && (status === 'idle' || isError) && !isDone
+  const canRetry = mode === 'gemini' && !isActive && !data?.scanRunning && (failedWindows > 0 || (isError && windows.length > 0))
+  const canRerun = mode === 'gemini' && Boolean(data?.ready) && !isActive && !data?.scanRunning && windows.length > 0
+
+  return (
+    <section aria-label="Auto pipeline — minute finder" className="panel">
+      <div className="flex flex-wrap items-center gap-2">
+        <Layers className="size-4 text-primary" aria-hidden />
+        <h2 className="text-sm font-semibold">
+          Auto Pipeline{' '}
+          <span className="font-normal text-muted-foreground">
+            {mode === 'gemini' ? '(Gemini Minute Finder)' : mode === 'twelvelabs' ? '(Merge → Index → Segmentation)' : '(off)'}
+          </span>
+        </h2>
+        <div className="ml-auto flex flex-wrap items-center justify-end gap-2">
+          {mode === 'gemini' &&
+            (isActive ? (
+              <span className="flex items-center gap-1 rounded-full border border-primary/30 bg-primary/15 px-2.5 py-0.5 text-xs text-primary">
+                <Loader2 className="size-3 animate-spin" aria-hidden />
+                Running...
+              </span>
+            ) : isDone ? (
+              <span className="flex items-center gap-1 rounded-full bg-success/15 px-2.5 py-0.5 text-xs text-success">
+                <Check className="size-3" aria-hidden />
+                Chunk scan started
+              </span>
+            ) : isError ? (
+              <span className="rounded-full bg-destructive/15 px-2.5 py-0.5 text-xs text-destructive">Error</span>
+            ) : (
+              <span className="rounded-full bg-secondary px-2.5 py-0.5 text-xs text-muted-foreground">
+                {data?.ready ? 'ready' : 'short + movie + trim ka wait'}
+              </span>
+            ))}
+          <MinuteFinderToggle mode={mode} onChanged={onModeChanged} />
+        </div>
+      </div>
+
+      {mode === 'off' && (
+        <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
+          Minute finder OFF hai — upload + trim ke baad kuch auto nahi chalega. Header me <span className="font-medium text-foreground">Start scan</span>{' '}
+          dabao to normal FULL scan hoga (saare chunks, 24 fps).
+        </p>
+      )}
+
+      {mode === 'twelvelabs' && (
+        <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
+          TwelveLabs mode — purana merge → Marengo → Pegasus → minute approval flow neeche wale panel me chalta hai (TwelveLabs key zaroori).
+        </p>
+      )}
+
+      {mode === 'gemini' && (
+        <>
+          {/* ACTION BUTTONS */}
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            {canStart && (
+              <button
+                type="button"
+                onClick={() => post('start')}
+                disabled={acting !== null || shortTooLong || keyCount === 0}
+                className="btn-press flex items-center gap-1 rounded-lg bg-primary px-3 py-1.5 text-xs font-semibold text-primary-foreground shadow-sm disabled:opacity-40"
+              >
+                <Play className="size-3" aria-hidden />
+                {acting === 'start' ? 'Starting...' : 'Start minute finder'}
+              </button>
+            )}
+            {canRetry && (
+              <button
+                type="button"
+                onClick={() => post('retry')}
+                disabled={acting !== null}
+                className="btn-press flex items-center gap-1 rounded-lg bg-primary px-3 py-1.5 text-xs font-semibold text-primary-foreground shadow-sm disabled:opacity-40"
+              >
+                <RotateCcw className="size-3" aria-hidden />
+                {acting === 'retry' ? 'Retrying...' : `Retry failed windows${failedWindows ? ` (${failedWindows})` : ''}`}
+              </button>
+            )}
+            {canRerun && (
+              <button
+                type="button"
+                onClick={() => post('rerun')}
+                disabled={acting !== null}
+                className="btn-press flex items-center gap-1 rounded-lg border border-input bg-card px-3 py-1.5 text-xs font-medium hover:border-primary/40 hover:bg-secondary disabled:opacity-40"
+              >
+                <RotateCcw className="size-3" aria-hidden />
+                {acting === 'rerun' ? 'Starting...' : 'Re-run minute finder'}
+              </button>
+            )}
+            {isActive && (
+              <button
+                type="button"
+                onClick={stop}
+                disabled={acting !== null}
+                className="btn-press flex items-center gap-1 rounded-lg border border-destructive/50 bg-card px-3 py-1.5 text-xs font-medium text-destructive hover:bg-destructive/10 disabled:opacity-40"
+              >
+                <Square className="size-3" aria-hidden />
+                {acting === 'stop' ? 'Stopping...' : 'Stop'}
+              </button>
+            )}
+            <span className="text-[11px] text-muted-foreground">
+              {keyCount} key(s) × {data?.models?.length ?? 2} models = {keyCount * (data?.models?.length ?? 2)} lanes · 1 req/min/lane
+            </span>
+          </div>
+
+          {shortTooLong && (
+            <p className="mt-2 flex items-start gap-1.5 text-xs text-warning">
+              <AlertTriangle className="mt-0.5 size-3 shrink-0" aria-hidden />
+              Short video 3 minute se lamba hai ({fmtTime(scan.shortDuration || 0)}) — Gemini Minute Finder sirf ≤3 min short par chalta hai. Manual Full scan use karo.
+            </p>
+          )}
+          {keyCount === 0 && data && (
+            <p className="mt-2 text-xs text-warning">Gemini API key nahi — Settings me key add karo.</p>
+          )}
+
+          {/* STEP TIMELINE */}
+          {(isActive || isDone || isError) && (
+            <ol className="mt-3 flex flex-wrap items-center gap-x-1 gap-y-2" aria-label="Minute finder steps">
+              {STEPS.map((s, i) => {
+                const done = step > i || isDone
+                const active = isActive && step === i
+                const failed = isError && step === i
+                let label = s.label
+                if (s.key === 'uploading' && keyCount > 0) label = `Upload (keys ${Math.min(uploadedKeys, keyCount)}/${keyCount})`
+                if (s.key === 'scanning' && windows.length > 0) label = `Scan windows (${doneWindows}/${windows.length})`
+                if (s.key === 'starting_scan' && minutes.length > 0) label = `Minutes found (${minutes.length})`
+                return (
+                  <li key={s.key} className="flex items-center gap-1">
+                    <span
+                      className={`flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] ${
+                        done
+                          ? 'bg-success/15 text-success'
+                          : active
+                            ? 'border border-primary/30 bg-primary/15 text-primary'
+                            : failed
+                              ? 'bg-destructive/15 text-destructive'
+                              : 'bg-secondary text-muted-foreground'
+                      }`}
+                    >
+                      {done ? <Check className="size-3" aria-hidden /> : active ? <Loader2 className="size-3 animate-spin" aria-hidden /> : failed ? <AlertTriangle className="size-3" aria-hidden /> : null}
+                      {label}
+                    </span>
+                    {i < STEPS.length - 1 && <span className="text-muted-foreground/50" aria-hidden>{'→'}</span>}
+                  </li>
+                )
+              })}
+            </ol>
+          )}
+
+          {/* LIVE PROGRESS */}
+          {isActive && prescan.progress && (
+            <p className="mt-2 flex items-center gap-1.5 text-xs text-muted-foreground">
+              <Loader2 className="size-3 animate-spin text-primary" aria-hidden />
+              {prescan.progress}
+            </p>
+          )}
+
+          {/* MOVIE COPY INFO */}
+          {prescan.movieCopy && (
+            <p className="mt-2 text-xs text-muted-foreground">
+              Movie upload copy: {fmtTime(prescan.movieCopy.trimStart)} → {fmtTime(prescan.movieCopy.trimEnd)} ({fmtTime(prescan.movieCopy.durationSec)}),{' '}
+              {fmtBytes(prescan.movieCopy.sizeBytes)} · {prescan.movieCopy.reencoded ? 're-encoded 480p' : 'stream copy'} — sirf Gemini upload ke liye, original/chunks untouched.
+            </p>
+          )}
+
+          {/* ERROR */}
+          {isError && prescan.error && (
+            <div className="mt-2 space-y-1">
+              <p className="flex items-start gap-1.5 text-xs text-destructive">
+                <AlertTriangle className="mt-0.5 size-3 shrink-0" aria-hidden />
+                <span>{prescan.error}</span>
+              </p>
+              <p className="text-[11px] text-muted-foreground">
+                Fallback: header ka <span className="font-medium text-foreground">Start scan</span> hamesha available hai (manual Full scan) — wo is finder par depend nahi karta.
+              </p>
+            </div>
+          )}
+          {actionError && <p className="mt-2 text-xs text-destructive">{actionError}</p>}
+
+          {/* MINUTES FOUND */}
+          {minutes.length > 0 && (
+            <div className="mt-3 rounded-lg border border-success/30 bg-success/5 p-2.5">
+              <p className="flex items-center gap-1.5 text-xs font-medium text-success">
+                <Sparkles className="size-3" aria-hidden />
+                Movie minute {minutes.map((m) => m + 1).join(', ')}{' '}
+                <span className="font-normal text-muted-foreground">
+                  ({windowsWithHits}/{windows.length} window{windows.length === 1 ? '' : 's'} me match · ±1 min buffer · chunk scan sirf inhi par)
+                </span>
+              </p>
+              <div className="mt-1.5 flex flex-wrap gap-1">
+                {minutes.map((m) => (
+                  <span key={m} className="rounded-md border border-success/30 bg-card px-2 py-0.5 font-mono text-[11px] text-success">
+                    {fmtTime(m * 60)}–{fmtTime((m + 1) * 60)}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* WINDOW GRID */}
+          {windows.length > 0 && (
+            <div className="mt-3">
+              <h3 className="text-xs font-semibold text-muted-foreground">
+                Windows ({doneWindows}/{windows.length} done{failedWindows ? `, ${failedWindows} failed` : ''}) — short @5fps + window @1fps
+              </h3>
+              <ul className="mt-1.5 grid gap-1.5 sm:grid-cols-2 lg:grid-cols-3">
+                {windows.map((w) => (
+                  <WindowCard key={w.index} w={w} trimStart={trimStart} open={openWindow === w.index} onToggle={() => setOpenWindow(openWindow === w.index ? null : w.index)} />
+                ))}
+              </ul>
+            </div>
+          )}
+
+          <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
+            Auto flow: trim confirm hote hi trimmed movie ki ek upload-copy banti hai (≤1.9 GB), short + copy har API key par Files API me upload hote hain,
+            phir movie 20-minute windows me {data?.models?.map(displayModelName).join(' + ') || 'gemini-3.6-flash + gemini-3.7-flash'} par scan hoti hai (short 5 fps, window 1 fps).
+            Jo minutes milte hain unpar 24 fps chunk-time scan apne aap start ho jata hai — koi approval nahi.
+          </p>
+        </>
+      )}
+    </section>
+  )
+}
+
+function WindowCard({ w, trimStart, open, onToggle }: { w: GeminiPrescanWindow; trimStart: number; open: boolean; onToggle: () => void }) {
+  const absStart = trimStart + w.startOffset
+  const absEnd = trimStart + w.endOffset
+  const chip =
+    w.status === 'done'
+      ? (w.matches || 0) > 0
+        ? 'bg-success/15 text-success'
+        : 'bg-secondary text-muted-foreground'
+      : w.status === 'running'
+        ? 'border border-primary/30 bg-primary/15 text-primary'
+        : w.status === 'failed'
+          ? 'bg-destructive/15 text-destructive'
+          : 'bg-secondary text-muted-foreground'
+  const chipText =
+    w.status === 'done' ? ((w.matches || 0) > 0 ? `${w.matches} hit(s)` : 'not in window') : w.status === 'running' ? 'running' : w.status === 'failed' ? 'failed' : 'pending'
+  return (
+    <li className="rounded-lg border border-border bg-background">
+      <button
+        type="button"
+        onClick={onToggle}
+        aria-expanded={open}
+        disabled={!w.raw && !w.error}
+        className="flex w-full flex-col gap-1 p-2 text-left disabled:cursor-default"
+      >
+        <div className="flex items-center gap-1.5">
+          <span className="font-mono text-xs font-semibold">
+            #{w.index} {fmtTime(absStart)}–{fmtTime(absEnd)}
+          </span>
+          <span className={`ml-auto flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] ${chip}`}>
+            {w.status === 'running' && <Loader2 className="size-3 animate-spin" aria-hidden />}
+            {w.status === 'done' && <Check className="size-3" aria-hidden />}
+            {chipText}
+          </span>
+          {(w.raw || w.error) && (open ? <ChevronDown className="size-3 text-muted-foreground" aria-hidden /> : <ChevronRight className="size-3 text-muted-foreground" aria-hidden />)}
+        </div>
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground">
+          {w.lane && <span>{w.lane.replace(/gemini-/, '')}</span>}
+          {w.tokens ? <span className="font-mono">{w.tokens.toLocaleString()} tok</span> : null}
+          {w.attempts && w.attempts > 1 ? <span>{w.attempts} attempts</span> : null}
+          {w.minutes && w.minutes.length > 0 && <span className="text-success">min {w.minutes.map((m) => m + 1).join(', ')}</span>}
+        </div>
+      </button>
+      {open && (w.raw || w.error) && (
+        <div className="border-t border-border p-2">
+          {w.error && <p className="mb-1 text-[11px] text-destructive">{w.error}</p>}
+          {w.raw && <pre className="max-h-64 overflow-auto whitespace-pre-wrap font-mono text-[11px] leading-relaxed text-muted-foreground">{w.raw}</pre>}
+        </div>
+      )}
+    </li>
+  )
+}

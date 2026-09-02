@@ -940,7 +940,8 @@ class Scheduler {
       groupsRejected: groups.filter((g) => g.status === 'rejected').length,
       groupsUnverified: groups.filter((g) => g.status === 'unverified').length,
       // How the chunk set was chosen for THIS run (results themselves are 100% Gemini).
-      prefilterMode: scan.prefilter?.mode === 'prefiltered' ? 'twelvelabs' : 'full',
+      prefilterMode:
+        scan.prefilter?.mode === 'prefiltered' ? 'twelvelabs' : scan.geminiPrescan?.appliedMinutes?.length ? 'gemini' : 'full',
       prefilterSelected: scan.prefilter?.selectedChunks,
       prefilterTotal: scan.prefilter?.totalChunks,
     }
@@ -1402,7 +1403,7 @@ class Scheduler {
         uploadedNames.push(movieClip.name)
 
         const vm = pickVerifyModel()
-        addLog(scan, 'info', `Verify: short ${ts(g.shortStart)}–${ts(g.shortEnd)} vs movie ${ts(c.movieStart)}–${ts(c.movieEnd)}${needsPad ? ' (padded)' : ''} on ${vm.id} (key ${lane.idx})`)
+        addLog(scan, 'info', `Verify: short ${ts(g.shortStart)}���${ts(g.shortEnd)} vs movie ${ts(c.movieStart)}–${ts(c.movieEnd)}${needsPad ? ' (padded)' : ''} on ${vm.id} (key ${lane.idx})`)
         const clipSecs = shortDur + padBefore + padAfter + Math.max(1, c.movieEnd - c.movieStart) + padBefore + padAfter
         const raw = await this.paceAndSend(job, lane, vm, clipSecs, () =>
           this.sendWithClipBackup(
@@ -1639,7 +1640,8 @@ class Scheduler {
       groupsConfirmed: groups.filter((g) => g.status === 'confirmed').length,
       groupsRejected: groups.filter((g) => g.status === 'rejected').length,
       groupsUnverified: groups.filter((g) => g.status === 'unverified').length,
-      prefilterMode: scan.prefilter?.mode === 'prefiltered' ? 'twelvelabs' : 'full',
+      prefilterMode:
+        scan.prefilter?.mode === 'prefiltered' ? 'twelvelabs' : scan.geminiPrescan?.appliedMinutes?.length ? 'gemini' : 'full',
       prefilterSelected: scan.prefilter?.selectedChunks,
       prefilterTotal: scan.prefilter?.totalChunks,
     }

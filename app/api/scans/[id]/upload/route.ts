@@ -1,11 +1,11 @@
 import { NextResponse } from 'next/server'
 import fs from 'node:fs'
-import { getScan, saveScan, addLog, SCANS_DIR } from '@/lib/store'
+import { getScan, SCANS_DIR } from '@/lib/store'
 import { restoreScansFromBlob } from '@/lib/scan-blob'
 import { finalizeUploadedMedia, localMediaPath } from '@/lib/media'
 import { getSession } from '@/lib/users'
-import { getUserTwelveLabsKey } from '@/lib/user-keys'
-import { startMergePipeline, pipelineReady, isPipelineRunning } from '@/lib/merge-pipeline'
+import { pipelineReady } from '@/lib/merge-pipeline'
+import { dispatchMinuteFinder } from '@/lib/minute-finder-dispatch'
 
 export const runtime = 'nodejs'
 export const maxDuration = 300
@@ -118,27 +118,19 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   const result = await finalizeUploadedMedia(scan, kind, name)
   if (!result.ok) return NextResponse.json({ error: result.error }, { status: 400 })
 
-  // AUTO MERGE PIPELINE trigger (short-after-movie order): agar short abhi
-  // aaya hai aur movie ka trim pehle se confirmed hai → pipeline auto-start.
+  // AUTO MINUTE FINDER trigger (short-after-movie order): agar short abhi
+  // aaya hai aur movie ka trim pehle se confirmed hai → user ke toggle ke
+  // hisaab se Gemini Minute Finder / TwelveLabs pipeline / nothing.
   // (Movie-after-short order trim route se trigger hota hai.)
   if (kind === 'short') {
     try {
       const fresh = getScan(id)
-      if (fresh && pipelineReady(fresh) && !isPipelineRunning(id)) {
-        const st = fresh.mergePipeline?.status
-        if (!st || st === 'idle') {
-          const session = await getSession()
-          const tlKey = session ? await getUserTwelveLabsKey(session.username) : null
-          if (!tlKey) {
-            addLog(fresh, 'info', 'TwelveLabs key nahi — auto merge pipeline skip, app normal flow me chalega')
-            saveScan(fresh)
-          } else {
-            startMergePipeline(id, tlKey)
-          }
-        }
+      if (fresh && pipelineReady(fresh)) {
+        const session = await getSession()
+        await dispatchMinuteFinder(id, session ? { username: session.username, role: session.role } : null)
       }
     } catch (err) {
-      console.error('[upload] merge pipeline auto-trigger failed:', err instanceof Error ? err.message : err)
+      console.error('[upload] minute finder auto-trigger failed:', err instanceof Error ? err.message : err)
     }
   }
 

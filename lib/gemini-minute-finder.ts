@@ -36,8 +36,10 @@ export const MINUTE_FINDER_WINDOW_SEC = 1200
 export const MINUTE_FINDER_MAX_SHORT_SEC = 180
 /** Gemini files live 48 h — reuse uploads for 47 h. */
 const UPLOAD_TTL_MS = 47 * 60 * 60 * 1000
-/** Safety cap per window for NON-rate errors (rate/429 retries are unlimited). */
-const MAX_WINDOW_ATTEMPTS = 8
+/** NO per-window attempt cap (user decision): any error → the SAME request is
+ *  re-queued and sent again after the lane's 1-minute pacing. A window only ends
+ *  up `failed` when every lane is dead (RPD exhausted) — Retry revives it. */
+const MAX_WINDOW_ATTEMPTS = Number.POSITIVE_INFINITY
 /** How long to wait for movie chunking to finish before the chunk scan can start. */
 const CHUNKING_WAIT_MS = 45 * 60_000
 
