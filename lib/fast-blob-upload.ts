@@ -1,60 +1,69 @@
 /**
- * Adaptive browser → Vercel Blob multipart uploader.
+ * Steady browser → Vercel Blob multipart uploader.
  *
- * Why not `upload()` from @vercel/blob/client? It is hardcoded to 6 parallel
- * parts of 8 MB with no stall handling, so on a high-latency / slightly lossy
- * link the throughput saw-tooths: fast for a burst, then a long dip while a
- * stuck part times out.
+ * THE PROBLEM this fixes ("15 Mbps burst → 10 s freeze → burst again"):
  *
- * What this uploader does differently to keep the speed STEADY:
+ *  Browsers buffer a whole request body into the HTTP/2 send window the
+ *  moment a request starts. `onUploadProgress` therefore hits 100 % for every
+ *  part almost instantly — long before the bytes are actually on the wire —
+ *  and then NOTHING happens until Blob acknowledges the part. With many
+ *  parts in flight the bar sprints, freezes for 10-20 s, and sprints again.
  *
- *  1. Adaptive concurrency (AIMD, like TCP itself). We start with a few parts
- *     in flight and add one more every tick while throughput keeps climbing.
- *     The moment a part stalls or errors we cut the in-flight count, because
- *     the browser multiplexes every part over ONE HTTP/2 connection — cramming
- *     100 MB into a single TCP pipe just makes every packet loss stall all of
- *     them at once. Finding the sweet spot for THIS connection is what makes
- *     the rate flat instead of "10 Mbps → kbps → 10 Mbps".
+ *  Worse, the old stall watchdog looked at those same progress events: a
+ *  healthy part that had been fully buffered (no more events) but was still
+ *  draining onto a 15 Mbps link got ABORTED after 10 s and re-sent — wasting
+ *  bandwidth and producing the real stop/start pattern the user sees.
  *
- *  2. Stall watchdog per part. If a part reports no progress for a few
- *     seconds it is aborted and re-sent immediately instead of hanging until
- *     the browser's own (very long) socket timeout gives up.
+ * WHAT WE DO INSTEAD:
  *
- *  3. Staggered part starts so parts finish out of phase and there is always
- *     something on the wire (no "all finish together → empty pipe" gap).
+ *  1. Speed is measured from ACKNOWLEDGED bytes only (parts confirmed by
+ *     Blob), smoothed over a rolling window + EMA. That is the true wire
+ *     rate, and it is what we show.
  *
- *  4. Smooth, monotonic progress + rolling speed (retries never move the bar
- *     backwards and the readout is averaged over several seconds).
+ *  2. The progress bar is a rate-limited ramp: it advances at the measured
+ *     speed and is clamped to what has really been handed to the network.
+ *     It never jumps and never goes backwards — one flat, honest number.
+ *
+ *  3. Stall detection is deadline based. A part gets at least
+ *     `size × inFlight ÷ rate × 4` (min 20 s) to be acknowledged before it is
+ *     considered stuck, so a slow-but-healthy link is never killed.
+ *
+ *  4. Modest, adaptive parallelism (3 → max 6 parts). All parts share ONE
+ *     TCP connection, so more parts don't add bandwidth — they only add
+ *     buffering and make the freeze longer. We add a part only when the
+ *     acked rate clearly improved, and back off on a real stall/error.
  */
 import { createMultipartUpload, uploadPart, completeMultipartUpload } from '@vercel/blob/client'
 
-/** Blob requires >= 5 MB per part except the last. Smaller parts finish more
- *  often, which keeps the in-flight byte count (and the progress bar) smooth. */
-const PART_BYTES = 6 * 1024 * 1024
-/** Parts in flight when we start — ramps up from here. */
-const INITIAL_CONCURRENCY = 4
+/** Blob requires >= 5 MB per part except the last. Smallest legal size →
+ *  most frequent acks → smoothest measured rate. */
+const PART_BYTES = 5 * 1024 * 1024
+const INITIAL_CONCURRENCY = 3
 const MIN_CONCURRENCY = 2
-const MAX_CONCURRENCY = 16
-/** How often the controller re-evaluates the in-flight count. */
-const TICK_MS = 2500
-/** A part with no progress event for this long is considered stuck. */
-const STALL_MS = 10_000
-/** Delay before re-sending a stalled part (fast — the link is likely fine). */
-const STALL_RETRY_DELAY_MS = 250
+const MAX_CONCURRENCY = 6
+/** How often the controller re-evaluates parallelism. */
+const TICK_MS = 5000
+/** Progress/speed is pushed to the UI on this cadence (rate-limited ramp). */
+const REPORT_MS = 200
+/** Rolling window for the acked-bytes speed measurement. */
+const SPEED_WINDOW_MS = 15_000
+/** Absolute minimum before a part can be called stuck. */
+const STALL_MIN_MS = 20_000
+/** Before we know the link speed, wait this long for the first acks. */
+const STALL_UNKNOWN_MS = 90_000
+const STALL_MAX_MS = 180_000
 const MAX_PART_ATTEMPTS = 8
-/** Rolling window for the speed readout. */
-const SPEED_WINDOW_MS = 6000
 /** Gap between launching consecutive parts so they finish out of phase. */
-const STAGGER_MS = 120
+const STAGGER_MS = 400
 
 export interface FastUploadProgress {
   loaded: number
   total: number
   /** 0-100 */
   percentage: number
-  /** bytes / second over the last few seconds; null until enough samples. */
+  /** bytes / second actually acknowledged by storage; null until measured. */
   speed: number | null
-  /** Parts currently in flight — handy for debugging the adaptive controller. */
+  /** Parts currently in flight. */
   inFlight: number
 }
 
@@ -74,11 +83,12 @@ interface PartResult {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+const clamp = (n: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, n))
 
 export async function fastBlobUpload(file: File, opts: FastUploadOptions): Promise<void> {
   const { token, pathname, signal } = opts
   const contentType = opts.contentType || file.type || 'application/octet-stream'
-  const maxConcurrency = Math.max(MIN_CONCURRENCY, Math.min(MAX_CONCURRENCY, opts.concurrency ?? MAX_CONCURRENCY))
+  const maxConcurrency = clamp(opts.concurrency ?? MAX_CONCURRENCY, MIN_CONCURRENCY, MAX_CONCURRENCY)
   const total = file.size
 
   const { key, uploadId } = await createMultipartUpload(pathname, {
@@ -91,43 +101,71 @@ export async function fastBlobUpload(file: File, opts: FastUploadOptions): Promi
   const partCount = Math.max(1, Math.ceil(total / PART_BYTES))
   const results: PartResult[] = new Array(partCount)
 
-  // ---- Progress bookkeeping -------------------------------------------------
-  // Bytes of parts fully acknowledged by Blob.
+  // ---- Byte accounting -------------------------------------------------------
+  /** Bytes of parts acknowledged by Blob — the only number we trust. */
   let committed = 0
-  // In-flight bytes per part (reset on retry, so never over-counts).
-  const inflightLoaded = new Float64Array(partCount)
-  // The bar never goes backwards even when a part has to be re-sent.
-  let displayedLoaded = 0
-  const samples: { t: number; loaded: number }[] = []
-  let lastReportAt = 0
-
-  function currentLoaded() {
+  /** Bytes the browser has handed to the network per in-flight part
+   *  (buffered, NOT necessarily delivered). Reset on retry. */
+  const buffered = new Float64Array(partCount)
+  const bufferedTotal = () => {
     let n = committed
-    for (let i = 0; i < partCount; i++) n += inflightLoaded[i]
+    for (let i = 0; i < partCount; i++) n += buffered[i]
     return n
   }
 
-  const report = (force = false) => {
-    const now = performance.now()
-    // Throttle to ~10 fps — 16 parts each firing progress events would
-    // otherwise flood React with state updates.
-    if (!force && now - lastReportAt < 100) return
-    lastReportAt = now
-    const loaded = currentLoaded()
-    displayedLoaded = Math.max(displayedLoaded, loaded)
-    samples.push({ t: now, loaded })
-    while (samples.length > 2 && now - samples[0].t > SPEED_WINDOW_MS) samples.shift()
-    let speed: number | null = null
-    if (samples.length >= 2) {
-      const first = samples[0]
-      const dt = (now - first.t) / 1000
-      if (dt >= 1) speed = Math.max(0, (loaded - first.loaded) / dt)
+  // ---- Acked-rate measurement -----------------------------------------------
+  const startedAt = performance.now()
+  const ackSamples: { t: number; committed: number }[] = [{ t: startedAt, committed: 0 }]
+  /** Smoothed acknowledged throughput (bytes/s). 0 until the first ack. */
+  let ackRate = 0
+  let lastAckAt = startedAt
+
+  function recordAck(now: number) {
+    lastAckAt = now
+    ackSamples.push({ t: now, committed })
+    while (ackSamples.length > 2 && now - ackSamples[0].t > SPEED_WINDOW_MS) ackSamples.shift()
+    const first = ackSamples[0]
+    const dt = (now - first.t) / 1000
+    if (dt >= 0.5) {
+      const windowRate = (committed - first.committed) / dt
+      ackRate = ackRate > 0 ? ackRate * 0.7 + windowRate * 0.3 : windowRate
     }
+  }
+
+  /** Best current estimate of the wire speed for the progress ramp. Before the
+   *  first ack we use half the buffered rate as a conservative guess so the
+   *  bar moves but cannot run far ahead of reality. */
+  function estimatedRate(now: number) {
+    if (ackRate > 0) {
+      // If acks have gone quiet for much longer than the window suggests,
+      // taper the estimate so the ramp slows instead of over-shooting.
+      const quiet = (now - lastAckAt) / 1000
+      const expectedGap = ackRate > 0 ? (PART_BYTES / ackRate) * 1.5 : 0
+      return quiet > expectedGap && expectedGap > 0 ? ackRate * clamp(expectedGap / quiet, 0.2, 1) : ackRate
+    }
+    const elapsed = (now - startedAt) / 1000
+    return elapsed > 0.5 ? (bufferedTotal() / elapsed) * 0.5 : 0
+  }
+
+  // ---- Rate-limited progress ramp -------------------------------------------
+  let displayed = 0
+  let lastReportAt = startedAt
+
+  function report(now = performance.now()) {
+    const dt = Math.max(0, (now - lastReportAt) / 1000)
+    lastReportAt = now
+    const rate = estimatedRate(now)
+    // Advance smoothly at the estimated speed, never beyond bytes actually
+    // handed to the network, never below what storage has acknowledged.
+    const ceiling = bufferedTotal()
+    displayed = clamp(Math.max(displayed, committed), displayed + rate * dt, ceiling)
+    displayed = Math.max(displayed, committed)
+    displayed = Math.min(displayed, ceiling, total)
     opts.onProgress?.({
-      loaded: displayedLoaded,
+      loaded: displayed,
       total,
-      percentage: total > 0 ? (displayedLoaded / total) * 100 : 100,
-      speed,
+      percentage: total > 0 ? (displayed / total) * 100 : 100,
+      speed: ackRate > 0 ? ackRate : null,
       inFlight: active,
     })
   }
@@ -137,39 +175,32 @@ export async function fastBlobUpload(file: File, opts: FastUploadOptions): Promi
   let active = 0
   let next = 0
   let failed: unknown = null
-  // Incidents (stall or transient error) since the last controller tick.
+  /** Real stalls / transient errors since the last controller tick. */
   let incidents = 0
-  let tickLoaded = 0
-  let tickAt = performance.now()
-  let bestRate = 0
+  let lastTickRate = 0
 
   function controllerTick() {
-    const now = performance.now()
-    const loaded = currentLoaded()
-    const dt = (now - tickAt) / 1000
-    const rate = dt > 0 ? (loaded - tickLoaded) / dt : 0
-    tickLoaded = loaded
-    tickAt = now
-
     if (incidents > 0) {
-      // Multiplicative decrease: the pipe is oversubscribed for this link.
-      target = Math.max(MIN_CONCURRENCY, Math.floor(target * 0.6))
-      bestRate = rate
-    } else if (rate >= bestRate * 0.8) {
-      // Additive increase while more parallelism still helps (or is neutral).
-      // A 2.5 s window is noisy, so only a CLEAR drop stops the ramp — and a
-      // drop without any stall/error never shrinks the pool (that used to
-      // oscillate the rate up and down every tick).
-      bestRate = Math.max(bestRate, rate)
-      target = Math.min(maxConcurrency, target + 1)
-    } else {
-      bestRate = Math.max(rate, bestRate * 0.9)
+      // The pipe is oversubscribed for this link — shed a part.
+      target = Math.max(MIN_CONCURRENCY, target - 1)
+    } else if (ackRate > 0 && ackRate > lastTickRate * 1.1 && target < maxConcurrency) {
+      // Acked rate is still climbing → one more part may help.
+      target = target + 1
     }
+    lastTickRate = ackRate
     incidents = 0
     void fill()
   }
 
-  // ---- Part upload with stall watchdog --------------------------------------
+  // ---- Part upload with deadline-based stall watchdog -------------------------
+  function stallLimitMs(size: number) {
+    if (ackRate <= 0) return STALL_UNKNOWN_MS
+    // Time this part *should* need given it shares the link with `active`
+    // others, with a 4x safety margin.
+    const expected = ((size * Math.max(1, active)) / ackRate) * 1000
+    return clamp(expected * 4, STALL_MIN_MS, STALL_MAX_MS)
+  }
+
   async function uploadOne(index: number) {
     const partNumber = index + 1
     const start = index * PART_BYTES
@@ -187,7 +218,7 @@ export async function fastBlobUpload(file: File, opts: FastUploadOptions): Promi
       let lastProgressAt = performance.now()
       let stalled = false
       const watchdog = setInterval(() => {
-        if (performance.now() - lastProgressAt > STALL_MS) {
+        if (performance.now() - lastProgressAt > stallLimitMs(size)) {
           stalled = true
           ctrl.abort()
         }
@@ -204,24 +235,22 @@ export async function fastBlobUpload(file: File, opts: FastUploadOptions): Promi
           abortSignal: ctrl.signal,
           onUploadProgress: ({ loaded }) => {
             const clamped = Math.min(loaded, size)
-            if (clamped > inflightLoaded[index]) lastProgressAt = performance.now()
-            inflightLoaded[index] = clamped
-            report()
+            if (clamped > buffered[index]) lastProgressAt = performance.now()
+            buffered[index] = clamped
           },
         })
-        inflightLoaded[index] = 0
+        buffered[index] = 0
         committed += size
         results[index] = { partNumber, etag: res.etag }
-        report(true)
+        recordAck(performance.now())
         return
       } catch (err) {
-        inflightLoaded[index] = 0
+        buffered[index] = 0
         if (signal?.aborted) throw err
         incidents++
         if (attempt + 1 >= MAX_PART_ATTEMPTS) throw err
         if (stalled) {
-          // The socket simply stopped moving — re-send right away.
-          await sleep(STALL_RETRY_DELAY_MS)
+          await sleep(500)
         } else {
           // Real error: exponential backoff with jitter (0.5s, 1s, 2s, 4s, 4s…).
           await sleep(Math.min(4000, 500 * 2 ** attempt) + Math.random() * 250)
@@ -259,7 +288,6 @@ export async function fastBlobUpload(file: File, opts: FastUploadOptions): Promi
     } finally {
       active--
       maybeFinish()
-      // Someone else may need to take over if target grew while we were busy.
       void fill()
     }
   }
@@ -271,7 +299,8 @@ export async function fastBlobUpload(file: File, opts: FastUploadOptions): Promi
     try {
       while (failed === null && active < target && next < partCount) {
         void worker()
-        // Stagger launches so parts finish out of phase.
+        // Stagger launches so parts finish out of phase and there is always
+        // an ack arriving somewhere instead of all of them at once.
         if (active < target && next < partCount) await sleep(STAGGER_MS)
       }
     } finally {
@@ -281,11 +310,13 @@ export async function fastBlobUpload(file: File, opts: FastUploadOptions): Promi
   }
 
   const ticker = setInterval(controllerTick, TICK_MS)
+  const reporter = setInterval(() => report(), REPORT_MS)
   try {
     void fill()
     await allDone
   } finally {
     clearInterval(ticker)
+    clearInterval(reporter)
   }
   if (failed !== null) throw failed
 
@@ -297,5 +328,6 @@ export async function fastBlobUpload(file: File, opts: FastUploadOptions): Promi
     contentType,
     abortSignal: signal,
   })
-  report(true)
+  displayed = total
+  report()
 }
