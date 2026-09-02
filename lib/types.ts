@@ -269,6 +269,76 @@ export interface MergePipelineState {
   finishedAt?: number | null
 }
 
+// ---------- Gemini Minute Finder (TwelveLabs/Pegasus alternative) ----------
+
+/** Which minute finder runs after upload + trim confirm.
+ *  'gemini' (default) = Gemini Minute Finder (20-min windows @ 5fps/1fps),
+ *  'twelvelabs' = old merge → Marengo → Pegasus → approval flow (unchanged),
+ *  'off' = no finder; user presses Start for a normal full scan. */
+export type MinuteFinderMode = 'gemini' | 'twelvelabs' | 'off'
+
+export type GeminiPrescanStatus =
+  | 'idle'
+  | 'preparing' // ffmpeg upload-copy of the trimmed movie
+  | 'uploading' // short + movie copy → Gemini Files API (per key)
+  | 'scanning' // 20-minute windows in flight
+  | 'starting_scan' // minutes found — kicking off the chunk scan
+  | 'done'
+  | 'error'
+
+export type GeminiPrescanWindowStatus = 'pending' | 'running' | 'done' | 'failed'
+
+export interface GeminiPrescanWindow {
+  index: number
+  /** seconds within the MOVIE COPY (trim-relative) */
+  startOffset: number
+  endOffset: number
+  status: GeminiPrescanWindowStatus
+  /** "key N · model" lane that produced the result */
+  lane?: string
+  /** usageMetadata.totalTokenCount of the last response */
+  tokens?: number
+  /** parsed MATCH + POSSIBLE lines */
+  matches?: number
+  /** ABSOLUTE original-movie minutes this window contributed */
+  minutes?: number[]
+  raw?: string
+  error?: string
+  attempts?: number
+}
+
+export interface GeminiPrescanUpload {
+  shortUri: string
+  shortName: string
+  movieUri: string
+  movieName: string
+  uploadedAt: number
+}
+
+export interface GeminiPrescanState {
+  status: GeminiPrescanStatus
+  progress?: string
+  windowLen: number
+  movieCopy?: {
+    path: string
+    durationSec: number
+    sizeBytes: number
+    reencoded: boolean
+    /** trim range the copy was cut from — a different trim invalidates the copy + movie uploads */
+    trimStart: number
+    trimEnd: number
+  }
+  /** keyed by apiKeyHash — Gemini files are project-scoped, so one upload per key */
+  uploads: Record<string, GeminiPrescanUpload>
+  windows: GeminiPrescanWindow[]
+  minuteSuggestions?: MinuteSuggestion[]
+  /** minutes handed to the chunk scan (absolute original-movie minutes, 0-based) */
+  appliedMinutes?: number[]
+  error?: string | null
+  startedAt?: number | null
+  finishedAt?: number | null
+}
+
 export interface ModelLiveState {
   state: 'idle' | 'active' | 'cooling' | 'exhausted' | 'waiting'
   currentChunk: number | null
@@ -288,8 +358,8 @@ export interface ScanReport {
   groupsConfirmed?: number
   groupsRejected?: number
   groupsUnverified?: number
-  /** how the chunk set was chosen: 'twelvelabs' pre-filter or normal 'full' scan */
-  prefilterMode?: 'twelvelabs' | 'full'
+  /** how the chunk set was chosen: 'twelvelabs' pre-filter, 'gemini' minute finder, or normal 'full' scan */
+  prefilterMode?: 'twelvelabs' | 'full' | 'gemini'
   prefilterSelected?: number
   prefilterTotal?: number
 }
@@ -335,6 +405,8 @@ export interface Scan {
   prefilter?: PrefilterInfo
   /** AUTO pipeline: merge → TL asset → Marengo index → Pegasus segmentation → minute approval */
   mergePipeline?: MergePipelineState
+  /** GEMINI MINUTE FINDER: 20-minute window pre-scan → minute list → auto chunk scan */
+  geminiPrescan?: GeminiPrescanState
   logs: LogEntry[]
   startedAt: number | null
   finishedAt: number | null

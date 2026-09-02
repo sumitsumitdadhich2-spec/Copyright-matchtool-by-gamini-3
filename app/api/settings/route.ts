@@ -7,6 +7,9 @@ import {
   getUserTwelveLabsKey,
   setUserTwelveLabsKey,
   clearUserTwelveLabsKey,
+  getUserMinuteFinderMode,
+  setUserMinuteFinderMode,
+  isMinuteFinderMode,
 } from '@/lib/user-keys'
 import { getSession } from '@/lib/users'
 import { MODEL_POOL } from '@/lib/models'
@@ -28,9 +31,12 @@ export async function GET() {
   }
   const key1 = await getUserKeyN(session.username, 1)
   const tlKey = await getUserTwelveLabsKey(session.username)
+  const minuteFinder = await getUserMinuteFinderMode(session.username)
   return NextResponse.json({
     keys,
     maxKeys: MAX_API_KEYS,
+    // Minute finder toggle: 'gemini' (default) | 'twelvelabs' | 'off'
+    minuteFinder,
     // OPTIONAL Twelve Labs pre-filter key (missing = feature off, app unchanged)
     twelveLabs: { hasKey: Boolean(tlKey), maskedKey: tlKey ? mask(tlKey) : null },
     // legacy fields kept for older clients
@@ -43,12 +49,34 @@ export async function GET() {
   })
 }
 
+/** PUT { minuteFinder: 'gemini' | 'twelvelabs' | 'off' } — persist the minute finder toggle.
+ *  A running pipeline is NOT affected; the new mode applies from the next upload/trim. */
+export async function PUT(req: Request) {
+  const session = await getSession()
+  if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  const body = (await req.json().catch(() => ({}))) as Record<string, unknown>
+  if (!isMinuteFinderMode(body.minuteFinder)) {
+    return NextResponse.json({ error: 'minuteFinder must be gemini | twelvelabs | off' }, { status: 400 })
+  }
+  await setUserMinuteFinderMode(session.username, body.minuteFinder)
+  return NextResponse.json({ ok: true, minuteFinder: body.minuteFinder })
+}
+
 export async function POST(req: Request) {
   const session = await getSession()
   if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   const username = session.username
 
   const body = (await req.json()) as Record<string, unknown>
+
+  // ----- Minute finder toggle (also accepted via POST for older clients) -----
+  if (body.minuteFinder !== undefined) {
+    if (!isMinuteFinderMode(body.minuteFinder)) {
+      return NextResponse.json({ error: 'minuteFinder must be gemini | twelvelabs | off' }, { status: 400 })
+    }
+    await setUserMinuteFinderMode(username, body.minuteFinder)
+    return NextResponse.json({ ok: true })
+  }
 
   // ----- Twelve Labs key (optional pre-filter): { twelveLabsKey } / { clearTwelveLabs: true } -----
   if (body.clearTwelveLabs === true) {
