@@ -72,18 +72,20 @@ function createSpeedMeter(windowMs = 6000) {
   }
 }
 
-// ---- PRIMARY path: browser → app server (chunked, parallel) → disk, then the
-// server mirrors the file to Blob at datacenter speed. Measured on real
-// uploads this is 10-20x faster and far steadier than sending parts straight
-// to the Blob origin: the app is fronted by an edge POP close to the user, so
-// TCP/TLS terminate nearby and every chunk gets a short, low-loss first hop.
-// Direct browser → Blob multipart is kept only as a FALLBACK (e.g. a
-// multi-instance server that cannot assemble chunks on one disk).
+// ---- PRIMARY path: browser → Vercel Blob directly (multipart, steady-rate
+// uploader in lib/fast-blob-upload.ts). The bytes go to ONE place in ONE hop
+// and the server then pulls the file at datacenter speed for ffmpeg.
+//
+// FALLBACK path: browser → app server in ~4 MB chunks. On Vercel every chunk
+// can land on a DIFFERENT serverless instance (each with its own /tmp), so the
+// file often can never be assembled and the whole upload had to be redone via
+// Blob — that "upload to 99 %, then start over" was the worst of the stalls.
+// It is kept only for when Blob is unreachable/misconfigured.
 const CHUNK_BYTES = 4 * 1024 * 1024
-/** How many chunks fly at once. Keeps the pipe full on high-latency links. */
-const PARALLEL = 8
+/** Chunks in flight for the fallback. Few = short, honest requests. */
+const PARALLEL = 3
 /** A chunk with no response for this long is aborted and re-sent. */
-const CHUNK_TIMEOUT_MS = 45_000
+const CHUNK_TIMEOUT_MS = 90_000
 
 export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Props) {
   const [uploading, setUploading] = useState<Kind | null>(null)
@@ -119,9 +121,8 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
   }
 
   /**
-   * FALLBACK: direct browser → Vercel Blob upload, then a small /complete call
-   * so the server pulls the file down and runs ffmpeg. Used only when the
-   * chunked server path could not transport/assemble the file.
+   * PRIMARY: direct browser → Vercel Blob upload, then a small /complete call
+   * so the server pulls the file down and runs ffmpeg.
    *
    * Returns true when everything succeeded. Returns false ONLY when the Blob
    * upload itself could not even start / transfer (token endpoint unreachable,
@@ -131,8 +132,8 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
     const contentType = file.type || 'application/octet-stream'
     let transferred = false
 
-    // 1) FASTEST: our own multipart uploader with 12 parts in flight and a
-    //    rolling speed readout. Needs a scoped client token from the server.
+    // 1) Steady-rate multipart uploader (acked-bytes speed, rate-limited bar,
+    //    deadline-based stall detection). Needs a scoped client token.
     try {
       const tokRes = await fetch(`/api/scans/${id}/upload/token`, {
         method: 'POST',
@@ -202,11 +203,11 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
   }
 
   /**
-   * PRIMARY: parallel chunked upload to the app server. Resolves true when the
-   * server confirmed the assembled file + ffmpeg finalize. Resolves false ONLY
-   * when the transport itself is unusable (network unreachable / 5xx storms /
-   * server never confirmed assembly) so the caller can fall back to Blob.
-   * Real 4xx errors (bad video etc.) are thrown as-is.
+   * FALLBACK: parallel chunked upload to the app server. Resolves true when the
+   * server confirmed the assembled file + ffmpeg finalize. Resolves false when
+   * the transport itself is unusable (network unreachable / 5xx storms /
+   * server never confirmed assembly). Real 4xx errors (bad video etc.) are
+   * thrown as-is.
    */
   async function uploadChunkedToServer(id: string, kind: Kind, file: File): Promise<boolean> {
     const session = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`
@@ -340,16 +341,16 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
       try {
         const id = await ensureScan()
 
-        // PRIMARY: parallel chunked upload through the app server (fast,
-        // steady — see the note above CHUNK_BYTES).
-        const viaServer = await uploadChunkedToServer(id, kind, file)
-        if (!viaServer) {
-          // FALLBACK: direct browser → Vercel Blob multipart upload.
+        // PRIMARY: direct browser → Vercel Blob multipart upload (one hop,
+        // steady rate — see the note above CHUNK_BYTES).
+        const direct = await uploadDirectToBlob(id, kind, file)
+        if (!direct) {
+          // FALLBACK: chunked upload through the app server.
           setProgress(0)
           setSpeed(null)
           setInFlight(0)
-          const direct = await uploadDirectToBlob(id, kind, file)
-          if (!direct) throw new Error('Upload failed — could not reach the server or storage. Please try again.')
+          const viaServer = await uploadChunkedToServer(id, kind, file)
+          if (!viaServer) throw new Error('Upload failed — could not reach the server or storage. Please try again.')
         }
 
         setProgress(100)
