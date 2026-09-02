@@ -3,7 +3,7 @@ import 'server-only'
 import { getScan, saveScan, addLog } from './store'
 import { getAllUserApiKeys, getUserTwelveLabsKey, getUserMinuteFinderMode } from './user-keys'
 import { startMergePipeline, pipelineReady, isPipelineRunning } from './merge-pipeline'
-import { startGeminiMinuteFinder, isMinuteFinderRunning } from './gemini-minute-finder'
+import { startGeminiMinuteFinder, isMinuteFinderRunning, stopAndWaitMinuteFinder } from './gemini-minute-finder'
 import type { MinuteFinderMode } from './types'
 
 export interface DispatchUser {
@@ -52,13 +52,41 @@ export async function dispatchMinuteFinder(scanId: string, user: DispatchUser | 
   }
 
   // ---- 'gemini' ----
-  if (isMinuteFinderRunning(scanId)) return mode
   const keys = await getAllUserApiKeys(user.username)
   if (keys.length === 0) {
     addLog(scan, 'warn', 'Gemini API key nahi — Minute Finder skip. Settings me key add karo ya manual Start (Full scan) dabao')
     saveScan(scan)
     return mode
   }
+
+  if (isMinuteFinderRunning(scanId)) {
+    // A new upload/trim arrived while an older run is still going — its
+    // windows point at the OLD range, so stop it and start fresh once its
+    // in-flight request has settled (can take up to ~2 min). Background.
+    void (async () => {
+      const idle = await stopAndWaitMinuteFinder(scanId, 'naya upload/trim aaya — purana run stale tha', 5 * 60_000)
+      if (!idle) {
+        const s = getScan(scanId)
+        if (s) {
+          addLog(s, 'warn', 'Purana minute finder abhi bhi band nahi hua — Auto Pipeline panel se "Start minute finder" dabao')
+          saveScan(s)
+        }
+        return
+      }
+      const s = getScan(scanId)
+      if (!s || !pipelineReady(s)) return
+      const r = startGeminiMinuteFinder(scanId, keys, user, 'start')
+      if (!r.ok && r.error) {
+        const fresh = getScan(scanId)
+        if (fresh) {
+          addLog(fresh, 'info', `Gemini Minute Finder auto-start skip: ${r.error}`)
+          saveScan(fresh)
+        }
+      }
+    })()
+    return mode
+  }
+
   const result = startGeminiMinuteFinder(scanId, keys, user, 'start')
   if (!result.ok && result.error) {
     // "already complete for this trim" etc. — informational only.

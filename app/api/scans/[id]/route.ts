@@ -4,14 +4,15 @@ import { restoreScansFromBlob } from '@/lib/scan-blob'
 import { invalidateUsageCache } from '@/lib/media'
 import { scheduler } from '@/lib/scheduler'
 import { getSession } from '@/lib/users'
+import { isMinuteFinderRunning, stopGeminiMinuteFinder } from '@/lib/gemini-minute-finder'
 
 export const runtime = 'nodejs'
 
 export async function GET(_req: Request, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params
   let scan: Awaited<ReturnType<typeof getFreshScan>>
-  if (scheduler.isRunning(id)) {
-    // Scan is actively running ON THIS instance — local state is freshest.
+  if (scheduler.isRunning(id) || isMinuteFinderRunning(id)) {
+    // Scan / minute finder is actively running ON THIS instance — local state is freshest.
     scan = getScan(id)
   } else {
     // Cross-instance safe read: another serverless instance may have just
@@ -43,8 +44,9 @@ export async function DELETE(_req: Request, ctx: { params: Promise<{ id: string 
   const scan = getScan(id)
   if (!scan) return NextResponse.json({ error: 'Not found' }, { status: 404 })
 
-  // Stop any running scan job before removing its files.
+  // Stop any running scan job / minute finder before removing its files.
   if (scheduler.isRunning(id)) scheduler.stop(id)
+  if (isMinuteFinderRunning(id)) stopGeminiMinuteFinder(id)
 
   deleteScan(id)
   invalidateUsageCache()

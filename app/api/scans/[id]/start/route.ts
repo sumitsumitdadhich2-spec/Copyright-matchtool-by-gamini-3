@@ -3,6 +3,7 @@ import { scheduler } from '@/lib/scheduler'
 import { getSession } from '@/lib/users'
 import { getAllUserApiKeys, getUserTwelveLabsKey } from '@/lib/user-keys'
 import { deductTokens, refundTokens, SCAN_TOKEN_COST } from '@/lib/tokens'
+import { isMinuteFinderRunning, stopAndWaitMinuteFinder } from '@/lib/gemini-minute-finder'
 
 export const runtime = 'nodejs'
 
@@ -46,6 +47,20 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   // OPTIONAL Twelve Labs pre-filter key: passing it enables the embedding
   // pre-filter at scan time. Missing key = normal full scan (feature off).
   const tlApiKey = await getUserTwelveLabsKey(session.username)
+
+  // Manual Start = the user's decision. A Gemini Minute Finder still running
+  // for this scan is stopped first so it cannot fire its own scheduler.start
+  // (or keep burning quota) underneath the manual scan.
+  if (isMinuteFinderRunning(id)) {
+    const idle = await stopAndWaitMinuteFinder(id, 'manual Start dabaya gaya', 20_000)
+    if (!idle) {
+      if (charged) await refundTokens(session.username, SCAN_TOKEN_COST)
+      return NextResponse.json(
+        { error: 'Gemini Minute Finder abhi band ho raha hai (request in flight) — kuch seconds baad Start dobara dabao.' },
+        { status: 409 },
+      )
+    }
+  }
 
   const result = await scheduler.start(id, resume, userApiKeys, tlApiKey)
   if (!result.ok) {
