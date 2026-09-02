@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { handleUpload, type HandleUploadBody } from '@vercel/blob/client'
+import { handleUpload, generateClientTokenFromReadWriteToken, type HandleUploadBody } from '@vercel/blob/client'
 import { getScan, SCANS_DIR } from '@/lib/store'
 import { restoreScansFromBlob } from '@/lib/scan-blob'
 import { mediaBlobPath } from '@/lib/media'
@@ -25,14 +25,44 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   }
   if (!scan) return NextResponse.json({ error: 'Scan not found' }, { status: 404 })
 
-  let body: HandleUploadBody
+  let body: HandleUploadBody | { type: 'direct'; kind: 'short' | 'movie'; contentType?: string }
   try {
-    body = (await req.json()) as HandleUploadBody
+    body = (await req.json()) as typeof body
   } catch {
     return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 })
   }
 
   const allowed = [mediaBlobPath(id, 'short'), mediaBlobPath(id, 'movie')]
+
+  // FAST PATH: hand the browser a short-lived client token scoped to exactly
+  // one pathname so it can drive its own high-concurrency multipart upload
+  // (createMultipartUpload / uploadPart / completeMultipartUpload). The stock
+  // `upload()` helper caps at 6 parallel parts which starves high-latency
+  // links; our own uploader runs many more in flight.
+  if ('type' in body && body.type === 'direct') {
+    if (body.kind !== 'short' && body.kind !== 'movie') {
+      return NextResponse.json({ error: 'Invalid kind' }, { status: 400 })
+    }
+    if (!process.env.BLOB_READ_WRITE_TOKEN) {
+      return NextResponse.json({ error: 'Blob storage not configured' }, { status: 503 })
+    }
+    const pathname = mediaBlobPath(id, body.kind)
+    try {
+      const token = await generateClientTokenFromReadWriteToken({
+        token: process.env.BLOB_READ_WRITE_TOKEN,
+        pathname,
+        allowedContentTypes: ['video/*', 'application/octet-stream'],
+        maximumSizeInBytes: 5 * 1024 * 1024 * 1024, // 5 GB per video
+        addRandomSuffix: false,
+        allowOverwrite: true,
+        // Enough for a multi-GB movie on a slow uplink.
+        validUntil: Date.now() + 6 * 60 * 60 * 1000,
+      })
+      return NextResponse.json({ token, pathname })
+    } catch (err) {
+      return NextResponse.json({ error: err instanceof Error ? err.message : 'Upload token failed' }, { status: 400 })
+    }
+  }
 
   try {
     const json = await handleUpload({
