@@ -18,14 +18,16 @@ export function ReportPanel({ scan }: { scan: Scan }) {
         {report.prefilterMode != null && (
           <span
             className={`ml-auto rounded-full px-2.5 py-0.5 text-xs ${
-              report.prefilterMode === 'twelvelabs'
+              report.prefilterMode === 'twelvelabs' || report.prefilterMode === 'gemini'
                 ? 'bg-primary/15 text-primary'
                 : 'bg-secondary text-muted-foreground'
             }`}
           >
             {report.prefilterMode === 'twelvelabs'
               ? `Twelve Labs pre-filtered — ${report.prefilterSelected ?? 0} of ${report.prefilterTotal ?? 0} chunks`
-              : 'Full scan'}
+              : report.prefilterMode === 'gemini'
+                ? `Chunk set: Gemini Minute Finder (${scan.geminiPrescan?.appliedMinutes?.length ?? 0} minutes)`
+                : 'Full scan'}
           </span>
         )}
       </div>

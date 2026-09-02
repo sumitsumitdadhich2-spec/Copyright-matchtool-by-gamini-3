@@ -3,7 +3,7 @@
 import { useState } from 'react'
 import useSWR from 'swr'
 import { Play, Square, RotateCcw, Loader2, LogOut, ScanSearch, Settings, Users } from 'lucide-react'
-import type { Scan } from '@/lib/types'
+import type { Scan, MinuteFinderMode } from '@/lib/types'
 import { fetcher } from '@/lib/format'
 import { useAuth } from '@/components/auth/auth-gate'
 import { UsersDialog } from '@/components/auth/users-dialog'
@@ -11,6 +11,7 @@ import { TokenBadge, TokensExhaustedBanner, useTokens } from './token-badge'
 import { SettingsDialog } from './settings-dialog'
 import { UploadPanel } from './upload-panel'
 import { TwelveLabsPanel } from './twelvelabs-panel'
+import { MinuteFinderPanel } from './minute-finder-panel'
 import { TrimPanel } from './trim-panel'
 import { MinuteSelectPanel } from './minute-select-panel'
 import { ScanTimeline } from './scan-timeline'
@@ -47,6 +48,10 @@ export function Dashboard() {
       return st === 'scanning' || st === 'chunking' || latest?.running || rendering || segmenting ? 1500 : 5000
     },
   })
+
+  // Minute finder toggle (per-user setting): gemini (default) | twelvelabs | off.
+  const { data: settings, mutate: mutateSettings } = useSWR<{ minuteFinder?: MinuteFinderMode }>('/api/settings', fetcher)
+  const minuteFinderMode: MinuteFinderMode = settings?.minuteFinder ?? 'gemini'
 
   const scan = data?.scan || null
   const running = data?.running || false
@@ -220,7 +225,15 @@ export function Dashboard() {
 
       <div className="grid gap-4 lg:grid-cols-3">
         <div className="flex flex-col gap-4 lg:col-span-2">
-          {scan && <TwelveLabsPanel scan={scan} />}
+          {scan && (
+            <MinuteFinderPanel
+              scan={scan}
+              mode={minuteFinderMode}
+              onModeChanged={(m) => void mutateSettings((prev) => ({ ...(prev || {}), minuteFinder: m }), { revalidate: true })}
+            />
+          )}
+          {/* Old TwelveLabs auto pipeline — only behind the toggle (zero changes inside). */}
+          {scan && minuteFinderMode === 'twelvelabs' && <TwelveLabsPanel scan={scan} />}
           <UploadPanel scan={scan} selectedScanId={scanId} onScanCreated={(id) => setScanId(id)} refresh={() => void mutate()} />
           {scan && scan.awaitingTrim && scan.movieDuration && scan.status !== 'chunking' && (
             <TrimPanel scan={scan} refresh={() => void mutate()} />
