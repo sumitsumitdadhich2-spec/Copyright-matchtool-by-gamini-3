@@ -11,18 +11,81 @@ export const runtime = 'nodejs'
 export const maxDuration = 300
 
 /**
- * CHUNKED upload: the browser slices the video into small pieces (~4 MB) and
- * sends them sequentially. Small request bodies pass through proxies and
- * serverless body-size limits that silently truncate a single giant POST.
+ * PARALLEL CHUNKED upload: the browser slices the video into small pieces
+ * (~4 MB) and sends SEVERAL of them at the same time. Small request bodies
+ * pass through proxies and serverless body-size limits that silently truncate
+ * a single giant POST, and sending them concurrently keeps the connection
+ * saturated instead of paying one round-trip of latency per chunk.
  *
- * Each chunk carries its byte offset; the server appends it to a .part file
- * and, once the final byte arrives, renames it into place and runs ffmpeg.
- * Retried chunks (same offset) are detected and skipped, so the client can
- * safely retry on network errors.
+ * Because chunks can arrive in ANY order, each one is written at its byte
+ * offset (positional write) into a .part file. A sidecar .meta file tracks
+ * which byte ranges have landed; the request that completes coverage renames
+ * the file into place and runs ffmpeg. Duplicate chunks (client retries) are
+ * harmless — they overwrite identical bytes.
  *
  * Query params:
  *   ?kind=short|movie & name=<filename> & offset=<byte offset> & total=<file size>
+ *   & session=<random id for THIS upload attempt — a new one resets the .part>
  */
+
+interface PartMeta {
+  session: string
+  total: number
+  /** Sorted, non-overlapping [start, end) byte ranges received so far. */
+  ranges: Array<[number, number]>
+}
+
+function readMeta(metaPath: string): PartMeta | null {
+  try {
+    if (!fs.existsSync(/*turbopackIgnore: true*/ metaPath)) return null
+    return JSON.parse(fs.readFileSync(metaPath, 'utf8')) as PartMeta
+  } catch {
+    return null
+  }
+}
+
+function writeMeta(metaPath: string, meta: PartMeta) {
+  fs.writeFileSync(metaPath, JSON.stringify(meta))
+}
+
+/** Insert [start, end) and merge adjacent/overlapping ranges. */
+function addRange(ranges: Array<[number, number]>, start: number, end: number): Array<[number, number]> {
+  const out: Array<[number, number]> = []
+  let s = start
+  let e = end
+  let inserted = false
+  for (const [rs, re] of ranges) {
+    if (re < s) {
+      out.push([rs, re])
+    } else if (rs > e) {
+      if (!inserted) {
+        out.push([s, e])
+        inserted = true
+      }
+      out.push([rs, re])
+    } else {
+      s = Math.min(s, rs)
+      e = Math.max(e, re)
+    }
+  }
+  if (!inserted) out.push([s, e])
+  return out
+}
+
+function covered(ranges: Array<[number, number]>): number {
+  let n = 0
+  for (const [s, e] of ranges) n += e - s
+  return n
+}
+
+function safeUnlink(p: string) {
+  try {
+    fs.unlinkSync(p)
+  } catch {
+    // ignore
+  }
+}
+
 export async function POST(req: Request, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params
   let scan = getScan(id)
@@ -42,6 +105,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
 
   const offset = Number.parseInt(url.searchParams.get('offset') || '', 10)
   const total = Number.parseInt(url.searchParams.get('total') || '', 10)
+  const session = (url.searchParams.get('session') || '').slice(0, 64) || 'legacy'
   if (!Number.isFinite(offset) || offset < 0 || !Number.isFinite(total) || total <= 0 || offset >= total) {
     return NextResponse.json({ error: 'Invalid offset/total' }, { status: 400 })
   }
@@ -62,57 +126,57 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
 
   const dest = localMediaPath(id, kind)
   const part = `${dest}.part`
+  const metaPath = `${dest}.meta`
 
-  // Starting a new upload (offset 0) always begins a fresh .part file.
-  const partSize = offset === 0 ? 0 : fs.existsSync(/*turbopackIgnore: true*/ part) ? fs.statSync(part).size : 0
-
-  if (offset === 0) {
-    try {
-      fs.writeFileSync(part, chunk)
-    } catch (err) {
-      console.error('[upload] write failed:', err instanceof Error ? err.message : err)
-      return NextResponse.json({ error: 'Upload failed while saving the file. Please try again.' }, { status: 500 })
+  // ---- Positional write. All fs work below is synchronous so two concurrent
+  // requests in the same process can never interleave a read-modify-write of
+  // the meta file (Node runs sync fs calls to completion without yielding).
+  try {
+    let meta = readMeta(metaPath)
+    const fresh = !meta || meta.session !== session || meta.total !== total || !fs.existsSync(/*turbopackIgnore: true*/ part)
+    if (fresh) {
+      // New upload attempt — start a clean .part (drops any half-finished one).
+      safeUnlink(part)
+      fs.closeSync(fs.openSync(part, 'w'))
+      meta = { session, total, ranges: [] }
     }
-  } else if (offset === partSize) {
-    // Expected next chunk — append.
-    try {
-      fs.appendFileSync(part, chunk)
-    } catch (err) {
-      console.error('[upload] append failed:', err instanceof Error ? err.message : err)
-      return NextResponse.json({ error: 'Upload failed while saving the file. Please try again.' }, { status: 500 })
-    }
-  } else if (offset + chunk.length <= partSize) {
-    // Duplicate of an already-written chunk (client retried after a lost
-    // response) — ignore it, the bytes are already on disk.
-  } else {
-    // Gap or partial overlap — the .part file is out of sync with the client.
-    // Report where the server actually is so the client can resume from there.
-    return NextResponse.json(
-      { error: 'Upload out of sync — please restart the upload.', received: partSize },
-      { status: 409 },
-    )
-  }
 
-  const newSize = fs.statSync(/*turbopackIgnore: true*/ part).size
-  if (newSize < total) {
-    // More chunks to come.
-    return NextResponse.json({ ok: true, received: newSize })
-  }
-
-  // Last chunk arrived — verify and move into place.
-  if (newSize !== total) {
+    const fd = fs.openSync(part, 'r+')
     try {
-      fs.unlinkSync(part)
-    } catch {
-      // ignore cleanup failure
+      let written = 0
+      while (written < chunk.length) {
+        written += fs.writeSync(fd, chunk, written, chunk.length - written, offset + written)
+      }
+    } finally {
+      fs.closeSync(fd)
     }
-    console.error(`[upload] size mismatch after final chunk: expected ${total}, got ${newSize}`)
-    return NextResponse.json(
-      { error: `Upload incomplete — received ${newSize.toLocaleString()} of ${total.toLocaleString()} bytes. Please try again.` },
-      { status: 400 },
-    )
+
+    meta!.ranges = addRange(meta!.ranges, offset, offset + chunk.length)
+    writeMeta(metaPath, meta!)
+
+    const received = covered(meta!.ranges)
+    if (received < total) {
+      // More chunks to come (or still in flight).
+      return NextResponse.json({ ok: true, received })
+    }
+
+    // Every byte has landed — verify the on-disk size and move into place.
+    const size = fs.statSync(/*turbopackIgnore: true*/ part).size
+    if (size !== total) {
+      safeUnlink(part)
+      safeUnlink(metaPath)
+      console.error(`[upload] size mismatch after final chunk: expected ${total}, got ${size}`)
+      return NextResponse.json(
+        { error: `Upload incomplete — received ${size.toLocaleString()} of ${total.toLocaleString()} bytes. Please try again.` },
+        { status: 400 },
+      )
+    }
+    fs.renameSync(part, dest)
+    safeUnlink(metaPath)
+  } catch (err) {
+    console.error('[upload] write failed:', err instanceof Error ? err.message : err)
+    return NextResponse.json({ error: 'Upload failed while saving the file. Please try again.' }, { status: 500 })
   }
-  fs.renameSync(part, dest)
 
   // Probe with ffmpeg and set up segments / trim state right away.
   const result = await finalizeUploadedMedia(scan, kind, name)
