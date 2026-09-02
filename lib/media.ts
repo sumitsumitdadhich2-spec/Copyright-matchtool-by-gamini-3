@@ -86,9 +86,9 @@ export function invalidateUsageCache() {
 }
 
 // ---------- Post-upload finalize ----------
-// Runs after the browser uploaded the video straight to the server (local
-// disk): probe duration, set up segments/chunk state, cut scan copies.
-// No Blob round-trip — ffmpeg works on the local file immediately.
+// Runs after the browser uploaded the video DIRECTLY to Blob (multipart, in
+// parallel). We pull it to /tmp over the server-side link (far faster than the
+// user's uplink), probe duration, set up segments/chunk state, cut scan copies.
 
 export async function finalizeUploadedMedia(
   scan: Scan,
@@ -96,9 +96,11 @@ export async function finalizeUploadedMedia(
   name: string,
 ): Promise<{ ok: true; duration: number; size: number } | { ok: false; error: string }> {
   const id = scan.id
-  const dest = localMediaPath(id, kind)
-  if (!fs.existsSync(/*turbopackIgnore: true*/ dest) || fs.statSync(dest).size === 0) {
-    return { ok: false, error: 'Video not found on the server — upload may have failed. Please try again.' }
+  // force=true: a fresh upload must replace any stale local copy of a previous
+  // video for this scan/kind.
+  const dest = await ensureLocalMedia(id, kind, true)
+  if (!dest || !fs.existsSync(/*turbopackIgnore: true*/ dest) || fs.statSync(dest).size === 0) {
+    return { ok: false, error: 'Video not found in storage — upload may have failed. Please try again.' }
   }
   const size = fs.statSync(/*turbopackIgnore: true*/ dest).size
   const mediaDir = scanMediaDir(id)

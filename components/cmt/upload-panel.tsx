@@ -1,6 +1,7 @@
 'use client'
 
 import { useRef, useState, type DragEvent } from 'react'
+import { upload } from '@vercel/blob/client'
 import { Film, Clapperboard, Loader2, CheckCircle2 } from 'lucide-react'
 import type { Scan } from '@/lib/types'
 import { fmtTime, fmtBytes } from '@/lib/format'
@@ -54,9 +55,6 @@ function readLocalDuration(file: File): Promise<number | null> {
   })
 }
 
-const CHUNK_BYTES = 4 * 1024 * 1024
-/** How many chunks fly at once. Keeps the pipe full on high-latency links. */
-const PARALLEL = 4
 
 export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Props) {
   const [uploading, setUploading] = useState<Kind | null>(null)
@@ -105,80 +103,45 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
       setLocal((prev) => (prev[kind]?.name === file.name ? { ...prev, [kind]: { ...prev[kind]!, duration: d } } : prev))
     })
 
-    // 2) BACKGROUND: parallel chunked upload.
+    // 2) BACKGROUND: direct browser → Blob multipart upload. The bytes never
+    //    touch our serverless function (which capped us at ~1 MB/s); the SDK
+    //    splits the file into parts, uploads them in parallel straight to Blob
+    //    storage and retries failed parts on its own.
     void (async () => {
       try {
         const id = await ensureScan()
-        const session = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`
-        const base = `/api/scans/${id}/upload?kind=${kind}&name=${encodeURIComponent(file.name)}&total=${file.size}&session=${session}`
-
-        const offsets: number[] = []
-        for (let o = 0; o < file.size; o += CHUNK_BYTES) offsets.push(o)
-
-        let sentBytes = 0
-        let done = false
-        let failed: Error | null = null
         const startedAt = performance.now()
-        let next = 0
 
-        async function sendChunk(offset: number) {
-          const piece = file.slice(offset, Math.min(offset + CHUNK_BYTES, file.size))
-          let lastErr: Error | null = null
-          for (let attempt = 0; attempt < 4; attempt++) {
-            if (attempt > 0) await new Promise((r) => setTimeout(r, 800 * attempt))
-            try {
-              const res = await fetch(`${base}&offset=${offset}`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/octet-stream' },
-                body: piece,
-              })
-              if (res.ok) {
-                const j = (await res.json().catch(() => ({}))) as { done?: boolean }
-                if (j.done) done = true
-                sentBytes += piece.size
-                const elapsed = (performance.now() - startedAt) / 1000
-                if (elapsed > 0.5) setSpeed(sentBytes / elapsed)
-                // Cap at 99 — server-side ffmpeg probe finishing is the real 100%.
-                setProgress(Math.min(99, Math.round((sentBytes / file.size) * 100)))
-                return
-              }
-              let msg = 'Upload failed. Please try again.'
-              try {
-                msg = ((await res.json()) as { error?: string }).error || msg
-              } catch {
-                // keep default
-              }
-              // Bad-request errors won't fix themselves — stop retrying.
-              if (res.status >= 400 && res.status < 500) throw new Error(msg)
-              lastErr = new Error(msg)
-            } catch (err) {
-              if (err instanceof TypeError) {
-                // fetch network error — retry
-                lastErr = new Error('Upload failed — network error. Please try again.')
-              } else {
-                throw err
-              }
-            }
-          }
-          throw lastErr ?? new Error('Upload failed. Please try again.')
-        }
+        await upload(`media/${id}/${kind}.mp4`, file, {
+          access: 'private',
+          handleUploadUrl: `/api/scans/${id}/upload`,
+          contentType: file.type || 'application/octet-stream',
+          multipart: true,
+          onUploadProgress: ({ loaded, percentage }) => {
+            const elapsed = (performance.now() - startedAt) / 1000
+            if (elapsed > 0.5) setSpeed(loaded / elapsed)
+            // Cap at 99 — server-side ffmpeg probe finishing is the real 100%.
+            setProgress(Math.min(99, Math.round(percentage)))
+          },
+        })
 
-        // Worker pool: PARALLEL chunks in flight at all times.
-        async function worker() {
-          while (!failed) {
-            const i = next++
-            if (i >= offsets.length) return
-            try {
-              await sendChunk(offsets[i])
-            } catch (err) {
-              failed = err instanceof Error ? err : new Error('Upload failed. Please try again.')
-              return
-            }
+        // Finalize: server pulls the video from Blob to its disk (server-to-
+        // server, fast), probes it with ffmpeg and sets up segments / trim state.
+        setSpeed(null)
+        const res = await fetch(`/api/scans/${id}/upload?action=complete`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ kind, name: file.name }),
+        })
+        if (!res.ok) {
+          let msg = 'Upload finished but processing failed. Please try again.'
+          try {
+            msg = ((await res.json()) as { error?: string }).error || msg
+          } catch {
+            // keep default
           }
+          throw new Error(msg)
         }
-        await Promise.all(Array.from({ length: Math.min(PARALLEL, offsets.length) }, worker))
-        if (failed) throw failed
-        if (!done) throw new Error('Upload finished but the server did not confirm it. Please try again.')
 
         setProgress(100)
         setUploading(null)
