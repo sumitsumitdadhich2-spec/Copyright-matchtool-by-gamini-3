@@ -59,6 +59,9 @@ RUN groupadd -g 1001 cmt && useradd -u 1001 -g cmt -m cmt
 COPY --from=build --chown=cmt:cmt /app/public ./public
 COPY --from=build --chown=cmt:cmt /app/.next/standalone ./
 COPY --from=build --chown=cmt:cmt /app/.next/static ./.next/static
+# Lifts Node's 5-minute request-body timeout so a single-stream multi-GB video
+# upload is never cut off with a 408 (see server-timeouts.cjs).
+COPY --from=build --chown=cmt:cmt /app/server-timeouts.cjs ./server-timeouts.cjs
 
 # Working store (EBS) + RAM work dir (tmpfs) are volumes — see docker-compose.yml
 RUN mkdir -p /data /dev/shm/cmt && chown -R cmt:cmt /data
@@ -70,4 +73,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
   CMD curl -fsS http://127.0.0.1:3000/api/health >/dev/null || exit 1
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["node", "server.js"]
+CMD ["node", "--require", "./server-timeouts.cjs", "server.js"]

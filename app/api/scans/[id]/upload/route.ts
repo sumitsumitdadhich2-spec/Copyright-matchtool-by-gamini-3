@@ -1,8 +1,10 @@
 import { NextResponse } from 'next/server'
 import fs from 'node:fs'
+import { Readable } from 'node:stream'
+import type { ReadableStream as WebReadableStream } from 'node:stream/web'
 import { getScan, SCANS_DIR } from '@/lib/store'
 import { restoreScans } from '@/lib/scan-store'
-import { finalizeUploadedMedia, localMediaPath, mirrorMediaToStorage } from '@/lib/media'
+import { finalizeUploadedMedia, localMediaPath, mirrorMediaToStorage, type MediaKind } from '@/lib/media'
 import { getSession } from '@/lib/users'
 import { pipelineReady } from '@/lib/merge-pipeline'
 import { dispatchMinuteFinder } from '@/lib/minute-finder-dispatch'
@@ -10,39 +12,54 @@ import { dispatchMinuteFinder } from '@/lib/minute-finder-dispatch'
 export const runtime = 'nodejs'
 
 /**
- * PARALLEL CHUNKED, RESUMABLE upload — the ONLY upload path.
+ * SINGLE-STREAM, RESUMABLE upload — the ONLY upload path.
  *
- * The browser slices the video into chunks (16 MB by default) and sends
- * several of them at once. Each chunk is written at its byte offset
- * (positional write) straight onto the EBS disk — the file can be larger than
- * RAM. A sidecar .meta file tracks which byte ranges have landed; the request
- * that completes coverage renames the file into place and runs ffprobe.
+ *   browser ──(one request body)──▶ Caddy ──▶ this handler ──▶ EBS disk
  *
- * Resume: the meta is keyed by a fingerprint of the file (name + size +
- * lastModified). GET ?kind=&fingerprint= returns the ranges already received
- * so a refreshed browser only sends what is missing. A different fingerprint
- * starts a fresh .part.
+ * The request body is streamed straight from the socket onto the disk in
+ * ~4 MB writes at its byte offset. Nothing is buffered in RAM, so the file
+ * can be far larger than memory and the network stays the only bottleneck.
  *
- * S3 backup runs in the background after finalize — never blocks the user.
+ * Resume: a sidecar `.meta` file remembers how many CONTIGUOUS bytes of this
+ * exact file (fingerprint `session` = name + size + lastModified) have landed.
+ * If the connection breaks, the browser asks `GET ?session=` for that number
+ * and opens a new stream from there. Different fingerprint → fresh `.part`.
  *
- * POST query params:
- *   ?kind=short|movie & name=<filename> & offset=<byte offset> & total=<file size>
- *   & session=<file fingerprint>
+ * IMPORTANT: this route is EXCLUDED from proxy.ts on purpose. When the proxy
+ * runs on a request, Next.js clones the body into memory (capped at
+ * `proxyClientMaxBodySize`, 10 MB by default) and silently truncates the rest.
+ * Auth is therefore checked inside the handlers below.
+ *
+ *   GET  ?kind=short|movie&session=&total=            → { received }
+ *   POST ?kind=short|movie&name=&total=&session=&offset=   body = bytes from offset
+ *        → { ok, received }            more bytes still needed (resume)
+ *        → { ok, done, duration, size } file complete + ffprobe OK
  */
 
 interface PartMeta {
   session: string
   total: number
   name: string
-  /** Sorted, non-overlapping [start, end) byte ranges received so far. */
-  ranges: Array<[number, number]>
+  /** Contiguous bytes from 0 that are on disk. */
+  received: number
   updatedAt: number
 }
+
+/** Coalesce socket chunks into writes of this size (fewer syscalls). */
+const WRITE_BUF = 4 * 1024 * 1024
+/** Persist `received` this often during a stream (crash → resume from here). */
+const META_EVERY = 64 * 1024 * 1024
+/** How long a new request waits for a dying stream on the same file to let go. */
+const LOCK_WAIT_MS = 15_000
+
+const unauthorized = () => NextResponse.json({ error: 'Unauthorized — please log in' }, { status: 401 })
 
 function readMeta(metaPath: string): PartMeta | null {
   try {
     if (!fs.existsSync(/*turbopackIgnore: true*/ metaPath)) return null
-    return JSON.parse(fs.readFileSync(metaPath, 'utf8')) as PartMeta
+    const m = JSON.parse(fs.readFileSync(metaPath, 'utf8')) as PartMeta
+    if (typeof m.received !== 'number' || !Number.isFinite(m.received)) return null
+    return m
   } catch {
     return null
   }
@@ -54,41 +71,19 @@ function writeMeta(metaPath: string, meta: PartMeta) {
   fs.renameSync(tmp, metaPath)
 }
 
-/** Insert [start, end) and merge adjacent/overlapping ranges. */
-function addRange(ranges: Array<[number, number]>, start: number, end: number): Array<[number, number]> {
-  const out: Array<[number, number]> = []
-  let s = start
-  let e = end
-  let inserted = false
-  for (const [rs, re] of ranges) {
-    if (re < s) {
-      out.push([rs, re])
-    } else if (rs > e) {
-      if (!inserted) {
-        out.push([s, e])
-        inserted = true
-      }
-      out.push([rs, re])
-    } else {
-      s = Math.min(s, rs)
-      e = Math.max(e, re)
-    }
-  }
-  if (!inserted) out.push([s, e])
-  return out
-}
-
-function covered(ranges: Array<[number, number]>): number {
-  let n = 0
-  for (const [s, e] of ranges) n += e - s
-  return n
-}
-
 function safeUnlink(p: string) {
   try {
     fs.unlinkSync(p)
   } catch {
     // ignore
+  }
+}
+
+function fileSize(p: string): number {
+  try {
+    return fs.statSync(/*turbopackIgnore: true*/ p).size
+  } catch {
+    return 0
   }
 }
 
@@ -101,120 +96,229 @@ async function loadScan(id: string) {
   return scan
 }
 
-/** Resume probe: which byte ranges of this exact file have already landed? */
+function parseKind(v: string | null): MediaKind | null {
+  return v === 'short' || v === 'movie' ? v : null
+}
+
+// ---- One stream per (scan, kind) at a time. A browser that aborted a stalled
+// request re-probes immediately; make it wait until the old stream has
+// flushed and recorded its byte count so the probe answer is exact.
+const active = new Map<string, Promise<void>>()
+
+async function waitIdle(key: string): Promise<boolean> {
+  const p = active.get(key)
+  if (!p) return true
+  return Promise.race([
+    p.then(
+      () => true,
+      () => true,
+    ),
+    new Promise<boolean>((r) => setTimeout(() => r(false), LOCK_WAIT_MS)),
+  ])
+}
+
+async function writeAll(fh: fs.promises.FileHandle, buf: Buffer, len: number, position: number) {
+  let off = 0
+  while (off < len) {
+    const { bytesWritten } = await fh.write(buf, off, len - off, position + off)
+    if (bytesWritten <= 0) throw new Error('disk write returned 0 bytes')
+    off += bytesWritten
+  }
+}
+
+/** Resume probe: how many contiguous bytes of this exact file are on disk? */
 export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }) {
+  if (!(await getSession())) return unauthorized()
   const { id } = await ctx.params
   const scan = await loadScan(id)
   if (!scan) return NextResponse.json({ error: 'Scan not found' }, { status: 404 })
 
   const url = new URL(req.url)
-  const kind = url.searchParams.get('kind')
+  const kind = parseKind(url.searchParams.get('kind'))
+  if (!kind) return NextResponse.json({ error: 'kind must be short or movie' }, { status: 400 })
   const session = (url.searchParams.get('session') || '').slice(0, 64)
   const total = Number.parseInt(url.searchParams.get('total') || '', 10)
-  if (kind !== 'short' && kind !== 'movie') {
-    return NextResponse.json({ error: 'kind must be short or movie' }, { status: 400 })
-  }
+
+  await waitIdle(`${id}/${kind}`)
+
   const dest = localMediaPath(id, kind)
+  const part = `${dest}.part`
   const meta = readMeta(`${dest}.meta`)
-  if (!meta || meta.session !== session || meta.total !== total || !fs.existsSync(/*turbopackIgnore: true*/ `${dest}.part`)) {
-    return NextResponse.json({ ranges: [], received: 0 })
+  if (!meta || meta.session !== session || meta.total !== total || !fs.existsSync(/*turbopackIgnore: true*/ part)) {
+    return NextResponse.json({ received: 0 })
   }
-  return NextResponse.json({ ranges: meta.ranges, received: covered(meta.ranges) })
+  // Never promise more than what is physically on disk.
+  return NextResponse.json({ received: Math.min(meta.received, fileSize(part), total) })
 }
 
 export async function POST(req: Request, ctx: { params: Promise<{ id: string }> }) {
+  if (!(await getSession())) return unauthorized()
   const { id } = await ctx.params
   const scan = await loadScan(id)
   if (!scan) return NextResponse.json({ error: 'Scan not found' }, { status: 404 })
 
   const url = new URL(req.url)
-  const kind = url.searchParams.get('kind')
-  const rawName = url.searchParams.get('name') || 'video.mp4'
-  const name = rawName.trim() || 'video.mp4'
-  if (kind !== 'short' && kind !== 'movie') {
-    return NextResponse.json({ error: 'kind must be short or movie' }, { status: 400 })
-  }
-
+  const kind = parseKind(url.searchParams.get('kind'))
+  if (!kind) return NextResponse.json({ error: 'kind must be short or movie' }, { status: 400 })
+  const name = (url.searchParams.get('name') || '').trim() || 'video.mp4'
   const offset = Number.parseInt(url.searchParams.get('offset') || '', 10)
   const total = Number.parseInt(url.searchParams.get('total') || '', 10)
   const session = (url.searchParams.get('session') || '').slice(0, 64) || 'legacy'
-  if (!Number.isFinite(offset) || offset < 0 || !Number.isFinite(total) || total <= 0 || offset >= total) {
+  if (!Number.isFinite(total) || total <= 0 || !Number.isFinite(offset) || offset < 0 || offset > total) {
     return NextResponse.json({ error: 'Invalid offset/total' }, { status: 400 })
   }
 
-  let chunk: Buffer
+  const key = `${id}/${kind}`
+  if (!(await waitIdle(key))) {
+    return NextResponse.json({ error: 'A previous stream for this file is still closing — retrying', received: 0 }, { status: 409 })
+  }
+  let release: () => void = () => {}
+  active.set(
+    key,
+    new Promise<void>((r) => {
+      release = r
+    }),
+  )
   try {
-    chunk = Buffer.from(await req.arrayBuffer())
-  } catch (err) {
-    console.error('[upload] failed to read chunk body:', err instanceof Error ? err.message : err)
-    return NextResponse.json({ error: 'Failed to read upload chunk. Please retry.' }, { status: 400 })
+    return await streamToDisk(req, { id, kind, name, offset, total, session })
+  } finally {
+    active.delete(key)
+    release()
   }
-  if (chunk.length === 0) {
-    return NextResponse.json({ error: 'Empty upload chunk' }, { status: 400 })
-  }
-  if (offset + chunk.length > total) {
-    return NextResponse.json({ error: 'Chunk extends past declared file size' }, { status: 400 })
-  }
+}
 
+interface StreamParams {
+  id: string
+  kind: MediaKind
+  name: string
+  offset: number
+  total: number
+  session: string
+}
+
+async function streamToDisk(req: Request, p: StreamParams): Promise<NextResponse> {
+  const { id, kind, name, offset, total, session } = p
   const dest = localMediaPath(id, kind)
   const part = `${dest}.part`
   const metaPath = `${dest}.meta`
 
-  // ---- Positional write onto EBS. All fs work below is synchronous so two
-  // concurrent requests in the same process can never interleave a
-  // read-modify-write of the meta file.
-  let complete = false
-  try {
-    let meta = readMeta(metaPath)
-    const fresh = !meta || meta.session !== session || meta.total !== total || !fs.existsSync(/*turbopackIgnore: true*/ part)
-    if (fresh) {
-      // New upload attempt — start a clean .part (drops any half-finished one).
-      safeUnlink(part)
-      fs.closeSync(fs.openSync(part, 'w'))
-      meta = { session, total, name, ranges: [], updatedAt: Date.now() }
+  // ---- Open or start the .part for this exact file.
+  let meta = readMeta(metaPath)
+  const fresh = !meta || meta.session !== session || meta.total !== total || !fs.existsSync(/*turbopackIgnore: true*/ part)
+  if (fresh) {
+    if (offset !== 0) {
+      // Browser thinks it can resume but we have nothing for this file.
+      return NextResponse.json({ error: 'Server has no data for this file yet — restarting from 0', received: 0 }, { status: 409 })
+    }
+    safeUnlink(part)
+    safeUnlink(metaPath)
+    fs.closeSync(fs.openSync(part, 'w'))
+    meta = { session, total, name, received: 0, updatedAt: Date.now() }
+    writeMeta(metaPath, meta)
+  } else {
+    meta!.received = Math.min(meta!.received, fileSize(part), total)
+    if (offset > meta!.received) {
+      return NextResponse.json({ error: 'Resuming from the last confirmed byte', received: meta!.received }, { status: 409 })
+    }
+  }
+  const state = meta!
+
+  // ---- Stream the body onto the disk at `offset`.
+  let pos = offset
+  let cutShort: string | null = null
+  let overflow = false
+
+  if (offset < total) {
+    if (!req.body) return NextResponse.json({ error: 'Missing request body' }, { status: 400 })
+    const source = Readable.fromWeb(req.body as unknown as WebReadableStream<Uint8Array>)
+    const fh = await fs.promises.open(part, 'r+')
+    const buf = Buffer.allocUnsafe(WRITE_BUF)
+    let fill = 0
+    let sinceMeta = 0
+
+    const persist = () => {
+      state.received = Math.max(state.received, pos)
+      state.updatedAt = Date.now()
+      writeMeta(metaPath, state)
+      sinceMeta = 0
+    }
+    const flush = async () => {
+      if (fill === 0) return
+      await writeAll(fh, buf, fill, pos)
+      pos += fill
+      sinceMeta += fill
+      fill = 0
+      if (sinceMeta >= META_EVERY) persist()
     }
 
-    const fd = fs.openSync(part, 'r+')
     try {
-      let written = 0
-      while (written < chunk.length) {
-        written += fs.writeSync(fd, chunk, written, chunk.length - written, offset + written)
+      for await (const raw of source) {
+        const u8 = raw as Uint8Array
+        const chunk = Buffer.isBuffer(u8) ? u8 : Buffer.from(u8.buffer, u8.byteOffset, u8.byteLength)
+        if (pos + fill + chunk.length > total) {
+          overflow = true
+          throw new Error('body longer than declared total')
+        }
+        if (chunk.length >= WRITE_BUF) {
+          await flush()
+          await writeAll(fh, chunk, chunk.length, pos)
+          pos += chunk.length
+          sinceMeta += chunk.length
+          if (sinceMeta >= META_EVERY) persist()
+        } else {
+          if (fill + chunk.length > WRITE_BUF) await flush()
+          chunk.copy(buf, fill)
+          fill += chunk.length
+        }
+      }
+      await flush()
+    } catch (err) {
+      // Client went away / connection reset / proxy cut the body. Keep every
+      // byte that made it to disk — the browser resumes from `received`.
+      cutShort = err instanceof Error ? err.message : String(err)
+      try {
+        if (!overflow) await flush()
+      } catch {
+        // disk error while flushing the tail — received stays at last good pos
       }
     } finally {
-      fs.closeSync(fd)
+      try {
+        await fh.close()
+      } catch {
+        // ignore
+      }
+      persist()
     }
-
-    meta!.ranges = addRange(meta!.ranges, offset, offset + chunk.length)
-    meta!.updatedAt = Date.now()
-    writeMeta(metaPath, meta!)
-
-    const received = covered(meta!.ranges)
-    if (received < total) {
-      // More chunks to come (or still in flight).
-      return NextResponse.json({ ok: true, received })
-    }
-
-    // Every byte has landed — verify the on-disk size and move into place.
-    const size = fs.statSync(/*turbopackIgnore: true*/ part).size
-    if (size !== total) {
-      safeUnlink(part)
-      safeUnlink(metaPath)
-      console.error(`[upload] size mismatch after final chunk: expected ${total}, got ${size}`)
-      return NextResponse.json(
-        { error: `Upload incomplete — received ${size.toLocaleString()} of ${total.toLocaleString()} bytes. Please try again.` },
-        { status: 400 },
-      )
-    }
-    fs.renameSync(part, dest)
-    safeUnlink(metaPath)
-    complete = true
-  } catch (err) {
-    console.error('[upload] write failed:', err instanceof Error ? err.message : err)
-    return NextResponse.json({ error: 'Upload failed while saving the file. Please try again.' }, { status: 500 })
   }
-  if (!complete) return NextResponse.json({ ok: true })
 
-  // Probe with ffprobe and set up segments / trim state right away.
+  if (overflow) {
+    safeUnlink(part)
+    safeUnlink(metaPath)
+    return NextResponse.json({ error: 'Upload sent more bytes than the file size — please try again.' }, { status: 400 })
+  }
+
+  const received = Math.min(state.received, total)
+  if (received < total) {
+    if (cutShort) console.warn(`[upload] ${kind} of ${id}: stream ended at ${received}/${total} bytes (${cutShort}) — browser will resume`)
+    return NextResponse.json({ ok: true, received })
+  }
+
+  // ---- Every byte is on disk: verify, move into place, probe.
+  const size = fileSize(part)
+  if (size !== total) {
+    safeUnlink(part)
+    safeUnlink(metaPath)
+    console.error(`[upload] size mismatch after final byte: expected ${total}, got ${size}`)
+    return NextResponse.json(
+      { error: `Upload incomplete — received ${size.toLocaleString()} of ${total.toLocaleString()} bytes. Please try again.` },
+      { status: 400 },
+    )
+  }
+  fs.renameSync(part, dest)
+  safeUnlink(metaPath)
+
+  const scan = getScan(id)
+  if (!scan) return NextResponse.json({ error: 'Scan not found' }, { status: 404 })
   const result = await finalizeUploadedMedia(scan, kind, name)
   if (!result.ok) return NextResponse.json({ error: result.error }, { status: 400 })
 
