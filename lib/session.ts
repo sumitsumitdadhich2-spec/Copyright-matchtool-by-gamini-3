@@ -1,8 +1,17 @@
 import crypto from 'crypto'
 
 // Signed stateless session tokens — no database needed.
-// Secret: prefer SESSION_SECRET, fall back to the Blob token (always present when Blob is connected).
-const SECRET = process.env.SESSION_SECRET || process.env.BLOB_READ_WRITE_TOKEN || 'cmt-dev-secret'
+// SESSION_SECRET is REQUIRED in production (docker-compose / .env). The dev
+// fallback only kicks in outside production so local previews still work.
+const SECRET = (() => {
+  const s = process.env.SESSION_SECRET
+  if (s && s.length >= 16) return s
+  if (process.env.NODE_ENV === 'production') {
+    console.error('[session] SESSION_SECRET is not set (min 16 chars) — sessions will NOT survive restarts. Set it in .env!')
+    return `cmt-unsafe-${process.pid}-${Date.now()}`
+  }
+  return 'cmt-dev-secret'
+})()
 
 export const SESSION_COOKIE = 'cmt_session'
 const SESSION_DAYS = 7

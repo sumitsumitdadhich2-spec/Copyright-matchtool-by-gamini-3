@@ -1,63 +1,36 @@
 import 'server-only'
 
-import { put, get } from '@vercel/blob'
 import { MAX_API_KEYS } from './store'
 import type { MinuteFinderMode } from './types'
+import { readJSONRecord, writeJSONRecord, deleteJSONRecord } from './json-record'
 
 // ---------------------------------------------------------------------------
-// PER-USER Gemini API keys, stored in Vercel Blob (private store).
-// Each account gets its own file: cmt-auth/keys/<username>.json
+// PER-USER Gemini API keys — local disk + S3 (lib/json-record.ts).
+// Each account gets its own file: auth/keys/<username>.json
 // so every user's keys are fully isolated from everyone else's.
 // ---------------------------------------------------------------------------
 
-const KEYS_PREFIX = 'cmt-auth/keys/'
+const KEYS_PREFIX = 'auth/keys/'
 
 /** slot number (as string) -> API key */
 type UserKeys = Record<string, string>
-
-// Small in-memory cache so we don't hit Blob on every request in one process.
-const cache = new Map<string, { keys: UserKeys; at: number }>()
-const CACHE_MS = 30_000
 
 function cacheKey(username: string): string {
   return username.trim().toLowerCase()
 }
 
-function blobPathFor(username: string): string {
+function recordFor(username: string): string {
   // Usernames are validated at creation ([a-zA-Z0-9_.-]{3,32}), safe as a path.
   return `${KEYS_PREFIX}${cacheKey(username)}.json`
 }
 
 async function readUserKeys(username: string): Promise<UserKeys> {
-  const ck = cacheKey(username)
-  const cached = cache.get(ck)
-  if (cached && Date.now() - cached.at < CACHE_MS) return cached.keys
-  try {
-    const result = await get(blobPathFor(username), { access: 'private' })
-    if (!result || !result.stream) {
-      cache.set(ck, { keys: {}, at: Date.now() })
-      return {}
-    }
-    const data = (await new Response(result.stream).json()) as UserKeys
-    const keys = data && typeof data === 'object' ? data : {}
-    cache.set(ck, { keys, at: Date.now() })
-    return keys
-  } catch {
-    cache.set(ck, { keys: {}, at: Date.now() })
-    return {}
-  }
+  const data = await readJSONRecord<UserKeys>(recordFor(username))
+  return data && typeof data === 'object' ? data : {}
 }
 
 async function writeUserKeys(username: string, keys: UserKeys): Promise<void> {
-  await put(blobPathFor(username), JSON.stringify(keys), {
-    access: 'private',
-    addRandomSuffix: false,
-    allowOverwrite: true,
-    contentType: 'application/json',
-    // Must be readable immediately after save.
-    cacheControlMaxAge: 0,
-  })
-  cache.set(cacheKey(username), { keys, at: Date.now() })
+  await writeJSONRecord(recordFor(username), keys)
 }
 
 // ---------------------------------------------------------------------------
@@ -146,10 +119,5 @@ export async function setUserMinuteFinderMode(username: string, mode: MinuteFind
 
 /** Delete a user's entire key file (used when the account is deleted). */
 export async function deleteUserKeys(username: string): Promise<void> {
-  try {
-    await writeUserKeys(username, {})
-  } catch {
-    // best-effort
-  }
-  cache.delete(cacheKey(username))
+  await deleteJSONRecord(recordFor(username))
 }
