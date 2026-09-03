@@ -13,9 +13,12 @@ RUN corepack enable && corepack prepare pnpm@latest --activate
 FROM base AS deps
 WORKDIR /app
 COPY package.json pnpm-lock.yaml ./
-# ffmpeg-static/ffprobe-static are NOT in package.json anymore — the OS ffmpeg
-# is used in production (see lib/ffmpeg-bin.ts).
-RUN --mount=type=cache,id=pnpm,target=/pnpm/store pnpm install --frozen-lockfile
+# ffmpeg-static/ffprobe-static are devDependencies used ONLY as a local-dev
+# fallback (lib/ffmpeg-bin.ts). In production the static /usr/bin/ffmpeg
+# installed below is used, so skip their binary-download postinstall here
+# (no other dependency in this project needs a build script).
+RUN --mount=type=cache,id=pnpm,target=/pnpm/store \
+  pnpm install --frozen-lockfile --ignore-scripts
 
 # ---------- build ----------
 FROM base AS build

@@ -1,7 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { CHUNK_SECONDS } from './models'
-import { getFfmpegPath } from './ffmpeg-bin'
 import {
   CancelToken,
   engineCount,
