@@ -1,6 +1,7 @@
-import { NextResponse } from 'next/server'
+import { type NextRequest, NextResponse } from 'next/server'
 import fs from 'node:fs'
 import os from 'node:os'
+import { SESSION_COOKIE, verifySessionToken } from '@/lib/session'
 import { poolSnapshot } from '@/lib/ffmpeg-pool'
 import { bootWorkDirs, ramWorkUsed } from '@/lib/work-dir'
 import { diskFree } from '@/lib/media'
@@ -14,11 +15,14 @@ export const dynamic = 'force-dynamic'
 /**
  * GET /api/health — used by the Docker HEALTHCHECK and for a quick look at the
  * box: cores/engines, active ffmpeg jobs, RAM + tmpfs usage, disk free, S3.
- * Unauthenticated on purpose (no secrets, no user data). Returns 503 when the
- * data dir is not writable or ffmpeg is missing — S3 being down only flags
- * `degraded` (uploads/scans keep working from the local disk).
+ * Reachable without a cookie (proxy.ts allows it) so the Docker HEALTHCHECK
+ * works — but the detailed payload (paths, job labels, disk numbers) is only
+ * returned to a logged-in user; anonymous callers get `{ status, uptimeSec }`.
+ * Returns 503 when the data dir is not writable or ffmpeg is missing — S3
+ * being down only flags `degraded` (uploads/scans keep working from disk).
  */
-export async function GET() {
+export async function GET(request: NextRequest) {
+  const authed = verifySessionToken(request.cookies.get(SESSION_COOKIE)?.value) !== null
   bootWorkDirs()
   const pool = poolSnapshot()
   const disk = diskFree()
@@ -49,6 +53,11 @@ export async function GET() {
   const s3 = storageEnabled() ? await storageHealthy() : { ok: false, error: 'S3_BUCKET not set' }
   const ok = dataWritable && ffmpeg !== null
   const status = !ok ? 'error' : s3.ok ? 'ok' : 'degraded'
+  const headers = { 'Cache-Control': 'no-store' }
+
+  if (!authed) {
+    return NextResponse.json({ status, uptimeSec: Math.round(process.uptime()) }, { status: ok ? 200 : 503, headers })
+  }
 
   return NextResponse.json(
     {
@@ -67,6 +76,6 @@ export async function GET() {
       s3: { enabled: storageEnabled(), reachable: s3.ok, error: s3.ok ? undefined : s3.error },
       limits: { maxScans: MAX_SCANS },
     },
-    { status: ok ? 200 : 503, headers: { 'Cache-Control': 'no-store' } },
+    { status: ok ? 200 : 503, headers },
   )
 }

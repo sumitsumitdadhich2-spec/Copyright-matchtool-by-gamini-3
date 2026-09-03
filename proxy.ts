@@ -12,6 +12,12 @@ export function proxy(request: NextRequest) {
     return NextResponse.next()
   }
 
+  // Docker HEALTHCHECK / load balancers probe this without a cookie. The route
+  // itself returns only a minimal {status} payload when unauthenticated.
+  if (pathname === '/api/health') {
+    return NextResponse.next()
+  }
+
   const session = verifySessionToken(request.cookies.get(SESSION_COOKIE)?.value)
   if (!session) {
     return NextResponse.json({ error: 'Unauthorized — please log in' }, { status: 401 })
