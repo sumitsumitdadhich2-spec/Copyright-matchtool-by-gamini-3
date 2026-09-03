@@ -73,11 +73,23 @@ interface KeyLane {
    *  chunkIndex -> in-flight/finished upload. Consumed (removed) on use,
    *  because every chunk upload is one-shot (deleted after its request). */
   chunkUploads: Map<number, Promise<{ uri: string; name: string }>>
+  /** verifier groups currently in flight on THIS key (capped by VERIFY_PER_LANE) */
+  verifyActive: number
 }
+
+/** Max verifier groups in flight per key at once. Before this cap, 7 keys × 3
+ *  verify models + 7 × 2 chunk models = 35 concurrent requests — the "fetch
+ *  failed" storms in the logs were connection-level timeouts from that load.
+ *  Now: per key = 2 chunk + 1 verify = 3 → 7 keys = 21. */
+const VERIFY_PER_LANE = 1
 
 interface Job {
   scan: Scan
   lanes: KeyLane[]
+  /** PREFETCH OWNERSHIP: chunkIndex -> lane idx that pre-uploaded it. One lane
+   *  per chunk, so the same chunk is never uploaded on 5 keys at once. Workers
+   *  pull "their" pre-uploaded chunks first (lane affinity). */
+  prefetchOwner: Map<number, number>
   /** OPTIONAL Twelve Labs key — enables the embedding pre-filter. null = normal full scan. */
   tlKey: string | null
   /** the short segment (minute) currently being scanned — workers read this */
@@ -247,6 +259,7 @@ class Scheduler {
       segUris: new Map(),
       segUriPromises: new Map(),
       chunkUploads: new Map(),
+      verifyActive: 0,
     }))
 
     const minuteNote = segments.length > 1 ? ` across ${segments.length} short minutes (scanned sequentially)` : ''
@@ -261,6 +274,7 @@ class Scheduler {
     const job: Job = {
       scan,
       lanes,
+      prefetchOwner: new Map(),
       tlKey: tlApiKey || null,
       seg: null,
       queue: [],
@@ -544,22 +558,50 @@ class Scheduler {
   private takeChunkUpload(job: Job, lane: KeyLane, chunkIndex: number): Promise<{ uri: string; name: string }> {
     const p = this.startChunkUpload(job, lane, chunkIndex, false)
     lane.chunkUploads.delete(chunkIndex)
+    // The chunk is now being consumed — release the claim so a re-queue (retry)
+    // can be prefetched fresh by whichever lane is free.
+    job.prefetchOwner.delete(chunkIndex)
     return p
+  }
+
+  /** Try to claim a chunk for pre-upload on this lane. Returns false when another
+   *  lane already owns it (its upload is in flight / ready there). */
+  private claimPrefetch(job: Job, lane: KeyLane, chunkIndex: number): boolean {
+    const owner = job.prefetchOwner.get(chunkIndex)
+    if (owner !== undefined && owner !== lane.idx) return false
+    job.prefetchOwner.set(chunkIndex, lane.idx)
+    return true
+  }
+
+  /** LANE AFFINITY: pull the next chunk for this lane — prefer a queued chunk this
+   *  key already pre-uploaded (zero upload wait, no duplicate upload), then a
+   *  chunk no lane has claimed, then the plain queue head. */
+  private pullChunkFor(job: Job, lane: KeyLane): number | undefined {
+    if (job.queue.length === 0) return undefined
+    let pos = job.queue.findIndex((ci) => lane.chunkUploads.has(ci))
+    if (pos < 0) pos = job.queue.findIndex((ci) => !job.prefetchOwner.has(ci))
+    if (pos < 0) pos = 0
+    return job.queue.splice(pos, 1)[0]
   }
 
   /** PIPELINING: while this lane's model is busy analyzing, pre-cut + pre-upload
    *  the next queued chunks on the SAME key so the next analysis starts with
-   *  ZERO upload wait. Depth 2 keeps bandwidth + Files API usage sane. */
+   *  ZERO upload wait. Depth 2 keeps bandwidth + Files API usage sane.
+   *  Each chunk is claimed by ONE lane — before this, every lane prefetched the
+   *  same 2 queue-head chunks (chunk 66 uploading on keys 1, 5, 3, 2, 6 at once). */
   private prefetchNextChunks(job: Job, lane: KeyLane) {
     if (job.stopping) return
     const PREFETCH_DEPTH = 2
-    let started = 0
+    let owned = 0
     for (const ci of job.queue) {
-      if (started >= PREFETCH_DEPTH) break
-      if (!lane.chunkUploads.has(ci)) {
-        void this.startChunkUpload(job, lane, ci, true).catch(() => {})
+      if (owned >= PREFETCH_DEPTH) break
+      if (lane.chunkUploads.has(ci)) {
+        owned++
+        continue
       }
-      started++
+      if (!this.claimPrefetch(job, lane, ci)) continue
+      owned++
+      void this.startChunkUpload(job, lane, ci, true).catch(() => job.prefetchOwner.delete(ci))
     }
   }
 
@@ -610,19 +652,18 @@ class Scheduler {
       }
     })()
     // NEXT-MINUTE CHUNK PRE-UPLOAD (user request: "next minute ke chunks upload
-    // karke READY rakho"): har lane par next minute ke pehle 2 highest-confidence
-    // chunks Gemini Files API par bhi pehle se upload ho jaate hain — minute
-    // start hote hi pehli request ZERO upload wait ke saath jaati hai. Uploads
-    // free hain (sirf bandwidth), quota sirf generate par lagta hai. Unused
-    // uploads finish() me delete ho jaate hain, Files API clean rahta hai.
-    const preUpload = pendingIdx.slice(0, 2)
-    for (const lane of job.lanes) {
-      for (const ci of preUpload) {
-        if (!lane.chunkUploads.has(ci)) {
-          void this.startChunkUpload(job, lane, ci, true).catch(() => {})
-        }
-      }
-    }
+    // karke READY rakho"): next minute ke top highest-confidence chunks Gemini
+    // Files API par pehle se upload ho jaate hain — minute start hote hi pehli
+    // request ZERO upload wait ke saath jaati hai. DISTRIBUTED: har chunk sirf
+    // EK lane par (round-robin), same chunk saari keys par nahi — worker lane
+    // affinity se apna pre-uploaded chunk hi uthata hai. Unused uploads finish()
+    // me delete ho jaate hain, Files API clean rahta hai.
+    const preUpload = pendingIdx.slice(0, Math.min(pendingIdx.length, job.lanes.length))
+    preUpload.forEach((ci, i) => {
+      const lane = job.lanes[i % job.lanes.length]
+      if (lane.chunkUploads.has(ci) || !this.claimPrefetch(job, lane, ci)) return
+      void this.startChunkUpload(job, lane, ci, true).catch(() => job.prefetchOwner.delete(ci))
+    })
   }
 
   // ---------- Twelve Labs pre-filter (optional, accuracy-first) ----------
@@ -1195,6 +1236,15 @@ class Scheduler {
       }
       st.cooldownUntil = null
 
+      // PER-KEY VERIFIER CAP: the 3 verify models on one key take turns instead
+      // of all firing at once (35 → 21 concurrent connections across 7 keys).
+      if (lane.verifyActive >= VERIFY_PER_LANE) {
+        if (job.verifyQueue.length === 0 && job.verifyInFlight.size === 0 && job.chunkPhaseDone) return
+        st.state = 'waiting'
+        await sleep(500)
+        continue
+      }
+
       const gi = job.verifyQueue.shift()
       if (gi === undefined) {
         // PIPELINE PARALLELISM: while the chunk phase is still running, verify
@@ -1214,7 +1264,19 @@ class Scheduler {
 
       const g = (scan.candidateGroups || [])[gi]
       if (!g || (g.status !== 'pending' && g.status !== 'verifying' && g.status !== 'rescanning')) continue
+
+      // SUPERSEDED: a confirmed group already covers this short window (adjacent
+      // chunks 66/67 both "found" the same short second at the boundary). Skip
+      // the verifier call and settle it as rejected so it never lands in the
+      // report table / export as a competing "no" row.
+      const winner = this.confirmedCovering(scan, g)
+      if (winner) {
+        this.supersedeGroup(job, g, winner)
+        continue
+      }
+
       job.verifyInFlight.add(gi)
+      lane.verifyActive++
       st.state = 'active'
       this.mark(job)
 
@@ -1244,10 +1306,67 @@ class Scheduler {
         this.mark(job)
       } finally {
         job.verifyInFlight.delete(gi)
+        lane.verifyActive = Math.max(0, lane.verifyActive - 1)
         if (st.state === 'active') st.state = 'idle'
         this.mark(job)
       }
     }
+  }
+
+  /** Fraction of `inner` (short-video window) covered by `outer`. */
+  private coverage(innerStart: number, innerEnd: number, outerStart: number, outerEnd: number): number {
+    const len = innerEnd - innerStart
+    if (len <= 0) return 0
+    const overlap = Math.min(innerEnd, outerEnd) - Math.max(innerStart, outerStart)
+    return overlap <= 0 ? 0 : overlap / len
+  }
+
+  /** A CONFIRMED group whose short window covers ≥ 80% of this group's short window, if any. */
+  private confirmedCovering(scan: Scan, g: CandidateGroup): CandidateGroup | null {
+    for (const other of scan.candidateGroups || []) {
+      if (other === g || other.status !== 'confirmed') continue
+      if (this.coverage(g.shortStart, g.shortEnd, other.shortStart, other.shortEnd) >= 0.8) return other
+    }
+    return null
+  }
+
+  /** Settle a group without a verifier call because a confirmed group already
+   *  owns its short window. Counted as rejected (so totals still add up) and
+   *  every candidate row is dropped from scan.matches. */
+  private supersedeGroup(job: Job, g: CandidateGroup, winner: CandidateGroup) {
+    const { scan } = job
+    g.status = 'rejected'
+    for (const c of g.candidates) {
+      if (c.verdict === 'pending' || c.verdict === 'verifying') {
+        c.verdict = 'different'
+        c.verifierReason = `superseded — short ${ts(winner.shortStart)}–${ts(winner.shortEnd)} already confirmed (group ${winner.id})`
+      }
+    }
+    this.applyGroupResult(job, g)
+    addLog(
+      scan,
+      'info',
+      `Group ${g.id} (short ${ts(g.shortStart)}–${ts(g.shortEnd)}) superseded by confirmed group ${winner.id} — ${g.candidates.length} duplicate candidate(s) dropped, no verifier call`,
+    )
+  }
+
+  /** After a group is CONFIRMED: drop competing rows for the same short window.
+   *  Adjacent chunks (66/67, 68/69 — 1-min boundary overlap) both report the same
+   *  short second, so a confirmed 0:06–0:07 used to sit next to two "no" rows
+   *  (1:07:00, 1:07:07) in the table and export. Pending/unfinished groups that the
+   *  winner covers are settled as superseded; loose unverified matches are removed. */
+  private pruneSuperseded(job: Job, winner: CandidateGroup) {
+    const { scan } = job
+    for (const g of scan.candidateGroups || []) {
+      if (g === winner || g.status === 'confirmed') continue
+      if (g.status !== 'pending' && g.status !== 'unverified') continue
+      if (this.coverage(g.shortStart, g.shortEnd, winner.shortStart, winner.shortEnd) >= 0.8) {
+        this.supersedeGroup(job, g, winner)
+      }
+    }
+    scan.matches = (scan.matches || []).filter(
+      (m) => m.verified === true || this.coverage(m.shortStart, m.shortEnd, winner.shortStart, winner.shortEnd) < 0.8,
+    )
   }
 
   /** Pace + count one verifier/rescan request on this (key × model) lane.
@@ -1727,9 +1846,10 @@ class Scheduler {
       }
       st.cooldownUntil = null
 
-      // Pull next chunk. When the queue is empty but other workers are still
-      // in flight, wait — a failed chunk may be re-queued for retry.
-      const chunkIndex = job.queue.shift()
+      // Pull next chunk (lane affinity: this key's pre-uploaded chunk first).
+      // When the queue is empty but other workers are still in flight, wait —
+      // a failed chunk may be re-queued for retry.
+      const chunkIndex = this.pullChunkFor(job, lane)
       if (chunkIndex === undefined) {
         if (job.inFlight.size === 0) {
           if (st.state !== 'idle') {
