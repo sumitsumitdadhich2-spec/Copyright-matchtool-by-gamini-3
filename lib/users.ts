@@ -1,18 +1,21 @@
 import 'server-only'
 
-import { put, get } from '@vercel/blob'
 import bcrypt from 'bcryptjs'
 import { cookies } from 'next/headers'
 import { SESSION_COOKIE, verifySessionToken, type SessionUser } from './session'
+import { readJSONRecord, writeJSONRecord } from './json-record'
 
 // ---------------------------------------------------------------------------
 // Main admin — hardcoded, always works, cannot be deleted or edited.
 // Username: shiva
+// Only the admin can create / delete / disable users.
 // ---------------------------------------------------------------------------
 const ADMIN_USERNAME = 'shiva'
 const ADMIN_PASSWORD_HASH = '$2b$10$SJEoi7jHco55ifsYRxF0ju7SHy9yYF8ULJDt551L4jfUeVBZEHeFC'
 
-const USERS_BLOB_PATH = 'cmt-auth/users.json'
+// Stored on local disk (DATA_DIR/auth/users.json) AND mirrored to S3
+// (auth/users.json) — see lib/json-record.ts.
+const USERS_RECORD = 'auth/users.json'
 
 export interface StoredUser {
   username: string
@@ -22,25 +25,12 @@ export interface StoredUser {
 }
 
 export async function readUsers(): Promise<StoredUser[]> {
-  try {
-    const result = await get(USERS_BLOB_PATH, { access: 'private' })
-    if (!result || !result.stream) return []
-    const data = (await new Response(result.stream).json()) as StoredUser[]
-    return Array.isArray(data) ? data : []
-  } catch {
-    return []
-  }
+  const data = await readJSONRecord<StoredUser[]>(USERS_RECORD)
+  return Array.isArray(data) ? data : []
 }
 
 async function writeUsers(users: StoredUser[]): Promise<void> {
-  await put(USERS_BLOB_PATH, JSON.stringify(users, null, 2), {
-    access: 'private',
-    addRandomSuffix: false,
-    allowOverwrite: true,
-    contentType: 'application/json',
-    // No edge caching — user create/update must be readable immediately
-    cacheControlMaxAge: 0,
-  })
+  await writeJSONRecord(USERS_RECORD, users)
 }
 
 // ---------------------------------------------------------------------------

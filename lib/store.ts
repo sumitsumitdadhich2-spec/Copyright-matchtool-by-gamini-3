@@ -3,14 +3,11 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import type { Scan, ScanSummary, LogEntry } from './types'
 import { MODEL_POOL } from './models'
-import { backupScanToBlob, deleteScanBlob, fetchScanFromBlob } from './scan-blob'
+import { backupScan, deleteScanRemote } from './scan-store'
+import { DATA_DIR, SCANS_DIR, MEDIA_DIR, MAX_SCANS } from './paths'
+import { removeScanWork } from './work-dir'
 
-// On Vercel the project directory is read-only; only /tmp is writable.
-// Using /tmp there also keeps the data dir out of build output tracing.
-const BASE_DIR = process.env.VERCEL ? '/tmp' : process.cwd()
-export const DATA_DIR = path.join(BASE_DIR, 'data')
-export const SCANS_DIR = path.join(DATA_DIR, 'scans')
-export const MEDIA_DIR = path.join(DATA_DIR, 'media')
+export { DATA_DIR, SCANS_DIR, MEDIA_DIR, MAX_SCANS }
 
 function ensureDirs() {
   for (const d of [DATA_DIR, SCANS_DIR, MEDIA_DIR]) {
@@ -137,11 +134,8 @@ function scanFile(id: string) {
   return path.join(SCANS_DIR, `${id}.json`)
 }
 
-/** Keep at most this many scans (videos). Creating the next one deletes the oldest. */
-export const MAX_SCANS = 4
-
 /**
- * Deletes the oldest scans (JSON record + local media files + Blob backup)
+ * Deletes the oldest scans (JSON record + local media files + S3 backup)
  * so at most `keep` scans remain. Called when a new scan is created.
  */
 export function pruneOldScans(keep: number = MAX_SCANS): string[] {
@@ -157,8 +151,8 @@ export function pruneOldScans(keep: number = MAX_SCANS): string[] {
 }
 
 /**
- * Delete a scan EVERYWHERE: JSON record, local media files (/tmp) and ALL
- * Blob objects (scan record + full videos) so the 10 GB storage frees up.
+ * Delete a scan EVERYWHERE: JSON record, local media files, RAM work dir and
+ * ALL S3 objects (scan record + full videos + embeddings) so disk frees up.
  */
 export function deleteScan(id: string) {
   try {
@@ -171,7 +165,8 @@ export function deleteScan(id: string) {
   } catch {
     // ignore
   }
-  void deleteScanBlob(id)
+  removeScanWork(id)
+  void deleteScanRemote(id)
 }
 
 export function newScan(): Scan {
@@ -230,37 +225,16 @@ export function saveScan(scan: Scan, opts?: { immediate?: boolean }) {
   if (scan.logs.length > 600) scan.logs = scan.logs.slice(-500)
   scan.updatedAt = Date.now()
   writeJSON(scanFile(scan.id), scan)
-  // Mirror to Blob storage (throttled, fire-and-forget) so results survive restarts.
-  backupScanToBlob(scan, opts?.immediate === true)
+  // Mirror to S3 (throttled, fire-and-forget) so results survive instance loss.
+  backupScan(scan, opts?.immediate === true)
 }
 
 /**
- * Cross-instance safe read: on Vercel every request may land on a DIFFERENT
- * serverless instance with its own /tmp. The local copy can therefore be
- * stale (e.g. missing a video that was just finalized on another instance).
- * This compares the local copy with the Blob mirror and returns the newer
- * one, refreshing the local file when Blob wins.
+ * Single long-lived server: the local file IS the freshest copy. Kept as an
+ * async function so existing route handlers need no changes.
  */
 export async function getFreshScan(id: string): Promise<Scan | null> {
-  const local = getScan(id)
-  let remote: Scan | null = null
-  try {
-    remote = await fetchScanFromBlob(id)
-  } catch {
-    // Blob unreachable — fall back to local.
-  }
-  if (!remote) return local
-  if (!local) {
-    writeJSON(scanFile(id), remote)
-    return getScan(id)
-  }
-  const localAt = local.updatedAt ?? 0
-  const remoteAt = remote.updatedAt ?? 0
-  if (remoteAt > localAt) {
-    writeJSON(scanFile(id), remote)
-    return getScan(id)
-  }
-  return local
+  return getScan(id)
 }
 
 export function listScans(): ScanSummary[] {

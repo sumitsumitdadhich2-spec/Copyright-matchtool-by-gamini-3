@@ -1,38 +1,25 @@
 import 'server-only'
 
-import { put, get } from '@vercel/blob'
+import { readJSONRecord, writeJSONRecord } from './json-record'
 
 // ---------------------------------------------------------------------------
-// Per-user token balances, stored in one private Blob file.
+// Per-user token balances — one JSON record on local disk + S3.
 // 1 scan = 100 tokens. Admin (shiva) has unlimited tokens.
 // ---------------------------------------------------------------------------
 
 export const SCAN_TOKEN_COST = 100
 
-const TOKENS_BLOB_PATH = 'cmt-auth/tokens.json'
+const TOKENS_RECORD = 'auth/tokens.json'
 
 type TokenMap = Record<string, number>
 
 async function readTokenMap(): Promise<TokenMap> {
-  try {
-    const result = await get(TOKENS_BLOB_PATH, { access: 'private' })
-    if (!result || !result.stream) return {}
-    const data = (await new Response(result.stream).json()) as TokenMap
-    return data && typeof data === 'object' ? data : {}
-  } catch {
-    return {}
-  }
+  const data = await readJSONRecord<TokenMap>(TOKENS_RECORD)
+  return data && typeof data === 'object' ? data : {}
 }
 
 async function writeTokenMap(map: TokenMap): Promise<void> {
-  await put(TOKENS_BLOB_PATH, JSON.stringify(map, null, 2), {
-    access: 'private',
-    addRandomSuffix: false,
-    allowOverwrite: true,
-    contentType: 'application/json',
-    // No edge caching — balance updates must be readable immediately
-    cacheControlMaxAge: 0,
-  })
+  await writeJSONRecord(TOKENS_RECORD, map)
 }
 
 function keyFor(username: string): string {
