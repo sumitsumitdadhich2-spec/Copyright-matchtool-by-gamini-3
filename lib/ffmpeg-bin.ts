@@ -1,13 +1,17 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import { Readable } from 'node:stream'
-import { pipeline } from 'node:stream/promises'
-import { get } from '@vercel/blob'
 
-// ffmpeg/ffprobe binaries are too large to bundle into Vercel serverless
-// functions (they push the deployment over the 12-function Hobby limit).
-// Locally (dev / sandbox) the binaries ship with node_modules; in production
-// they are pulled ONCE per server instance from Blob storage into /tmp.
+// ---------------------------------------------------------------------------
+// ffmpeg / ffprobe binary resolution (long-lived server, NOT serverless).
+//
+//   1. FFMPEG_PATH / FFPROBE_PATH env  (explicit override)
+//   2. /usr/bin/ffmpeg, /usr/bin/ffprobe (Docker image: apt-get install ffmpeg
+//      → ffmpeg + ffprobe are the SAME version, ≥ 6.x)
+//   3. anything on PATH
+//   4. node_modules/ffmpeg-static + ffprobe-static (local dev fallback only)
+//
+// Resolution happens once per process and is cached.
+// ---------------------------------------------------------------------------
 
 const LOCAL_FFMPEG = path.join(process.cwd(), 'node_modules', 'ffmpeg-static', 'ffmpeg')
 const LOCAL_FFPROBE = path.join(
@@ -20,47 +24,55 @@ const LOCAL_FFPROBE = path.join(
   process.platform === 'win32' ? 'ffprobe.exe' : 'ffprobe',
 )
 
-const TMP_BIN_DIR = '/tmp/cmt-bin'
-
-// Only one download per binary at a time — parallel requests share it.
-const inflight = new Map<string, Promise<string>>()
-
-async function ensureBinary(name: 'ffmpeg' | 'ffprobe', localPath: string): Promise<string> {
-  // Local dev / sandbox: binaries are present in node_modules.
-  if (fs.existsSync(/*turbopackIgnore: true*/ localPath)) return localPath
-
-  const dest = path.join(TMP_BIN_DIR, name)
-  if (fs.existsSync(dest) && fs.statSync(dest).size > 0) return dest
-
-  const existing = inflight.get(name)
-  if (existing) return existing
-
-  const job = (async (): Promise<string> => {
-    try {
-      fs.mkdirSync(TMP_BIN_DIR, { recursive: true })
-      const result = await get(`bin/${name}`, { access: 'private' })
-      if (!result || !('stream' in result) || !result.stream) {
-        throw new Error(`${name} binary not found in Blob storage (expected at bin/${name})`)
-      }
-      const tmp = `${dest}.dl-${process.pid}`
-      await pipeline(Readable.fromWeb(result.stream as never), fs.createWriteStream(tmp, { mode: 0o755 }))
-      fs.chmodSync(tmp, 0o755)
-      fs.renameSync(tmp, dest)
-      return dest
-    } finally {
-      inflight.delete(name)
-    }
-  })()
-  inflight.set(name, job)
-  return job
+function isExecutable(p: string | undefined): p is string {
+  if (!p) return false
+  try {
+    fs.accessSync(p, fs.constants.X_OK)
+    return fs.statSync(p).isFile()
+  } catch {
+    return false
+  }
 }
 
-/** Absolute path to a runnable ffmpeg binary (downloads from Blob on first use in production). */
-export function getFfmpegPath(): Promise<string> {
-  return ensureBinary('ffmpeg', LOCAL_FFMPEG)
+function fromPath(name: string): string | null {
+  const dirs = (process.env.PATH || '').split(path.delimiter).filter(Boolean)
+  for (const d of dirs) {
+    const p = path.join(d, name)
+    if (isExecutable(p)) return p
+  }
+  return null
 }
 
-/** Absolute path to a runnable ffprobe binary (downloads from Blob on first use in production). */
-export function getFfprobePath(): Promise<string> {
-  return ensureBinary('ffprobe', LOCAL_FFPROBE)
+function resolve(name: 'ffmpeg' | 'ffprobe', envVar: string, local: string): string {
+  const fromEnv = process.env[envVar]
+  if (isExecutable(fromEnv)) return fromEnv
+  const system = `/usr/bin/${name}`
+  if (isExecutable(system)) return system
+  const onPath = fromPath(name)
+  if (onPath) return onPath
+  if (isExecutable(local)) return local
+  throw new Error(
+    `${name} binary not found. Set ${envVar}, install it (apt-get install ffmpeg) or add ${name === 'ffmpeg' ? 'ffmpeg-static' : 'ffprobe-static'} for local dev.`,
+  )
+}
+
+let ffmpegPath: string | null = null
+let ffprobePath: string | null = null
+
+/** Absolute path to a runnable ffmpeg binary. */
+export async function getFfmpegPath(): Promise<string> {
+  if (!ffmpegPath) ffmpegPath = resolve('ffmpeg', 'FFMPEG_PATH', LOCAL_FFMPEG)
+  return ffmpegPath
+}
+
+/** Absolute path to a runnable ffprobe binary. */
+export async function getFfprobePath(): Promise<string> {
+  if (!ffprobePath) ffprobePath = resolve('ffprobe', 'FFPROBE_PATH', LOCAL_FFPROBE)
+  return ffprobePath
+}
+
+/** Synchronous variant for boot-time logging (same resolution order). */
+export function getFfmpegPathSync(): string {
+  if (!ffmpegPath) ffmpegPath = resolve('ffmpeg', 'FFMPEG_PATH', LOCAL_FFMPEG)
+  return ffmpegPath
 }

@@ -1,23 +1,31 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  serverExternalPackages: ['@google/genai', 'ffmpeg-static', 'ffprobe-static'],
-  // ffmpeg/ffprobe binaries are NOT bundled into serverless functions — they
-  // blow up function size, prevent function merging, and push the deployment
-  // over the 12-function Hobby limit. In production they are downloaded once
-  // per instance from Blob storage (see lib/ffmpeg-bin.ts).
+  // Long-lived Node server inside Docker (see Dockerfile) — the standalone
+  // output bundles only what the server needs. ffmpeg/ffprobe come from the
+  // OS package (apt-get install ffmpeg), see lib/ffmpeg-bin.ts.
+  output: 'standalone',
+  serverExternalPackages: ['@google/genai', '@aws-sdk/client-s3', '@aws-sdk/lib-storage'],
   outputFileTracingExcludes: {
-    '*': [
-      './data/**',
-      './public/**',
-      './node_modules/ffmpeg-static/**',
-      './node_modules/ffprobe-static/**',
-    ],
+    '*': ['./data/**', './public/**'],
   },
   typescript: {
     ignoreBuildErrors: true,
   },
   images: {
     unoptimized: true,
+  },
+  async headers() {
+    return [
+      {
+        source: '/(.*)',
+        headers: [
+          { key: 'X-Content-Type-Options', value: 'nosniff' },
+          { key: 'Referrer-Policy', value: 'strict-origin-when-cross-origin' },
+          { key: 'X-Frame-Options', value: 'SAMEORIGIN' },
+          { key: 'Permissions-Policy', value: 'camera=(), microphone=(), geolocation=()' },
+        ],
+      },
+    ]
   },
 }
 
