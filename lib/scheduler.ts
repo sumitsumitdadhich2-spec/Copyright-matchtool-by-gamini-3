@@ -28,7 +28,7 @@ import {
   scanMediaDir,
 } from './store'
 import { chunkPath, cleanupChunks, cleanupClips, extractClipPrecise, extractSegment, segmentPath } from './ffmpeg'
-import { chunkOverlapsSegRange, segMovieRange } from './segment-range'
+import { chunkOverlapsSegRange, segMovieRange, segHasMinuteList, formatMinuteList } from './segment-range'
 import {
   ensureIndex,
   createIndexTask,
@@ -818,7 +818,11 @@ class Scheduler {
 
         if (multi) {
           const r = segMovieRange(scan, seg)
-          const rangeNote = r.custom ? ` (movie range ${ts(r.start)}–${ts(r.end)} only — baaki chunks skipped)` : ''
+          const rangeNote = segHasMinuteList(seg)
+            ? ` (movie minutes [${formatMinuteList(seg.movieMinutes!)}] only — ${seg.movieMinutes!.length} listed, gap chunks skipped)`
+            : r.custom
+              ? ` (movie range ${ts(r.start)}–${ts(r.end)} only — baaki chunks skipped)`
+              : ''
           addLog(scan, 'info', `Minute ${seg.index + 1}/${segments.length}: scanning short ${ts(seg.start)}–${ts(seg.end)} against ${pending.length} pending movie chunk(s)${rangeNote}${hasConf ? ' — confidence order high→low' : ''}`)
         }
         addLog(
