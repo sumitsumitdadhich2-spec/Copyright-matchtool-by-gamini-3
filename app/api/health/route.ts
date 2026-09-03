@@ -8,6 +8,7 @@ import { diskFree } from '@/lib/media'
 import { storageEnabled, storageHealthy } from '@/lib/storage'
 import { DATA_DIR, WORK_DIR, WORK_RAM_BUDGET_BYTES, MAX_SCANS } from '@/lib/paths'
 import { getFfmpegPathSync } from '@/lib/ffmpeg-bin'
+import { UPLOAD_PROTOCOL } from '@/lib/upload-protocol'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -55,14 +56,18 @@ export async function GET(request: NextRequest) {
   const status = !ok ? 'error' : s3.ok ? 'ok' : 'degraded'
   const headers = { 'Cache-Control': 'no-store' }
 
+  // `upload` tells you which uploader the running build has — after a
+  // `docker compose up -d --build` it must read "stream-v2" (single stream);
+  // anything else means an old image is still serving.
   if (!authed) {
-    return NextResponse.json({ status, uptimeSec: Math.round(process.uptime()) }, { status: ok ? 200 : 503, headers })
+    return NextResponse.json({ status, uptimeSec: Math.round(process.uptime()), upload: UPLOAD_PROTOCOL }, { status: ok ? 200 : 503, headers })
   }
 
   return NextResponse.json(
     {
       status,
       uptimeSec: Math.round(process.uptime()),
+      upload: UPLOAD_PROTOCOL,
       cpu: { cores: pool.cores, engines: pool.engines },
       ffmpeg: { bin: ffmpeg, active: pool.active, queued: pool.queued, jobs: pool.jobs },
       ram: { totalBytes: mem.total, freeBytes: mem.free, processRssBytes: process.memoryUsage().rss },

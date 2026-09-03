@@ -8,6 +8,7 @@ import { finalizeUploadedMedia, localMediaPath, mirrorMediaToStorage, type Media
 import { getSession } from '@/lib/users'
 import { pipelineReady } from '@/lib/merge-pipeline'
 import { dispatchMinuteFinder } from '@/lib/minute-finder-dispatch'
+import { UPLOAD_PROTOCOL, UPLOAD_PROTOCOL_HEADER } from '@/lib/upload-protocol'
 
 export const runtime = 'nodejs'
 
@@ -157,6 +158,16 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   const scan = await loadScan(id)
   if (!scan) return NextResponse.json({ error: 'Scan not found' }, { status: 404 })
 
+  // Old cached bundle (chunked uploader) → tell the user to reload instead of
+  // accepting 16 MB slices that this handler can no longer make sense of.
+  if (req.headers.get(UPLOAD_PROTOCOL_HEADER) !== UPLOAD_PROTOCOL) {
+    console.warn(`[upload] rejected request without ${UPLOAD_PROTOCOL_HEADER}=${UPLOAD_PROTOCOL} (old browser bundle?) for ${req.url}`)
+    return NextResponse.json(
+      { error: 'This tab is running an old version of the app — please hard-refresh the page (Ctrl+Shift+R) and upload again.' },
+      { status: 400 },
+    )
+  }
+
   const url = new URL(req.url)
   const kind = parseKind(url.searchParams.get('kind'))
   if (!kind) return NextResponse.json({ error: 'kind must be short or movie' }, { status: 400 })
@@ -188,7 +199,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     }),
   )
   try {
-    return await streamToDisk(req, { id, kind, name, offset, total, session })
+    return await streamToDisk(req, { id, kind, name, offset, total, session, declared: Number.isFinite(declared) && declared > 0 ? declared : null })
   } finally {
     active.delete(key)
     release()
@@ -202,10 +213,12 @@ interface StreamParams {
   offset: number
   total: number
   session: string
+  /** Content-Length the browser announced (null if absent). */
+  declared: number | null
 }
 
 async function streamToDisk(req: Request, p: StreamParams): Promise<NextResponse> {
-  const { id, kind, name, offset, total, session } = p
+  const { id, kind, name, offset, total, session, declared } = p
   const dest = localMediaPath(id, kind)
   const part = `${dest}.part`
   const metaPath = `${dest}.meta`
@@ -325,8 +338,22 @@ async function streamToDisk(req: Request, p: StreamParams): Promise<NextResponse
 
   const received = Math.min(state.received, total)
   if (received < total) {
-    if (cutShort) console.warn(`[upload] ${kind} of ${id}: stream ended at ${received}/${total} bytes (${cutShort}) — browser will resume`)
-    return NextResponse.json({ ok: true, received })
+    const got = Math.max(0, pos - offset)
+    // The body ENDED CLEANLY but was shorter than the browser's Content-Length:
+    // something between the browser and this handler swallowed the tail. The
+    // usual culprit is proxy.ts running on this route (Next.js buffers the body
+    // in RAM and cuts it at proxyClientMaxBodySize = 10 MB) or a proxy body
+    // limit. The browser resumes anyway, but flag it so it is visible.
+    const truncated = !cutShort && declared !== null && got < declared
+    if (truncated) {
+      console.error(
+        `[upload] ${kind} of ${id}: BODY TRUNCATED — browser sent ${declared.toLocaleString()} bytes, only ${got.toLocaleString()} arrived. ` +
+          `Check that /api/scans/<id>/upload is excluded from the proxy.ts matcher and that no proxy limits request bodies.`,
+      )
+    } else if (cutShort) {
+      console.warn(`[upload] ${kind} of ${id}: stream ended at ${received}/${total} bytes (${cutShort}) — browser will resume`)
+    }
+    return NextResponse.json({ ok: true, received, truncated })
   }
 
   // ---- Every byte is on disk: verify, move into place, probe.

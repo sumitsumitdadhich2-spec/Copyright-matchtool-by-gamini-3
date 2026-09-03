@@ -17,6 +17,8 @@
 // sliding window with light smoothing → one steady Mbps number + ETA.
 // ---------------------------------------------------------------------------
 
+import { UPLOAD_PROTOCOL, UPLOAD_PROTOCOL_HEADER } from './upload-protocol'
+
 export type UploadKind = 'short' | 'movie'
 
 export type UploadPhase =
@@ -76,8 +78,10 @@ const FINALIZE_TIMEOUT_MS = 5 * 60_000
  *  up. A stream that moved even one byte resets the counter, so a long upload
  *  on a flaky line keeps going for as long as it keeps making progress. */
 const MAX_CONSECUTIVE_FAILURES = 15
-/** GET probe attempts before falling back to "resume from 0". */
+/** GET probe attempts before falling back to the last confirmed byte count. */
 const PROBE_ATTEMPTS = 4
+/** Server-reported "body cut short by a proxy" rounds before giving up. */
+const MAX_TRUNCATIONS = 3
 const SAMPLE_MS = 250
 const WINDOW_MS = 3_000
 
@@ -159,12 +163,14 @@ async function probeOnce(base: string, signal?: AbortSignal): Promise<number> {
 }
 
 /**
- * Probe with retries. A single failed probe must NOT make us restart from 0 —
- * that would re-send gigabytes the server already has. Fatal errors (401/404)
+ * Probe with retries. A failed probe must NOT make us restart from 0 — that
+ * would re-send gigabytes the server already has. Fatal errors (401/404)
  * propagate immediately; anything else is retried a few times, and only then
- * do we fall back to 0 (the server answers 409 with its real count anyway).
+ * do we fall back to `lastKnown` (the last byte count the server confirmed to
+ * us). If that is too optimistic the server answers 409 with its real count
+ * and we probe again; if it is too low the overlap is rewritten identically.
  */
-async function probeReceived(base: string, signal?: AbortSignal): Promise<number> {
+async function probeReceived(base: string, lastKnown: number, signal?: AbortSignal): Promise<number> {
   let lastErr: unknown = null
   for (let attempt = 0; attempt < PROBE_ATTEMPTS; attempt++) {
     if (signal?.aborted) throw new UploadError('Upload cancelled', true)
@@ -178,11 +184,11 @@ async function probeReceived(base: string, signal?: AbortSignal): Promise<number
       await sleep(400 * (attempt + 1), signal)
     }
   }
-  console.warn('[upload] probe failed repeatedly — assuming 0, server will correct us', lastErr)
-  return 0
+  console.warn(`[upload] probe failed repeatedly — continuing from last confirmed byte ${lastKnown}, server will correct us`, lastErr)
+  return lastKnown
 }
 
-type StreamOutcome = { done: true; duration: number; size: number } | { done: false; received: number }
+type StreamOutcome = { done: true; duration: number; size: number } | { done: false; received: number; truncated: boolean }
 
 /** One single-body request from `offset` to the end of the file. */
 function sendStream(
@@ -218,6 +224,7 @@ function sendStream(
     xhr.open('POST', `${base}&offset=${offset}`)
     xhr.setRequestHeader('Content-Type', 'application/octet-stream')
     xhr.setRequestHeader('x-video-type', videoType)
+    xhr.setRequestHeader(UPLOAD_PROTOCOL_HEADER, UPLOAD_PROTOCOL)
 
     xhr.upload.onprogress = (e) => {
       if (e.loaded > loaded) {
@@ -236,7 +243,7 @@ function sendStream(
 
     xhr.onload = () => {
       cleanup()
-      let j: { done?: boolean; duration?: number; size?: number; received?: number; error?: string } = {}
+      let j: { done?: boolean; duration?: number; size?: number; received?: number; truncated?: boolean; error?: string } = {}
       try {
         j = JSON.parse(xhr.responseText)
       } catch {
@@ -244,7 +251,7 @@ function sendStream(
       }
       if (xhr.status >= 200 && xhr.status < 300) {
         if (j.done) resolve({ done: true, duration: j.duration ?? 0, size: j.size ?? file.size })
-        else resolve({ done: false, received: Number.isFinite(j.received) ? j.received! : offset })
+        else resolve({ done: false, received: Number.isFinite(j.received) ? j.received! : offset, truncated: j.truncated === true })
         return
       }
       const msg = j.error || `Upload failed (HTTP ${xhr.status})`
@@ -295,6 +302,8 @@ export async function uploadVideoStream({ scanId, kind, file, onProgress, signal
   let reconnects = 0
   /** Failures in a row with NO new byte reaching the server — this is what ends the upload. */
   let consecutiveFailures = 0
+  /** Rounds where the server reported a cleanly-ended but short body (proxy limit). */
+  let truncations = 0
   let resumedFrom = 0
   let offline = false
 
@@ -345,7 +354,7 @@ export async function uploadVideoStream({ scanId, kind, file, onProgress, signal
       wire = 0
       emit()
       const before = confirmed
-      confirmed = Math.min(await probeReceived(base, signal), file.size)
+      confirmed = Math.min(await probeReceived(base, confirmed, signal), file.size)
       // The server has more than after the last attempt → the line is moving
       // data, however flaky. Only attempts that land NOTHING count towards
       // giving up (see MAX_CONSECUTIVE_FAILURES).
@@ -381,6 +390,20 @@ export async function uploadVideoStream({ scanId, kind, file, onProgress, signal
         consecutiveFailures = progressed ? 0 : consecutiveFailures + 1
         confirmed = Math.max(confirmed, out.received)
         console.warn(`[upload] server has ${out.received}/${file.size} bytes — streaming the rest`)
+        if (out.truncated) {
+          // The server saw the body end cleanly but SHORTER than what we sent:
+          // a proxy between us and the disk is cutting bodies. Each round still
+          // lands a slice, so "progress" never trips the failure counter — stop
+          // after a few rounds with a message that names the real cause instead
+          // of crawling through a 5 GB file 10 MB at a time.
+          truncations++
+          if (truncations >= MAX_TRUNCATIONS) {
+            throw new UploadError(
+              'The server keeps receiving a cut-off body — a proxy in between is limiting request bodies (Next.js proxy.ts matcher / proxyClientMaxBodySize or a reverse-proxy body limit). The server was rebuilt with an old config; redeploy and try again.',
+              true,
+            )
+          }
+        }
         if (!progressed) {
           // Something between us and the disk drops the body before a single
           // byte lands. Back off like a network error instead of hammering.
