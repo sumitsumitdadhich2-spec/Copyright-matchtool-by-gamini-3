@@ -12,7 +12,19 @@ __v0_jsx-dev-runtime.ts
 # Common ignores
 node_modules
 .next/
-.DS_Storeuploads/
+.DS_Store
+uploads/
 *.mp4
 *.avi
 *.mov
+*.mkv
+*.webm
+
+# Runtime data written by the app in local dev (DATA_DIR defaults to ./data).
+# Scan records, uploaded videos and in-progress .part/.meta upload files must
+# never be committed — in production this lives on the EBS volume (/data).
+data/media/
+data/scans/
+data/work/
+data/auth/
+data/counters.json
