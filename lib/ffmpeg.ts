@@ -26,6 +26,13 @@ import { placeWork, removeStageWork } from './work-dir'
 //     per core; slices use IDENTICAL params so a join is seamless
 //   * joins are re-encodes too (concat demuxer → libx264/aac); intermediates
 //     at CRF 18 (near-lossless), the final join at the target quality
+//   * INTERMEDIATE AUDIO IS LOSSLESS PCM (.mov container). AAC adds ~1024
+//     samples of encoder priming + up to one frame of trailing padding to
+//     EVERY file (~45–50 ms). The concat demuxer positions each next part at
+//     the previous part's container duration (= the longer audio stream), so
+//     with AAC parts a 48-scene render drifted +2.3 s and A/V desynced toward
+//     the end. PCM parts are sample-exact → seams land on the exact frame;
+//     AAC is applied ONCE in the final join.
 //   * every output is verified with ffprobe: duration ≈ expected (±1 frame)
 // ---------------------------------------------------------------------------
 
@@ -37,6 +44,10 @@ const SCAN_FPS_STR = String(SCAN_FPS)
 const IN_FLAGS = ['-fflags', '+genpts']
 /** Output-side flags shared by every encode. */
 const OUT_FLAGS = ['-avoid_negative_ts', 'make_zero', '-fps_mode', 'cfr', '-pix_fmt', 'yuv420p', '-threads', '1']
+/** Lossless audio for intermediate parts (no priming/padding — see header). */
+const PART_AUDIO = ['-c:a', 'pcm_s16le', '-ar', '48000']
+/** Container for intermediate parts: QuickTime carries PCM without `-strict` flags. */
+const PART_EXT = '.mov'
 
 /** Scan-copy video params (640px / 24 fps / CRF 28 / veryfast) — Gemini uploads. */
 const SCAN_VIDEO = ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '28']
@@ -391,7 +402,7 @@ function partArgs(
     '-map', '[v]', '-map', '[a]',
     '-c:v', 'libx264', '-preset', spec.preset, '-crf', '18',
     '-force_key_frames', `expr:gte(t,n_forced*${CHUNK_SECONDS})`,
-    '-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-ac', String(spec.channels),
+    ...PART_AUDIO, '-ac', String(spec.channels),
     ...OUT_FLAGS,
     partFile,
   )
@@ -456,7 +467,7 @@ export async function encodeParts(
   const [p0, p1] = spec.progressRange ?? [0, 70]
   spec.onLog?.(`ffmpeg: ${label} — ${slices.length} slice(s) on ${engineCount()} engines, parts in ${placement.inRam ? 'RAM' : 'disk'} (${placement.dir})`)
 
-  const parts = slices.map((s) => path.join(placement.dir, `${prefix}-${String(s.index).padStart(4, '0')}.mp4`))
+  const parts = slices.map((s) => path.join(placement.dir, `${prefix}-${String(s.index).padStart(4, '0')}${PART_EXT}`))
   const progress = sliceProgress((doneSec, speed) => {
     spec.onProgress?.(Math.min(p1, p0 + Math.round((doneSec / rangeDur) * (p1 - p0))), `Encoding ${slices.length} slice(s) in parallel${speed ? ` (${speed.toFixed(1)}x)` : ''}...`)
   })
@@ -641,4 +652,4 @@ function even(n: number): number {
 }
 
 // Shared encode building blocks (used by lib/render.ts and lib/merge.ts).
-export { IN_FLAGS, OUT_FLAGS, SCAN_FPS, scalePadFilter }
+export { IN_FLAGS, OUT_FLAGS, PART_AUDIO, PART_EXT, SCAN_FPS, scalePadFilter }

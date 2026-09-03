@@ -9,12 +9,22 @@ export function ReportPanel({ scan }: { scan: Scan }) {
   const report = scan.report
   if (!report) return null
   const matches = report.matches || []
+  const chunksPending = report.chunksPending ?? 0
+  // Older saved reports have no groupsPending — derive the gap so totals still add up.
+  const groupsPending =
+    report.groupsPending ??
+    Math.max(0, (report.groupsTotal ?? 0) - (report.groupsConfirmed ?? 0) - (report.groupsRejected ?? 0) - (report.groupsUnverified ?? 0))
 
   return (
     <section aria-label="Final report" className="panel border-success/30">
       <div className="flex flex-wrap items-center gap-2">
         <FileCheck2 className="size-4 text-success" aria-hidden />
-        <h2 className="text-sm font-semibold">Final Report</h2>
+        <h2 className="text-sm font-semibold">{report.partial ? 'Partial Report' : 'Final Report'}</h2>
+        {report.partial && (
+          <span className="rounded-full bg-warning/15 px-2.5 py-0.5 text-xs font-medium text-warning">
+            INCOMPLETE — {chunksPending} chunk(s) not scanned · {groupsPending} group(s) unfinished
+          </span>
+        )}
         {report.prefilterMode != null && (
           <span
             className={`ml-auto rounded-full px-2.5 py-0.5 text-xs ${
@@ -32,19 +42,21 @@ export function ReportPanel({ scan }: { scan: Scan }) {
         )}
       </div>
 
-      <div className="mt-3 grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
+      <div className="mt-3 grid grid-cols-2 gap-2 text-xs sm:grid-cols-5">
         <Stat label="Scan time" value={fmtDuration(report.totalScanTimeMs)} />
         <Stat label="Chunks scanned" value={String(report.chunksScanned)} />
         <Stat label="Chunks failed" value={String(report.chunksFailed)} />
+        <Stat label="Chunks not scanned" value={String(chunksPending)} warn={chunksPending > 0} />
         <Stat label="Matched segments" value={String(matches.length)} />
       </div>
 
       {report.groupsTotal != null && report.groupsTotal > 0 && (
-        <div className="mt-2 grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
+        <div className="mt-2 grid grid-cols-2 gap-2 text-xs sm:grid-cols-5">
           <Stat label="Candidate groups" value={String(report.groupsTotal)} />
           <Stat label="Verifier confirmed" value={String(report.groupsConfirmed ?? 0)} />
           <Stat label="Verifier rejected" value={String(report.groupsRejected ?? 0)} />
           <Stat label="Unverified" value={String(report.groupsUnverified ?? 0)} />
+          <Stat label="Still verifying" value={String(groupsPending)} warn={groupsPending > 0} />
         </div>
       )}
 
@@ -97,11 +109,11 @@ export function ReportPanel({ scan }: { scan: Scan }) {
   )
 }
 
-function Stat({ label, value }: { label: string; value: string }) {
+function Stat({ label, value, warn = false }: { label: string; value: string; warn?: boolean }) {
   return (
-    <div className="rounded-md border border-border bg-background p-2">
+    <div className={`rounded-md border p-2 ${warn ? 'border-warning/50 bg-warning/10' : 'border-border bg-background'}`}>
       <p className="text-muted-foreground">{label}</p>
-      <p className="font-mono text-sm font-semibold">{value}</p>
+      <p className={`font-mono text-sm font-semibold ${warn ? 'text-warning' : ''}`}>{value}</p>
     </div>
   )
 }

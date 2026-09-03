@@ -355,6 +355,10 @@ export interface ScanReport {
   totalScanTimeMs: number
   chunksScanned: number
   chunksFailed: number
+  /** chunks never completed: still pending / re-queued / in flight when the report froze (Stop, quota) */
+  chunksPending?: number
+  /** true when the report was built before the scan finished (Stop / quota pause) */
+  partial?: boolean
   modelsUsed: string[]
   /** all parsed matches across all chunks (absolute movie seconds) */
   matches: ChunkMatch[]
@@ -363,6 +367,8 @@ export interface ScanReport {
   groupsConfirmed?: number
   groupsRejected?: number
   groupsUnverified?: number
+  /** groups still pending / verifying / rescanning when the report froze — total = confirmed + rejected + unverified + pending */
+  groupsPending?: number
   /** how the chunk set was chosen: 'twelvelabs' pre-filter, 'gemini' minute finder, or normal 'full' scan */
   prefilterMode?: 'twelvelabs' | 'full' | 'gemini'
   prefilterSelected?: number
