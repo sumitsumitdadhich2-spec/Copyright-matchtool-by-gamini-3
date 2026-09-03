@@ -3,6 +3,7 @@
 import { useState } from 'react'
 import { Check, Loader2, ListChecks } from 'lucide-react'
 import type { MinuteSuggestion } from '@/lib/types'
+import { fmtTime } from '@/lib/format'
 
 /** APPROVAL STEP: Pegasus segment_4 se bani "in movie minutes ko check karna
  *  hai" list. User review + approve karta hai — approve ke BAAD hi Gemini
@@ -81,9 +82,14 @@ export function MinuteApproval({
                   checked={selected.has(s.minute)}
                   onChange={() => toggle(s.minute)}
                   className="size-3.5 accent-primary"
-                  aria-label={`Movie minute ${s.minute + 1} approve karo`}
+                  aria-label={`Movie minute ${s.minute} (${fmtTime(s.minute * 60)}–${fmtTime((s.minute + 1) * 60)}) approve karo`}
                 />
-                <span className="font-medium tabular-nums">Minute {s.minute + 1}</span>
+                <span className="font-medium tabular-nums">
+                  Minute {s.minute}{' '}
+                  <span className="font-mono text-muted-foreground">
+                    {fmtTime(s.minute * 60)}–{fmtTime((s.minute + 1) * 60)}
+                  </span>
+                </span>
                 <span className="text-muted-foreground">
                   — {s.sceneCount} scene{s.sceneCount > 1 ? 's' : ''}
                   {conf ? ` (confidence: ${conf})` : ''}

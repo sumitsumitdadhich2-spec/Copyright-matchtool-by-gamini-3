@@ -284,15 +284,21 @@ export function MinuteFinderPanel({ scan, mode, onModeChanged }: { scan: Scan; m
             <div className="mt-3 rounded-lg border border-success/30 bg-success/5 p-2.5">
               <p className="flex items-center gap-1.5 text-xs font-medium text-success">
                 <Sparkles className="size-3" aria-hidden />
-                Movie minute {minutes.map((m) => m + 1).join(', ')}{' '}
+                {/* Minute numbers are 0-indexed ABSOLUTE movie minutes — same number as
+                    the chunk index / log lines ("chunk 66" = 1:06:00–1:07:00). Never +1. */}
+                Movie minute {minutes.join(', ')}{' '}
                 <span className="font-normal text-muted-foreground">
                   ({windowsWithHits}/{windows.length} window{windows.length === 1 ? '' : 's'} me match · ±1 min buffer · chunk scan sirf inhi par)
                 </span>
               </p>
               <div className="mt-1.5 flex flex-wrap gap-1">
                 {minutes.map((m) => (
-                  <span key={m} className="rounded-md border border-success/30 bg-card px-2 py-0.5 font-mono text-[11px] text-success">
-                    {fmtTime(m * 60)}–{fmtTime((m + 1) * 60)}
+                  <span
+                    key={m}
+                    title={`Movie minute ${m} = chunk ${m}`}
+                    className="rounded-md border border-success/30 bg-card px-2 py-0.5 font-mono text-[11px] text-success"
+                  >
+                    <span className="text-muted-foreground">{m}:</span> {fmtTime(m * 60)}–{fmtTime((m + 1) * 60)}
                   </span>
                 ))}
               </div>
