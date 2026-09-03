@@ -1,38 +1,42 @@
 import { NextResponse } from 'next/server'
 import fs from 'node:fs'
 import { getScan, SCANS_DIR } from '@/lib/store'
-import { restoreScansFromBlob } from '@/lib/scan-blob'
-import { finalizeUploadedMedia, localMediaPath, mirrorMediaToBlob } from '@/lib/media'
+import { restoreScans } from '@/lib/scan-store'
+import { finalizeUploadedMedia, localMediaPath, mirrorMediaToStorage } from '@/lib/media'
 import { getSession } from '@/lib/users'
 import { pipelineReady } from '@/lib/merge-pipeline'
 import { dispatchMinuteFinder } from '@/lib/minute-finder-dispatch'
 
 export const runtime = 'nodejs'
-export const maxDuration = 300
 
 /**
- * PARALLEL CHUNKED upload: the browser slices the video into small pieces
- * (~4 MB) and sends SEVERAL of them at the same time. Small request bodies
- * pass through proxies and serverless body-size limits that silently truncate
- * a single giant POST, and sending them concurrently keeps the connection
- * saturated instead of paying one round-trip of latency per chunk.
+ * PARALLEL CHUNKED, RESUMABLE upload — the ONLY upload path.
  *
- * Because chunks can arrive in ANY order, each one is written at its byte
- * offset (positional write) into a .part file. A sidecar .meta file tracks
- * which byte ranges have landed; the request that completes coverage renames
- * the file into place and runs ffmpeg. Duplicate chunks (client retries) are
- * harmless — they overwrite identical bytes.
+ * The browser slices the video into chunks (16 MB by default) and sends
+ * several of them at once. Each chunk is written at its byte offset
+ * (positional write) straight onto the EBS disk — the file can be larger than
+ * RAM. A sidecar .meta file tracks which byte ranges have landed; the request
+ * that completes coverage renames the file into place and runs ffprobe.
  *
- * Query params:
+ * Resume: the meta is keyed by a fingerprint of the file (name + size +
+ * lastModified). GET ?kind=&fingerprint= returns the ranges already received
+ * so a refreshed browser only sends what is missing. A different fingerprint
+ * starts a fresh .part.
+ *
+ * S3 backup runs in the background after finalize — never blocks the user.
+ *
+ * POST query params:
  *   ?kind=short|movie & name=<filename> & offset=<byte offset> & total=<file size>
- *   & session=<random id for THIS upload attempt — a new one resets the .part>
+ *   & session=<file fingerprint>
  */
 
 interface PartMeta {
   session: string
   total: number
+  name: string
   /** Sorted, non-overlapping [start, end) byte ranges received so far. */
   ranges: Array<[number, number]>
+  updatedAt: number
 }
 
 function readMeta(metaPath: string): PartMeta | null {
@@ -45,7 +49,9 @@ function readMeta(metaPath: string): PartMeta | null {
 }
 
 function writeMeta(metaPath: string, meta: PartMeta) {
-  fs.writeFileSync(metaPath, JSON.stringify(meta))
+  const tmp = `${metaPath}.tmp`
+  fs.writeFileSync(tmp, JSON.stringify(meta))
+  fs.renameSync(tmp, metaPath)
 }
 
 /** Insert [start, end) and merge adjacent/overlapping ranges. */
@@ -86,13 +92,39 @@ function safeUnlink(p: string) {
   }
 }
 
-export async function POST(req: Request, ctx: { params: Promise<{ id: string }> }) {
-  const { id } = await ctx.params
+async function loadScan(id: string) {
   let scan = getScan(id)
   if (!scan) {
-    await restoreScansFromBlob(SCANS_DIR)
+    await restoreScans(SCANS_DIR)
     scan = getScan(id)
   }
+  return scan
+}
+
+/** Resume probe: which byte ranges of this exact file have already landed? */
+export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }) {
+  const { id } = await ctx.params
+  const scan = await loadScan(id)
+  if (!scan) return NextResponse.json({ error: 'Scan not found' }, { status: 404 })
+
+  const url = new URL(req.url)
+  const kind = url.searchParams.get('kind')
+  const session = (url.searchParams.get('session') || '').slice(0, 64)
+  const total = Number.parseInt(url.searchParams.get('total') || '', 10)
+  if (kind !== 'short' && kind !== 'movie') {
+    return NextResponse.json({ error: 'kind must be short or movie' }, { status: 400 })
+  }
+  const dest = localMediaPath(id, kind)
+  const meta = readMeta(`${dest}.meta`)
+  if (!meta || meta.session !== session || meta.total !== total || !fs.existsSync(/*turbopackIgnore: true*/ `${dest}.part`)) {
+    return NextResponse.json({ ranges: [], received: 0 })
+  }
+  return NextResponse.json({ ranges: meta.ranges, received: covered(meta.ranges) })
+}
+
+export async function POST(req: Request, ctx: { params: Promise<{ id: string }> }) {
+  const { id } = await ctx.params
+  const scan = await loadScan(id)
   if (!scan) return NextResponse.json({ error: 'Scan not found' }, { status: 404 })
 
   const url = new URL(req.url)
@@ -128,9 +160,10 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   const part = `${dest}.part`
   const metaPath = `${dest}.meta`
 
-  // ---- Positional write. All fs work below is synchronous so two concurrent
-  // requests in the same process can never interleave a read-modify-write of
-  // the meta file (Node runs sync fs calls to completion without yielding).
+  // ---- Positional write onto EBS. All fs work below is synchronous so two
+  // concurrent requests in the same process can never interleave a
+  // read-modify-write of the meta file.
+  let complete = false
   try {
     let meta = readMeta(metaPath)
     const fresh = !meta || meta.session !== session || meta.total !== total || !fs.existsSync(/*turbopackIgnore: true*/ part)
@@ -138,7 +171,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
       // New upload attempt — start a clean .part (drops any half-finished one).
       safeUnlink(part)
       fs.closeSync(fs.openSync(part, 'w'))
-      meta = { session, total, ranges: [] }
+      meta = { session, total, name, ranges: [], updatedAt: Date.now() }
     }
 
     const fd = fs.openSync(part, 'r+')
@@ -152,6 +185,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     }
 
     meta!.ranges = addRange(meta!.ranges, offset, offset + chunk.length)
+    meta!.updatedAt = Date.now()
     writeMeta(metaPath, meta!)
 
     const received = covered(meta!.ranges)
@@ -173,18 +207,19 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     }
     fs.renameSync(part, dest)
     safeUnlink(metaPath)
+    complete = true
   } catch (err) {
     console.error('[upload] write failed:', err instanceof Error ? err.message : err)
     return NextResponse.json({ error: 'Upload failed while saving the file. Please try again.' }, { status: 500 })
   }
+  if (!complete) return NextResponse.json({ ok: true })
 
-  // Probe with ffmpeg and set up segments / trim state right away.
+  // Probe with ffprobe and set up segments / trim state right away.
   const result = await finalizeUploadedMedia(scan, kind, name)
   if (!result.ok) return NextResponse.json({ error: result.error }, { status: 400 })
 
-  // Push the finished file to Blob in the background (server → Blob is
-  // datacenter bandwidth) so it survives cold starts. The user never waits.
-  void mirrorMediaToBlob(id, kind, req.headers.get('x-video-type') || 'video/mp4')
+  // Durable copy to S3 in the background — the user never waits for it.
+  void mirrorMediaToStorage(id, kind, req.headers.get('x-video-type') || 'video/mp4')
 
   // AUTO MINUTE FINDER trigger (short-after-movie order): agar short abhi
   // aaya hai aur movie ka trim pehle se confirmed hai → user ke toggle ke
@@ -194,8 +229,8 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     try {
       const fresh = getScan(id)
       if (fresh && pipelineReady(fresh)) {
-        const session = await getSession()
-        await dispatchMinuteFinder(id, session ? { username: session.username, role: session.role } : null)
+        const s = await getSession()
+        await dispatchMinuteFinder(id, s ? { username: s.username, role: s.role } : null)
       }
     } catch (err) {
       console.error('[upload] minute finder auto-trigger failed:', err instanceof Error ? err.message : err)
