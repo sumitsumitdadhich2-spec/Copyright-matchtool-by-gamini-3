@@ -210,11 +210,12 @@ async function chunkRange(
   const engines = engineCount()
   opts.onLog?.(`ffmpeg: ${prefix === 'chunk' ? 'movie chunking' : 'short segmenting'} ${rangeDur.toFixed(0)}s → ${slices.length} slice(s) on ${engines} engines (1 process/core)`)
   const startedAt = Date.now()
-  let lastSpeed: number | null = null
+  // Holder object (not a bare `let`) so TS keeps the union type across the closure.
+  const peak: { speed: number | null } = { speed: null }
 
   const progress = sliceProgress((doneSec, speed) => {
     onProgress(Math.min(99, Math.round((doneSec / rangeDur) * 100)))
-    if (speed !== null) lastSpeed = speed
+    if (speed !== null) peak.speed = Math.max(peak.speed ?? 0, speed)
   })
 
   // Each slice writes into its own staging dir so a rounding-tail file at a
@@ -275,7 +276,7 @@ async function chunkRange(
   onProgress(100)
   const total = fs.readdirSync(outDir).filter((f) => f.startsWith(`${prefix}-`) && f.endsWith('.mp4')).length
   const wall = (Date.now() - startedAt) / 1000
-  opts.onLog?.(`ffmpeg: ${total} ${prefix} file(s) in ${wall.toFixed(1)}s (${(rangeDur / Math.max(0.1, wall)).toFixed(1)}x realtime across ${slices.length} engines${lastSpeed ? `, peak ${lastSpeed.toFixed(1)}x` : ''})`)
+  opts.onLog?.(`ffmpeg: ${total} ${prefix} file(s) in ${wall.toFixed(1)}s (${(rangeDur / Math.max(0.1, wall)).toFixed(1)}x realtime across ${slices.length} engines${peak.speed ? `, peak ${peak.speed.toFixed(1)}x` : ''})`)
 
   // Verify: first + last chunk land on the grid.
   const first = path.join(outDir, `${prefix}-0000.mp4`)
@@ -374,7 +375,12 @@ function scalePadFilter(w: number, h: number, fps: number): string {
 }
 
 /** Part encode: near-lossless CRF 18 intermediate at the shared geometry. */
-function partArgs(spec: SliceEncodeSpec, hasAudio: boolean, s: TimeSlice, partFile: string): string[] {
+function partArgs(
+  spec: Pick<SliceEncodeSpec, 'source' | 'width' | 'height' | 'fps' | 'channels' | 'preset'>,
+  hasAudio: boolean,
+  s: TimeSlice,
+  partFile: string,
+): string[] {
   const dur = s.end - s.start
   const args: string[] = ['-y', ...IN_FLAGS]
   if (s.start > 0.0005) args.push('-ss', s.start.toFixed(3))
@@ -426,16 +432,34 @@ export function writeConcatList(listFile: string, files: string[]) {
  */
 export async function sliceEncode(spec: SliceEncodeSpec): Promise<{ parts: string[]; workDir: string; durationSec: number }> {
   const rangeDur = Math.max(0.1, spec.rangeEnd - spec.rangeStart)
+  const { parts, workDir } = await encodeParts(spec)
+  spec.onLog?.(`ffmpeg: ${spec.label || spec.stage} — joining with re-encode...`)
+  await joinParts(parts, spec, spec.outFile, rangeDur)
+  const durationSec = await probeDuration(spec.outFile)
+  return { parts, workDir, durationSec }
+}
+
+/**
+ * Parts-only half of sliceEncode: cut + encode [rangeStart, rangeEnd) into
+ * numbered CRF 18 part files (all engines busy) WITHOUT joining them. Callers
+ * that combine several sources (merge: short + movie) build their own list
+ * and call joinParts once. Progress spans `progressRange` (default 0..70 %).
+ */
+export async function encodeParts(
+  spec: Omit<SliceEncodeSpec, 'outFile' | 'final'> & { partPrefix?: string; progressRange?: [number, number] },
+): Promise<{ parts: string[]; workDir: string }> {
+  const rangeDur = Math.max(0.1, spec.rangeEnd - spec.rangeStart)
   const hasAudio = await probeHasAudio(spec.source)
   const slices = planSlices(spec.rangeStart, spec.rangeEnd)
   const placement = placeWork(spec.scanId, spec.stage, spec.estimatedBytes)
   const label = spec.label || spec.stage
+  const prefix = spec.partPrefix || 'part'
+  const [p0, p1] = spec.progressRange ?? [0, 70]
   spec.onLog?.(`ffmpeg: ${label} — ${slices.length} slice(s) on ${engineCount()} engines, parts in ${placement.inRam ? 'RAM' : 'disk'} (${placement.dir})`)
 
-  const parts = slices.map((s) => path.join(placement.dir, `part-${String(s.index).padStart(4, '0')}.mp4`))
+  const parts = slices.map((s) => path.join(placement.dir, `${prefix}-${String(s.index).padStart(4, '0')}.mp4`))
   const progress = sliceProgress((doneSec, speed) => {
-    // Parts = 0..70 %, join = 70..99 %
-    spec.onProgress?.(Math.min(70, Math.round((doneSec / rangeDur) * 70)), `Encoding ${slices.length} slice(s) in parallel${speed ? ` (${speed.toFixed(1)}x)` : ''}...`)
+    spec.onProgress?.(Math.min(p1, p0 + Math.round((doneSec / rangeDur) * (p1 - p0))), `Encoding ${slices.length} slice(s) in parallel${speed ? ` (${speed.toFixed(1)}x)` : ''}...`)
   })
 
   const t0 = Date.now()
@@ -447,11 +471,8 @@ export async function sliceEncode(spec: SliceEncodeSpec): Promise<{ parts: strin
     const secs = (Date.now() - ts) / 1000
     spec.onLog?.(`ffmpeg: ${label} slice ${s.index + 1}/${slices.length}: ${dur.toFixed(1)}s in ${secs.toFixed(1)}s (${(dur / Math.max(0.1, secs)).toFixed(1)}x)`)
   })
-  spec.onLog?.(`ffmpeg: ${label} parts done in ${((Date.now() - t0) / 1000).toFixed(1)}s — joining with re-encode...`)
-
-  await joinParts(parts, spec, spec.outFile, rangeDur)
-  const durationSec = await probeDuration(spec.outFile)
-  return { parts, workDir: placement.dir, durationSec }
+  spec.onLog?.(`ffmpeg: ${label} parts done in ${((Date.now() - t0) / 1000).toFixed(1)}s`)
+  return { parts, workDir: placement.dir }
 }
 
 /** Join already-encoded parts into outFile (re-encode) and verify the duration. */
@@ -620,14 +641,5 @@ function even(n: number): number {
   return n % 2 === 0 ? n : n + 1
 }
 
-// ---------- Render/export helpers (used by lib/render.ts) ----------
-
-/** Absolute path to a runnable ffmpeg binary. */
-export function getFfmpegBin(): Promise<string> {
-  return getFfmpegPath()
-}
-
-/** Parse an ffmpeg progress line into { time, speed } (either may be null). */
-export const parseFfmpegProgress = parseProgressLine
-
+// Shared encode building blocks (used by lib/render.ts and lib/merge.ts).
 export { IN_FLAGS, OUT_FLAGS, SCAN_FPS, scalePadFilter }

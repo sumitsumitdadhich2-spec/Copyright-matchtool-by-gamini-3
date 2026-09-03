@@ -1,12 +1,30 @@
-import { spawn, type ChildProcess } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
-import { getFfmpegBin, parseFfmpegProgress, probeDuration, probeHasAudio } from './ffmpeg'
+import { IN_FLAGS, OUT_FLAGS, joinParts, probeDuration, probeHasAudio, scalePadFilter, verifyDuration } from './ffmpeg'
+import { CancelToken, FfmpegCancelled, engineCount, parallelMap, runFfmpeg, sliceProgress } from './ffmpeg-pool'
+import { estimateBitrateBytes, placeWork, removeStageWork } from './work-dir'
 import { getScan, saveScan, scanMediaDir, addLog } from './store'
 import type { RenderJob, RenderResolution, RenderSettings, Scan } from './types'
 import { buildRenderSegments, totalStitchedSeconds, type RenderSegment } from './render-segments'
 
 export { buildRenderSegments } from './render-segments'
+
+// ---------------------------------------------------------------------------
+// RENDER / EXPORT — precise, parallel, no stream copy.
+//
+//   Phase 1  every matched scene is cut from the ORIGINAL movie as its own
+//            part file: `-ss <abs>` before `-i` (frame-accurate) + exact `-t`,
+//            scaled/padded to the target geometry, CRF 18 intermediate
+//            (near-lossless). All parts run CONCURRENTLY on the ffmpeg engine
+//            pool (one single-threaded process per core).
+//   Phase 2  parts are joined with the concat demuxer and RE-ENCODED once at
+//            the user's bitrate/fps — identical geometry/fps/audio on every
+//            part means the join is seamless, no A/V drift.
+//   verify   ffprobe duration ≈ sum of scenes (±1 frame) — logged.
+//
+// Cancel kills every in-flight child through the CancelToken and drops queued
+// parts immediately.
+// ---------------------------------------------------------------------------
 
 // ---------- Settings validation ----------
 
@@ -44,14 +62,9 @@ export function validateRenderSettings(input: unknown): { ok: true; settings: Re
 
 // ---------- Render job manager (one render at a time per scan) ----------
 
-interface ActiveRender {
-  child: ChildProcess | null
-  cancelled: boolean
-}
-
 // Survives route-module reloads in dev.
-const g = globalThis as unknown as { __cmtActiveRenders?: Map<string, ActiveRender> }
-const activeRenders: Map<string, ActiveRender> = g.__cmtActiveRenders ?? new Map()
+const g = globalThis as unknown as { __cmtActiveRenders?: Map<string, CancelToken> }
+const activeRenders: Map<string, CancelToken> = g.__cmtActiveRenders ?? new Map()
 g.__cmtActiveRenders = activeRenders
 
 export function isRenderActive(scanId: string): boolean {
@@ -62,9 +75,7 @@ export function renderOutputPath(scanId: string): string {
   return path.join(scanMediaDir(scanId), 'render.mp4')
 }
 
-function renderPartsDir(scanId: string): string {
-  return path.join(scanMediaDir(scanId), 'render-parts')
-}
+const RENDER_STAGE = 'render-parts'
 
 function freshJob(settings: RenderSettings, totalOutputSeconds: number, segmentCount: number): RenderJob {
   return {
@@ -81,52 +92,8 @@ function freshJob(settings: RenderSettings, totalOutputSeconds: number, segmentC
   }
 }
 
-class RenderCancelled extends Error {
-  constructor() {
-    super('cancelled')
-  }
-}
-
-/** Run one ffmpeg command. Resolves on exit 0, rejects otherwise.
- *  Registers the child on `active` so Cancel can kill the CURRENT process. */
-function runFfmpeg(
-  bin: string,
-  args: string[],
-  active: ActiveRender,
-  onStderr?: (line: string) => void,
-): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (active.cancelled) return reject(new RenderCancelled())
-    const child = spawn(bin, args)
-    active.child = child
-    let tail = ''
-    child.stderr?.on('data', (d: Buffer) => {
-      const line = d.toString()
-      tail = (tail + line).slice(-1200)
-      onStderr?.(line)
-    })
-    child.on('error', (err) => {
-      active.child = null
-      reject(new Error(`ffmpeg failed to start: ${err.message}`))
-    })
-    child.on('close', (code) => {
-      active.child = null
-      if (active.cancelled) return reject(new RenderCancelled())
-      if (code === 0) return resolve()
-      reject(new Error(`ffmpeg exited ${code}: ${tail.slice(-400)}`))
-    })
-  })
-}
-
 /**
  * Start a background render. Returns an error string if it cannot start.
- *
- * CRASH-PROOF PIPELINE: scenes are rendered ONE BY ONE into small part files
- * (one ffmpeg process + one input at a time — tiny memory footprint), then
- * losslessly joined with the concat demuxer (-c copy). The old single-command
- * approach opened EVERY scene as a separate input of the full movie at once,
- * which crashed on long scans / large movies.
- *
  * Progress is persisted into scan.renderJob (throttled), so the existing
  * GET /api/scans/[id] polling picks it up with no extra wiring.
  */
@@ -158,20 +125,40 @@ export async function startRender(scanId: string, settings: RenderSettings): Pro
 
   const totalOut = totalStitchedSeconds(segments)
   scan.renderJob = freshJob(settings, totalOut, segments.length)
+  const engines = engineCount()
   addLog(
     scan,
     'info',
-    `Render started: ${segments.length} scenes, ${totalOut.toFixed(1)}s output, ${settings.resolution} @ ${settings.fps}fps, ${settings.videoBitrateKbps}kbps video / ${settings.audioBitrateKbps}kbps audio${scan.status === 'stopped' ? ' — PARTIAL export (scan stopped; ab tak ke matches)' : ''}`,
+    `Render started: ${segments.length} scenes, ${totalOut.toFixed(1)}s output, ${settings.resolution} @ ${settings.fps}fps, ${settings.videoBitrateKbps}kbps video / ${settings.audioBitrateKbps}kbps audio — ${Math.min(engines, segments.length)} part(s) at a time on ${engines} engines, precise re-encode (no stream copy)${scan.status === 'stopped' ? ' — PARTIAL export (scan stopped; ab tak ke matches)' : ''}`,
   )
   saveScan(scan)
 
-  const active: ActiveRender = { child: null, cancelled: false }
-  activeRenders.set(scanId, active)
+  const token = new CancelToken()
+  activeRenders.set(scanId, token)
 
   // Fire and forget — progress lands in scan.renderJob.
-  void runRenderPipeline(scanId, settings, segments, movieFile, hasAudio, totalOut, active)
+  void runRenderPipeline(scanId, settings, segments, movieFile, hasAudio, totalOut, token)
 
   return null
+}
+
+/** Part encode: frame-accurate cut + CRF 18 intermediate at the final geometry/fps. */
+function partArgs(movieFile: string, hasAudio: boolean, seg: RenderSegment, w: number, h: number, fps: number, partFile: string): string[] {
+  const dur = Math.max(0.1, seg.movieEnd - seg.movieStart)
+  const args: string[] = ['-y', ...IN_FLAGS]
+  if (seg.movieStart > 0.0005) args.push('-ss', seg.movieStart.toFixed(3))
+  args.push('-t', dur.toFixed(3), '-i', movieFile)
+  if (!hasAudio) args.push('-f', 'lavfi', '-t', dur.toFixed(3), '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000')
+  args.push(
+    '-filter_complex',
+    `[0:v]${scalePadFilter(w, h, fps)}[v];${hasAudio ? '[0:a]' : '[1:a]'}aresample=48000:async=1,aformat=channel_layouts=stereo[a]`,
+    '-map', '[v]', '-map', '[a]',
+    '-c:v', 'libx264', '-preset', 'medium', '-crf', '18',
+    '-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-ac', '2',
+    ...OUT_FLAGS,
+    partFile,
+  )
+  return args
 }
 
 async function runRenderPipeline(
@@ -181,11 +168,10 @@ async function runRenderPipeline(
   movieFile: string,
   hasAudio: boolean,
   totalOut: number,
-  active: ActiveRender,
+  token: CancelToken,
 ) {
   const { w, h } = RESOLUTION_MAP[settings.resolution]
   const outFile = renderOutputPath(scanId)
-  const partsDir = renderPartsDir(scanId)
 
   let lastSave = 0
   const persist = (mutate: (s: Scan) => void, force = false) => {
@@ -197,77 +183,84 @@ async function runRenderPipeline(
     mutate(fresh)
     saveScan(fresh)
   }
+  const log = (level: 'info' | 'warn' | 'error' | 'success', msg: string) =>
+    persist((s) => addLog(s, level, msg), true)
 
-  const cleanupParts = () => {
-    try {
-      fs.rmSync(partsDir, { recursive: true, force: true })
-    } catch {
-      // ignore
-    }
-  }
-
-  try {
-    const ffmpegBin = await getFfmpegBin()
-    cleanupParts()
-    fs.mkdirSync(partsDir, { recursive: true })
-
-    // ---- Phase 1: render each scene into its own small part file (sequential —
-    // one input, one process at a time; the crash-proof path for big movies). ----
-    let doneSeconds = 0
-    const partFiles: string[] = []
-    for (let i = 0; i < segments.length; i++) {
-      const seg = segments[i]
-      const dur = Math.max(0.1, seg.movieEnd - seg.movieStart)
-      const partFile = path.join(partsDir, `part-${String(i).padStart(4, '0')}.mp4`)
-      partFiles.push(partFile)
-
-      const args: string[] = ['-y', '-ss', seg.movieStart.toFixed(3), '-t', dur.toFixed(3), '-i', movieFile]
-      if (!hasAudio) {
-        args.push('-f', 'lavfi', '-t', dur.toFixed(3), '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000')
-      }
-      args.push(
-        '-filter_complex',
-        `[0:v]scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,fps=${settings.fps},setsar=1[v];` +
-          (hasAudio ? `[0:a]aresample=48000[a]` : `[1:a]anull[a]`),
-        '-map', '[v]',
-        '-map', '[a]',
-        '-c:v', 'libx264',
-        '-preset', 'medium',
-        '-b:v', `${settings.videoBitrateKbps}k`,
-        '-maxrate', `${Math.round(settings.videoBitrateKbps * 1.5)}k`,
-        '-bufsize', `${settings.videoBitrateKbps * 2}k`,
-        '-c:a', 'aac',
-        '-b:a', `${settings.audioBitrateKbps}k`,
-        '-ar', '48000',
-        partFile,
-      )
-
-      const base = doneSeconds
-      await runFfmpeg(ffmpegBin, args, active, (line) => {
-        const { time, speed } = parseFfmpegProgress(line)
-        if (time === null) return
-        const progressed = Math.min(base + Math.min(time, dur), totalOut)
-        const pct = Math.min(98, Math.round((progressed / Math.max(0.1, totalOut)) * 100))
-        const eta = speed && speed > 0 ? Math.max(0, Math.round((totalOut - progressed) / speed)) : null
-        persist((s) => {
-          if (!s.renderJob || s.renderJob.status !== 'rendering') return
-          s.renderJob.pct = pct
-          s.renderJob.etaSeconds = eta
-        })
-      })
-      doneSeconds += dur
-    }
-
-    // ---- Phase 2: lossless concat of the parts (stream copy — fast + tiny memory). ----
+  const setProgress = (pct: number, eta: number | null) =>
     persist((s) => {
       if (!s.renderJob || s.renderJob.status !== 'rendering') return
-      s.renderJob.pct = 99
-      s.renderJob.etaSeconds = null
-    }, true)
+      s.renderJob.pct = pct
+      s.renderJob.etaSeconds = eta
+    })
 
-    const listFile = path.join(partsDir, 'concat.txt')
-    fs.writeFileSync(listFile, partFiles.map((f) => `file '${f.replace(/'/g, "'\\''")}'`).join('\n'))
-    await runFfmpeg(ffmpegBin, ['-y', '-f', 'concat', '-safe', '0', '-i', listFile, '-c', 'copy', '-movflags', '+faststart', outFile], active)
+  // Intermediates at CRF 18 are roughly 2.5× the target bitrate — estimate for
+  // RAM/disk placement (spills to DATA_DIR/work when the tmpfs budget is tight).
+  const estimate = estimateBitrateBytes(totalOut, Math.max(settings.videoBitrateKbps * 2.5, 6000), 192)
+  const placement = placeWork(scanId, RENDER_STAGE, estimate)
+  const partsDir = placement.dir
+  const cleanupParts = () => removeStageWork(scanId, RENDER_STAGE)
+
+  try {
+    log('info', `Render parts → ${placement.inRam ? 'RAM' : 'disk'} work dir (est ${(estimate / 1048576).toFixed(0)} MB)`)
+
+    // ---- Phase 1: every scene as its own part, all engines busy (0..70 %). ----
+    const partFiles = segments.map((_, i) => path.join(partsDir, `part-${String(i).padStart(4, '0')}.mp4`))
+    const startedAt = Date.now()
+    const progress = sliceProgress((doneSec, speed) => {
+      const pct = Math.min(70, Math.round((doneSec / Math.max(0.1, totalOut)) * 70))
+      // ETA: remaining parts at aggregate speed + join (≈ 1× realtime at medium preset, spread over cores)
+      const remainingParts = Math.max(0, totalOut - doneSec)
+      const eta = speed && speed > 0 ? Math.round(remainingParts / speed + totalOut * 0.6) : null
+      setProgress(pct, eta)
+    })
+
+    await parallelMap(segments, async (seg, i) => {
+      const dur = Math.max(0.1, seg.movieEnd - seg.movieStart)
+      const t0 = Date.now()
+      await runFfmpeg(partArgs(movieFile, hasAudio, seg, w, h, settings.fps, partFiles[i]), {
+        label: `render ${scanId.slice(0, 6)} part ${i + 1}/${segments.length}`,
+        token,
+        onStderr: progress.forSlice(i, dur),
+      })
+      progress.complete(i, dur)
+      const secs = (Date.now() - t0) / 1000
+      const check = await verifyDuration(partFiles[i], dur, settings.fps)
+      persist((s) =>
+        addLog(
+          s,
+          check.ok ? 'info' : 'warn',
+          `Scene ${i + 1}/${segments.length}: ${seg.movieStart.toFixed(3)}s → ${seg.movieEnd.toFixed(3)}s (${dur.toFixed(2)}s) encoded in ${secs.toFixed(1)}s (${(dur / Math.max(0.1, secs)).toFixed(1)}x)${check.ok ? '' : ` — duration ${check.actual.toFixed(3)}s (off by ${(check.diff * 1000).toFixed(0)} ms)`}`,
+        ),
+      )
+    })
+    if (token.cancelled) throw new FfmpegCancelled()
+    const partsWall = (Date.now() - startedAt) / 1000
+    log('info', `All ${segments.length} scene part(s) done in ${partsWall.toFixed(1)}s — joining with precise re-encode at ${settings.videoBitrateKbps}kbps...`)
+
+    // ---- Phase 2: concat + final re-encode at the user's quality (70..99 %). ----
+    const joinStarted = Date.now()
+    await joinParts(
+      partFiles,
+      {
+        width: w,
+        height: h,
+        fps: settings.fps,
+        channels: 2,
+        preset: 'medium',
+        final: { videoKbps: settings.videoBitrateKbps, audioKbps: settings.audioBitrateKbps },
+        token,
+        label: `render ${scanId.slice(0, 6)}`,
+        onProgress: (pct) => {
+          const done = ((pct - 70) / 29) * totalOut
+          const elapsed = (Date.now() - joinStarted) / 1000
+          const rate = done > 0 && elapsed > 0 ? done / elapsed : null
+          setProgress(Math.min(99, pct), rate ? Math.max(0, Math.round((totalOut - done) / rate)) : null)
+        },
+        onLog: (msg) => persist((s) => addLog(s, msg.includes('MISMATCH') ? 'warn' : 'info', msg), true),
+      },
+      outFile,
+      totalOut,
+    )
 
     activeRenders.delete(scanId)
     cleanupParts()
@@ -278,13 +271,13 @@ async function runRenderPipeline(
     } catch {
       // ignore
     }
-    // Confirm real output with a probe (guarantees settings actually produced a playable file).
     let probedDur: number | null = null
     try {
       probedDur = await probeDuration(outFile)
     } catch {
       // ignore — file exists, size known
     }
+    const wall = (Date.now() - startedAt) / 1000
     persist((s) => {
       if (!s.renderJob) return
       s.renderJob.status = 'done'
@@ -295,13 +288,13 @@ async function runRenderPipeline(
       addLog(
         s,
         'success',
-        `Render complete: ${probedDur ? `${probedDur.toFixed(1)}s, ` : ''}${size ? `${(size / (1024 * 1024)).toFixed(1)} MB` : 'file ready'} — download available`,
+        `Render complete in ${wall.toFixed(1)}s: ${probedDur ? `${probedDur.toFixed(2)}s, ` : ''}${size ? `${(size / (1024 * 1024)).toFixed(1)} MB` : 'file ready'} — download available`,
       )
     }, true)
   } catch (err) {
     activeRenders.delete(scanId)
     cleanupParts()
-    if (err instanceof RenderCancelled || active.cancelled) {
+    if (err instanceof FfmpegCancelled || token.cancelled) {
       try {
         if (fs.existsSync(outFile)) fs.unlinkSync(outFile)
       } catch {
@@ -331,14 +324,10 @@ async function runRenderPipeline(
 
 /** Cancel an in-flight render. Returns false when nothing is rendering. */
 export function cancelRender(scanId: string): boolean {
-  const active = activeRenders.get(scanId)
-  if (active) {
-    active.cancelled = true
-    try {
-      active.child?.kill('SIGKILL')
-    } catch {
-      // ignore
-    }
+  const token = activeRenders.get(scanId)
+  if (token) {
+    // Kills every running part/join child and drops queued parts.
+    token.cancel()
     return true
   }
   // No live process (e.g. server restarted mid-render) — reset the persisted state.

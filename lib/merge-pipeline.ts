@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import { getScan, saveScan, addLog, scanMediaDir } from './store'
 import { ensureLocalMedia, localMediaPath } from './media'
 import { probeDuration } from './ffmpeg'
-import { checkMergeCompatibility, mergeVideos, mergedFilePath } from './merge'
+import { planMergeTarget, mergeVideos, mergedFilePath } from './merge'
 import { ensureIndex, fetchVideoEmbeddings, loadEmbeddings, saveEmbeddings, type TLSegment } from './twelvelabs'
 import {
   createAsset,
@@ -22,8 +22,10 @@ import type { Scan, MergePipelineState } from './types'
 // AUTO PIPELINE ORCHESTRATOR (fire-and-forget, same pattern as the old
 // manual indexing route):
 //
-//   [1] checking   — ffprobe codec/resolution compat (mismatch => ERROR, stop)
-//   [2] merging    — stream-copy concat (short + FULL movie) + duration check
+//   [1] checking   — ffprobe both files, target = movie resolution/fps
+//   [2] merging    — precise re-encode (short + FULL movie normalized to the
+//                    target, parallel parts on every core, one final join) +
+//                    duration check
 //   [3] uploading  — merged.mp4 → TwelveLabs asset
 //   [4] indexing   — Marengo index via indexed-assets → embeddings download
 //   [5] splitting  — time-split embeddings at short-end (short / movie sets)
@@ -130,20 +132,24 @@ async function runPipeline(id: string, tlKey: string): Promise<void> {
     mergedDuration = await probeDuration(mergedFile)
     log(id, 'info', `Merge cached: merged.mp4 already exists (${fmtDur(mergedDuration)}) — skip re-merge`)
   } else {
-    setState(id, { status: 'checking', progress: 'Checking codec/resolution...' })
-    log(id, 'info', 'Checking codec/resolution... (stream-copy merge ke liye dono files compatible honi chahiye)')
-    const compat = await checkMergeCompatibility(shortFile, movieFile)
-    if (!compat.ok) {
-      log(id, 'error', compat.reason)
-      throw new Error(compat.reason)
+    setState(id, { status: 'checking', progress: 'Probing codec/resolution...' })
+    log(id, 'info', 'Probing codec/resolution... (target = movie ki resolution/fps; short usme scale/pad hoga — koi format restriction nahi)')
+    const plan = await planMergeTarget(shortFile, movieFile)
+    if (!plan.ok) {
+      log(id, 'error', plan.reason)
+      throw new Error(plan.reason)
     }
-    log(id, 'success', 'Codec/resolution match — stream-copy merge valid hai (no re-encode)')
+    log(id, 'success', `Merge target: ${plan.target.summary}`)
 
-    setState(id, { status: 'merging', progress: 'Merging PART A + PART B...' })
-    log(id, 'info', `Merging PART A (short ${fmtDur(shortDuration)}) + PART B (movie ${fmtDur(movieDuration)})... (-c copy, original quality)`)
-    await mergeVideos(shortFile, movieFile, mergedFile)
-    mergedDuration = await probeDuration(mergedFile)
-    log(id, 'success', `Merge complete — total ${fmtDur(mergedDuration)}`)
+    setState(id, { status: 'merging', progress: 'Merging PART A + PART B (precise re-encode)...' })
+    log(id, 'info', `Merging PART A (short ${fmtDur(shortDuration)}) + PART B (movie ${fmtDur(movieDuration)})... (precise re-encode, all cores, frame-accurate join)`)
+    const merged = await mergeVideos(shortFile, movieFile, mergedFile, {
+      scanId: id,
+      onLog: (msg) => log(id, msg.includes('MISMATCH') ? 'warn' : 'info', msg),
+      onProgress: (pct, note) => setState(id, { status: 'merging', progress: `Merging ${pct}% — ${note}` }),
+    })
+    mergedDuration = merged.duration
+    log(id, 'success', `Merge complete — total ${fmtDur(mergedDuration)} (${merged.target.width}x${merged.target.height} @ ${merged.target.fps}fps)`)
   }
 
   // Duration validation: merged ≈ short + movie (>1.5s difference => WARN only).

@@ -13,6 +13,7 @@ import {
 } from '@/lib/user-keys'
 import { getSession } from '@/lib/users'
 import { MODEL_POOL } from '@/lib/models'
+import { poolSnapshot } from '@/lib/ffmpeg-pool'
 
 export const runtime = 'nodejs'
 
@@ -46,6 +47,11 @@ export async function GET() {
     maskedKey2: keys[1].maskedKey,
     usage: key1 ? getAllUsage(key1) : null,
     models: MODEL_POOL,
+    // ffmpeg engine pool: one single-threaded ffmpeg per core.
+    engine: (() => {
+      const p = poolSnapshot()
+      return { cores: p.cores, engines: p.engines, active: p.active, queued: p.queued }
+    })(),
   })
 }
 
