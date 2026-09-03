@@ -39,12 +39,17 @@ export interface UploadProgress {
   bytesPerSec: number | null
   /** Highest smoothed rate seen during this upload. */
   peakBytesPerSec: number
+  /** Average rate since this upload session started (bytes actually moved /
+   *  seconds spent uploading — reconnect pauses excluded). */
+  avgBytesPerSec: number | null
   /** Estimated seconds left (null until the rate is known). */
   etaSec: number | null
   /** Number of reconnects so far (0 on a clean run). */
   reconnects: number
   /** Byte offset the current stream started from (0 unless resumed). */
   resumedFrom: number
+  /** true while the browser reports it has no network — waiting for it to come back. */
+  offline: boolean
 }
 
 export interface UploadResult {
@@ -67,8 +72,12 @@ const STALL_MS = 30_000
 /** After the last byte left the browser, how long to wait for the server's
  *  verdict (draining proxies + ffprobe on a multi-GB file). */
 const FINALIZE_TIMEOUT_MS = 5 * 60_000
-/** Reconnect attempts before giving up. */
-const MAX_RECONNECTS = 15
+/** CONSECUTIVE failed attempts (no new byte reached the server) before giving
+ *  up. A stream that moved even one byte resets the counter, so a long upload
+ *  on a flaky line keeps going for as long as it keeps making progress. */
+const MAX_CONSECUTIVE_FAILURES = 15
+/** GET probe attempts before falling back to "resume from 0". */
+const PROBE_ATTEMPTS = 4
 const SAMPLE_MS = 250
 const WINDOW_MS = 3_000
 
@@ -116,14 +125,61 @@ function sleep(ms: number, signal?: AbortSignal) {
   })
 }
 
+function isOffline() {
+  return typeof navigator !== 'undefined' && navigator.onLine === false
+}
+
+/** Resolve when the browser reports the network is back (or on abort). */
+function waitOnline(signal?: AbortSignal) {
+  if (!isOffline()) return Promise.resolve()
+  return new Promise<void>((resolve) => {
+    const done = () => {
+      window.removeEventListener('online', done)
+      signal?.removeEventListener('abort', done)
+      clearInterval(poll)
+      resolve()
+    }
+    window.addEventListener('online', done, { once: true })
+    signal?.addEventListener('abort', done, { once: true })
+    // Some browsers never fire `online` reliably — poll as a fallback.
+    const poll = setInterval(() => {
+      if (!isOffline()) done()
+    }, 2_000)
+  })
+}
+
 /** GET → how many contiguous bytes of this exact file the server already has. */
-async function probeReceived(base: string, signal?: AbortSignal): Promise<number> {
+async function probeOnce(base: string, signal?: AbortSignal): Promise<number> {
   const res = await fetch(base, { method: 'GET', cache: 'no-store', signal })
   if (res.status === 401) throw new UploadError('Session expired — please log in again', true)
   if (res.status === 404) throw new UploadError('Scan not found — please refresh the page', true)
   if (!res.ok) throw new UploadError(`Server error while checking upload state (HTTP ${res.status})`)
   const j = (await res.json()) as { received?: number }
   return Number.isFinite(j.received) && j.received! > 0 ? j.received! : 0
+}
+
+/**
+ * Probe with retries. A single failed probe must NOT make us restart from 0 —
+ * that would re-send gigabytes the server already has. Fatal errors (401/404)
+ * propagate immediately; anything else is retried a few times, and only then
+ * do we fall back to 0 (the server answers 409 with its real count anyway).
+ */
+async function probeReceived(base: string, signal?: AbortSignal): Promise<number> {
+  let lastErr: unknown = null
+  for (let attempt = 0; attempt < PROBE_ATTEMPTS; attempt++) {
+    if (signal?.aborted) throw new UploadError('Upload cancelled', true)
+    try {
+      return await probeOnce(base, signal)
+    } catch (err) {
+      if (err instanceof UploadError && err.fatal) throw err
+      if (signal?.aborted) throw new UploadError('Upload cancelled', true)
+      lastErr = err
+      await waitOnline(signal)
+      await sleep(400 * (attempt + 1), signal)
+    }
+  }
+  console.warn('[upload] probe failed repeatedly — assuming 0, server will correct us', lastErr)
+  return 0
 }
 
 type StreamOutcome = { done: true; duration: number; size: number } | { done: false; received: number }
@@ -235,21 +291,44 @@ export async function uploadVideoStream({ scanId, kind, file, onProgress, signal
   let phase: UploadPhase = 'probing'
   let confirmed = 0
   let wire = 0
+  /** Total reconnects (shown in the UI). */
   let reconnects = 0
+  /** Failures in a row with NO new byte reaching the server — this is what ends the upload. */
+  let consecutiveFailures = 0
   let resumedFrom = 0
+  let offline = false
+
+  // Average speed = bytes moved during this session / seconds spent in the
+  // 'uploading' phase (probing / reconnect pauses are not counted).
+  let uploadingMs = 0
+  let uploadingSince: number | null = null
+  let sessionStartByte: number | null = null
+  const uploadingElapsedMs = () => uploadingMs + (uploadingSince !== null ? performance.now() - uploadingSince : 0)
+  const setPhase = (next: UploadPhase) => {
+    if (phase === 'uploading' && next !== 'uploading' && uploadingSince !== null) {
+      uploadingMs += performance.now() - uploadingSince
+      uploadingSince = null
+    }
+    if (next === 'uploading' && phase !== 'uploading') uploadingSince = performance.now()
+    phase = next
+  }
 
   const emit = () => {
     const sent = Math.min(file.size, confirmed + wire)
     const rate = meter.rate
+    const elapsedSec = uploadingElapsedMs() / 1000
+    const moved = sessionStartByte === null ? 0 : sent - sessionStartByte
     onProgress({
       phase,
       sent,
       total: file.size,
       bytesPerSec: rate,
       peakBytesPerSec: meter.peak,
+      avgBytesPerSec: elapsedSec >= 1 && moved > 0 ? moved / elapsedSec : null,
       etaSec: rate && rate > 0 && phase === 'uploading' ? Math.max(0, (file.size - sent) / rate) : null,
       reconnects,
       resumedFrom,
+      offline,
     })
   }
 
@@ -262,21 +341,20 @@ export async function uploadVideoStream({ scanId, kind, file, onProgress, signal
     for (;;) {
       if (signal?.aborted) throw new UploadError('Upload cancelled', true)
 
-      phase = 'probing'
+      setPhase('probing')
       wire = 0
       emit()
-      try {
-        confirmed = await probeReceived(base, signal)
-      } catch (err) {
-        if (err instanceof UploadError && err.fatal) throw err
-        if (signal?.aborted) throw new UploadError('Upload cancelled', true)
-        confirmed = 0
-      }
-      confirmed = Math.min(confirmed, file.size)
+      const before = confirmed
+      confirmed = Math.min(await probeReceived(base, signal), file.size)
+      // The server has more than after the last attempt → the line is moving
+      // data, however flaky. Only attempts that land NOTHING count towards
+      // giving up (see MAX_CONSECUTIVE_FAILURES).
+      if (confirmed > before) consecutiveFailures = 0
       resumedFrom = confirmed
+      if (sessionStartByte === null) sessionStartByte = confirmed
       if (confirmed > 0) console.log(`[upload] resuming ${kind} from byte ${confirmed} of ${file.size}`)
 
-      phase = 'uploading'
+      setPhase('uploading')
       meter.resetWindow()
       emit()
 
@@ -286,7 +364,7 @@ export async function uploadVideoStream({ scanId, kind, file, onProgress, signal
             wire = n
           },
           onFinalizing: () => {
-            phase = 'finalizing'
+            setPhase('finalizing')
             emit()
           },
           signal,
@@ -299,24 +377,53 @@ export async function uploadVideoStream({ scanId, kind, file, onProgress, signal
         }
         // Server accepted bytes but the body ended before the declared size
         // (a proxy cut it short). Loop: re-probe and stream the remainder.
-        confirmed = out.received
+        const progressed = out.received > confirmed
+        consecutiveFailures = progressed ? 0 : consecutiveFailures + 1
+        confirmed = Math.max(confirmed, out.received)
         console.warn(`[upload] server has ${out.received}/${file.size} bytes — streaming the rest`)
+        if (!progressed) {
+          // Something between us and the disk drops the body before a single
+          // byte lands. Back off like a network error instead of hammering.
+          reconnects++
+          if (consecutiveFailures > MAX_CONSECUTIVE_FAILURES) {
+            throw new UploadError(
+              'The server keeps receiving an empty body — a proxy in between is dropping the upload. Check the Caddy/Next.js body-size settings on the server.',
+              true,
+            )
+          }
+          setPhase('reconnecting')
+          wire = 0
+          emit()
+          await sleep(Math.min(8_000, 500 * 2 ** Math.min(consecutiveFailures, 6)), signal)
+        }
         continue
       } catch (err) {
         if (err instanceof UploadError && err.fatal) throw err
         if (signal?.aborted) throw new UploadError('Upload cancelled', true)
         reconnects++
-        if (reconnects > MAX_RECONNECTS) {
+        // Counted as a failure for now; the probe at the top of the loop resets
+        // the counter if the server confirms that new bytes actually landed.
+        consecutiveFailures++
+        if (consecutiveFailures > MAX_CONSECUTIVE_FAILURES) {
           throw new UploadError(
-            `Upload failed after ${MAX_RECONNECTS} reconnects (${err instanceof Error ? err.message : 'network error'}). Check your connection and try again — it will resume where it stopped.`,
+            `Upload failed after ${MAX_CONSECUTIVE_FAILURES} attempts in a row without progress (${err instanceof Error ? err.message : 'network error'}). Check your connection and try again — it will resume where it stopped.`,
             true,
           )
         }
-        phase = 'reconnecting'
+        setPhase('reconnecting')
         wire = 0
         emit()
+        // No network at all → wait for it to come back instead of burning retries.
+        if (isOffline()) {
+          offline = true
+          emit()
+          await waitOnline(signal)
+          offline = false
+          emit()
+          if (signal?.aborted) throw new UploadError('Upload cancelled', true)
+        }
         // 0.5 s, 1 s, 2 s ... capped at 8 s, plus jitter.
-        await sleep(Math.min(8_000, 500 * 2 ** (reconnects - 1)) + Math.random() * 300, signal)
+        await sleep(Math.min(8_000, 500 * 2 ** Math.min(consecutiveFailures, 6)) + Math.random() * 300, signal)
       }
     }
   } finally {
