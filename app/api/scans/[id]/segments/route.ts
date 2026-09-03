@@ -40,7 +40,14 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     for (const r of body.ranges) {
       const seg = segs.find((s) => s.index === r.index)
       if (!seg) continue
+      // Manual range edit/clear overrides any Minute Finder exact-minute list —
+      // but ONLY when the range actually changed. The UI re-posts every
+      // minute's current range on each save (e.g. a plain checkbox toggle),
+      // and that must not wipe the finder's list.
+      const prevStart = typeof seg.movieRangeStart === 'number' ? Math.round(seg.movieRangeStart) : null
+      const prevEnd = typeof seg.movieRangeEnd === 'number' ? Math.round(seg.movieRangeEnd) : null
       if (r.start === null || r.end === null) {
+        if (prevStart !== null || prevEnd !== null) delete seg.movieMinutes
         delete seg.movieRangeStart
         delete seg.movieRangeEnd
         continue
@@ -58,9 +65,11 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
       }
       // Range covering the whole trim window = no custom range.
       if (start <= trimStart && end >= trimEnd) {
+        if (prevStart !== null || prevEnd !== null) delete seg.movieMinutes
         delete seg.movieRangeStart
         delete seg.movieRangeEnd
       } else {
+        if (Math.round(start) !== prevStart || Math.round(end) !== prevEnd) delete seg.movieMinutes
         seg.movieRangeStart = start
         seg.movieRangeEnd = end
         if (seg.selected !== false) rangeNotes.push(`minute ${seg.index + 1} → movie ${Math.round(start)}s–${Math.round(end)}s`)

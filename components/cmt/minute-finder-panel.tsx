@@ -67,6 +67,11 @@ export function MinuteFinderPanel({ scan, mode, onModeChanged }: { scan: Scan; m
   const failedWindows = windows.filter((w) => w.status === 'failed').length
   const windowsWithHits = windows.filter((w) => (w.matches || 0) > 0).length
   const minutes = prescan.appliedMinutes ?? prescan.minuteSuggestions?.map((s) => s.minute) ?? []
+  // ACTUAL chunk-scan plan: per short minute the scheduler only touches chunks
+  // whose absolute movie minute is in that minute's exact allow-list.
+  const listSegs = (scan.shortSegments || []).filter((s) => s.selected !== false && Array.isArray(s.movieMinutes) && s.movieMinutes.length > 0)
+  const plannedChunkCalls = listSegs.reduce((n, s) => n + s.movieMinutes!.length, 0)
+  const plannedUniqueChunks = new Set(listSegs.flatMap((s) => s.movieMinutes!)).size
   const shortTooLong = Boolean(scan.shortDuration && data?.maxShortSec && scan.shortDuration > data.maxShortSec)
 
   async function post(action: 'start' | 'retry' | 'rerun') {
@@ -291,6 +296,12 @@ export function MinuteFinderPanel({ scan, mode, onModeChanged }: { scan: Scan; m
                   </span>
                 ))}
               </div>
+              {listSegs.length > 0 && (
+                <p className="mt-1.5 text-[11px] text-muted-foreground">
+                  Chunk scan: <span className="font-medium text-foreground">{plannedChunkCalls} chunk call{plannedChunkCalls === 1 ? '' : 's'}</span>{' '}
+                  (list-based · {plannedUniqueChunks} unique movie chunk{plannedUniqueChunks === 1 ? '' : 's'} across {listSegs.length} short minute{listSegs.length === 1 ? '' : 's'}) — gap chunks skipped
+                </p>
+              )}
             </div>
           )}
 

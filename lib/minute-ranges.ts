@@ -1,4 +1,5 @@
 import type { MinuteSuggestion, Scan } from './types'
+import { formatMinuteList } from './segment-range'
 
 /**
  * SHARED: map approved MOVIE minutes back onto each SHORT minute via the
@@ -34,22 +35,28 @@ export function applyApprovedMinutes(
       seg.selected = false
       delete seg.movieRangeStart
       delete seg.movieRangeEnd
+      delete seg.movieMinutes
       continue
     }
     seg.selected = true
-    // Range = min..max of approved minutes for this short minute, clamped to trim.
-    const rawStart = Math.min(...relevantMinutes) * 60
-    const rawEnd = (Math.max(...relevantMinutes) + 1) * 60
+    // EXACT MINUTE LIST: chunk selection uses this allow-list (gaps between
+    // minutes are skipped). ±1 buffer is already included by the finder.
+    const minuteList = [...new Set(relevantMinutes)].sort((a, b) => a - b)
+    seg.movieMinutes = minuteList
+    // Range = min..max kept ONLY for UI / backward-compat display; the chunk
+    // scheduler prefers `movieMinutes` when it is set.
+    const rawStart = Math.min(...minuteList) * 60
+    const rawEnd = (Math.max(...minuteList) + 1) * 60
     const start = Math.max(trimStart, rawStart)
     const end = Math.min(trimEnd, rawEnd)
     if (end > start && !(start <= trimStart && end >= trimEnd)) {
       seg.movieRangeStart = start
       seg.movieRangeEnd = end
-      rangeNotes.push(`minute ${seg.index + 1} → movie ${Math.round(start)}s–${Math.round(end)}s`)
     } else {
       delete seg.movieRangeStart
       delete seg.movieRangeEnd
     }
+    rangeNotes.push(`minute ${seg.index + 1} → movie minutes [${formatMinuteList(minuteList)}] (${minuteList.length} chunks)`)
   }
 
   if (!segs.some((s) => s.selected !== false)) {

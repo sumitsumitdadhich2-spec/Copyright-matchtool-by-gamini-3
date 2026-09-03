@@ -64,6 +64,11 @@ export interface ShortSegmentState {
    *  Unset = search the whole trim window. */
   movieRangeStart?: number
   movieRangeEnd?: number
+  /** PER-MINUTE exact movie-minute allow-list (ABSOLUTE original-movie minute
+   *  numbers, e.g. [7,8,9,66,67]). When set, this short minute is scanned ONLY
+   *  against chunks whose absolute minute is in this list — gaps between
+   *  minutes are skipped. Takes priority over movieRangeStart/End. */
+  movieMinutes?: number[]
   /** TWELVE LABS PRE-FILTER (optional): chunk indexes selected by embedding
    *  similarity for THIS minute (already includes ±1 buffer chunks).
    *  Unset = no pre-filter — scan every chunk (normal full scan). */
