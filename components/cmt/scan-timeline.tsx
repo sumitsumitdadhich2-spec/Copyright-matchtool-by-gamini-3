@@ -110,7 +110,7 @@ export function ScanTimeline({ scan }: { scan: Scan }) {
           <div
             key={c.index}
             role="listitem"
-            title={`Minute ${c.index} (${fmtTime(c.index * 60)}) — ${c.status}${c.model ? ` · ${displayModelName(c.model)}` : ''}${
+            title={`Minute ${c.index} (${fmtTime(c.index * 60)}–${fmtTime((c.index + 1) * 60)}) — ${c.status}${c.model ? ` · ${displayModelName(c.model)}` : ''}${
               c.confidence !== undefined ? ` · conf ${c.confidence}` : ''
             }`}
             className={`h-5 w-5 rounded-sm ${STATUS_CLASS[c.status] || 'bg-muted'} transition-all duration-300 hover:scale-125 hover:ring-2 hover:ring-primary/50`}
