@@ -9,7 +9,6 @@ import { dispatchMinuteFinder } from '@/lib/minute-finder-dispatch'
 import { isMinuteFinderRunning, stopAndWaitMinuteFinder } from '@/lib/gemini-minute-finder'
 
 export const runtime = 'nodejs'
-export const maxDuration = 300
 
 /** Confirm the movie trim window (or the full movie) and start chunking.
  *  Chunks cover ONLY the confirmed range; all reported movie timestamps stay

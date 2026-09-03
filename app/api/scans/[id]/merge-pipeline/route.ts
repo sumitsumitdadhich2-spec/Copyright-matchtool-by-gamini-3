@@ -5,7 +5,6 @@ import { getUserTwelveLabsKey } from '@/lib/user-keys'
 import { startMergePipeline, isPipelineRunning, pipelineReady } from '@/lib/merge-pipeline'
 
 export const runtime = 'nodejs'
-export const maxDuration = 300
 
 /** GET: auto-pipeline state for the UI (status + minute suggestions + logs live in scan.logs). */
 export async function GET(_req: Request, ctx: { params: Promise<{ id: string }> }) {

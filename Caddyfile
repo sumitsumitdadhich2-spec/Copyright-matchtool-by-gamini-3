@@ -1,0 +1,34 @@
+# Reverse proxy for the CMT app.
+# SITE_ADDRESS=cmt.example.com  -> automatic HTTPS (Let's Encrypt)
+# SITE_ADDRESS=:80              -> plain HTTP (before DNS is set up)
+
+{
+	# Long uploads / renders: never cut a request short.
+	servers {
+		timeouts {
+			read_body 0
+			read_header 60s
+			write 0
+			idle 30m
+		}
+	}
+}
+
+{$SITE_ADDRESS} {
+	encode zstd gzip
+
+	# No request body limit — movie chunks are 16 MB, renders download multi-GB.
+	request_body {
+		max_size 0
+	}
+
+	reverse_proxy app:3000 {
+		flush_interval -1
+		transport http {
+			dial_timeout 10s
+			response_header_timeout 30m
+			read_timeout 0
+			write_timeout 0
+		}
+	}
+}
