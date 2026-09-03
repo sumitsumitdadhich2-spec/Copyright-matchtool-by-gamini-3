@@ -678,15 +678,13 @@ function minutesFromWindow(
     const b = Math.floor(Math.max(absStart, absEnd - 0.001) / 60) + 1
     for (let m = a; m <= b; m++) if (m >= minMinute && m <= maxMinute) out.add(m)
   }
-  if (parsed.hits.length > 0) {
-    for (const h of parsed.hits) add(trimStart + h.fileStart, trimStart + h.fileEnd)
-  } else {
-    // HISSA 3 fallback: minute numbers on the movie-copy clock.
-    for (const n of [...parsed.matchMinutes, ...parsed.possibleMinutes]) {
-      const fileT = n * 60
-      if (fileT < w.startOffset - 120 || fileT > w.endOffset + 120) continue
-      add(trimStart + fileT, trimStart + fileT + 60)
-    }
+  for (const h of parsed.hits) add(trimStart + h.fileStart, trimStart + h.fileEnd)
+  // HISSA 3 is UNIONED with the hits (not a fallback): the model's own minute list
+  // sometimes names minutes whose HISSA 2 range we could not parse — never drop them.
+  for (const n of [...parsed.matchMinutes, ...parsed.possibleMinutes]) {
+    const fileT = n * 60
+    if (fileT < w.startOffset - 120 || fileT > w.endOffset + 120) continue
+    add(trimStart + fileT, trimStart + fileT + 60)
   }
   return [...out].sort((a, b) => a - b)
 }
@@ -708,15 +706,17 @@ function buildSuggestions(windows: GeminiPrescanWindow[], trimStart: number, tri
   for (const w of windows) {
     if (w.status !== 'done' || !w.raw) continue
     const parsed = parseMinuteFinderOutput(w.raw, w.startOffset, w.endOffset, WINDOW_TIMESTAMPS_RELATIVE)
-    if (parsed.hits.length > 0) {
-      for (const h of parsed.hits) {
-        const mins = minutesFromWindow({ ...parsed, hits: [h], matchMinutes: [], possibleMinutes: [] }, w, trimStart, trimEnd)
-        const sw = h.shortStart !== null && h.shortEnd !== null ? { start: h.shortStart, end: h.shortEnd } : fullShort
-        for (const m of mins) touch(m, h.kind, sw)
+    const covered = new Set<number>()
+    for (const h of parsed.hits) {
+      const mins = minutesFromWindow({ ...parsed, hits: [h], matchMinutes: [], possibleMinutes: [] }, w, trimStart, trimEnd)
+      const sw = h.shortStart !== null && h.shortEnd !== null ? { start: h.shortStart, end: h.shortEnd } : fullShort
+      for (const m of mins) {
+        covered.add(m)
+        touch(m, h.kind, sw)
       }
-    } else if (w.minutes && w.minutes.length > 0) {
-      for (const m of w.minutes) touch(m, 'possible', fullShort)
     }
+    // Minutes that only came from HISSA 3 (no parsable HISSA 2 range) still count.
+    for (const m of w.minutes || []) if (!covered.has(m)) touch(m, 'possible', fullShort)
   }
   return [...byMinute.values()].sort((a, b) => a.minute - b.minute)
 }

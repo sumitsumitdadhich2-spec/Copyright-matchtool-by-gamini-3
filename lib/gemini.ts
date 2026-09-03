@@ -323,43 +323,57 @@ export function parseMinuteFinderOutput(
     return null
   }
 
-  // HISSA 2: S<n> --> MATCH | WINDOW a - b | MOVIE c - d | EVIDENCE: ...
+  // HISSA 2: S<n> --> MATCH | WINDOW a - b[, c - d, ...] | MOVIE e - f[, g - h, ...] | EVIDENCE: ...
+  // The model may list SEVERAL ranges per scene (comma separated) when the same
+  // short scene appears at multiple movie moments — every range becomes a hit.
   const hits: MinuteFinderHit[] = []
   const TS = String.raw`(\d+:\d{1,2}(?::\d{1,2})?(?:\.\d+)?)`
   const hitRe = new RegExp(
     String.raw`S(\d+)\s*-->\s*(MATCH|POSSIBLE)\b([^\n]*)`,
     'gi',
   )
-  const winRe = new RegExp(String.raw`WINDOW\s+${TS}\s*-\s*${TS}`, 'i')
-  const movRe = new RegExp(String.raw`MOVIE\s+${TS}\s*-\s*${TS}`, 'i')
+  // Whole column text up to the next "|" (so all comma-separated ranges are included).
+  const winColRe = /WINDOW\s*:?\s*([^|\n]+)/i
+  const movColRe = /MOVIE\s*:?\s*([^|\n]+)/i
+  const rangeRe = new RegExp(String.raw`${TS}\s*(?:-|–|—|to)\s*${TS}`, 'gi')
   const evRe = /(?:EVIDENCE|REASON)\s*:\s*(.+)$/i
+  const rangesIn = (col: string | undefined): Array<{ s: number | null; e: number | null }> => {
+    if (!col) return []
+    const out: Array<{ s: number | null; e: number | null }> = []
+    for (const m of col.matchAll(rangeRe)) out.push({ s: parseTsFlexible(m[1]), e: parseTsFlexible(m[2]) })
+    return out
+  }
   let hm: RegExpExecArray | null
   while ((hm = hitRe.exec(raw)) !== null) {
     const scene = Number(hm[1])
     const kind = hm[2].toUpperCase() === 'MATCH' ? 'match' : 'possible'
     const rest = hm[3] || ''
-    const w = rest.match(winRe)
-    const mv = rest.match(movRe)
-    const winS = w ? parseTsFlexible(w[1]) : null
-    const winE = w ? parseTsFlexible(w[2]) : null
-    const movS = mv ? parseTsFlexible(mv[1]) : null
-    const movE = mv ? parseTsFlexible(mv[2]) : null
-    const fs0 = resolve(winS, movS)
-    const fe0 = resolve(winE, movE)
-    if (fs0 === null || fe0 === null) continue
-    const fileStart = Math.min(Math.max(startOffset, fs0), endOffset)
-    const fileEnd = Math.min(Math.max(startOffset, fe0), endOffset)
-    if (fileEnd < fileStart) continue
+    const winRanges = rangesIn(rest.match(winColRe)?.[1])
+    const movRanges = rangesIn(rest.match(movColRe)?.[1])
+    const n = Math.max(winRanges.length, movRanges.length)
+    if (n === 0) continue
+    const evidence = (rest.match(evRe)?.[1] || '').trim().slice(0, 160)
     const sw = shortMap.get(scene) || null
-    hits.push({
-      scene,
-      kind,
-      shortStart: sw?.start ?? null,
-      shortEnd: sw?.end ?? null,
-      fileStart,
-      fileEnd: Math.max(fileEnd, fileStart + 0.5),
-      evidence: (rest.match(evRe)?.[1] || '').trim().slice(0, 160),
-    })
+    for (let i = 0; i < n; i++) {
+      // Pair WINDOW[i] with MOVIE[i]; if one column has fewer ranges, resolve from the other alone.
+      const wr = winRanges[i]
+      const mr = movRanges[i]
+      const fs0 = resolve(wr?.s ?? null, mr?.s ?? null)
+      const fe0 = resolve(wr?.e ?? null, mr?.e ?? null)
+      if (fs0 === null || fe0 === null) continue
+      const fileStart = Math.min(Math.max(startOffset, fs0), endOffset)
+      const fileEnd = Math.min(Math.max(startOffset, fe0), endOffset)
+      if (fileEnd < fileStart) continue
+      hits.push({
+        scene,
+        kind,
+        shortStart: sw?.start ?? null,
+        shortEnd: sw?.end ?? null,
+        fileStart,
+        fileEnd: Math.max(fileEnd, fileStart + 0.5),
+        evidence,
+      })
+    }
   }
 
   // HISSA 3 fallback lists (movie-copy minutes as the model understood them).
