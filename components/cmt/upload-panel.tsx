@@ -1,7 +1,7 @@
 'use client'
 
-import { useRef, useState, type DragEvent } from 'react'
-import { Film, Clapperboard, Loader2, CheckCircle2, X, RefreshCw } from 'lucide-react'
+import { useEffect, useRef, useState, type DragEvent } from 'react'
+import { Film, Clapperboard, Loader2, CheckCircle2, X, RefreshCw, WifiOff } from 'lucide-react'
 import type { Scan } from '@/lib/types'
 import { fmtTime, fmtBytes } from '@/lib/format'
 import { uploadVideoStream, fmtMbps, fmtEta, UploadError, type UploadProgress, type UploadKind } from '@/lib/upload-client'
@@ -73,6 +73,20 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
   const [local, setLocal] = useState<Partial<Record<Kind, LocalPick>>>({})
   const abortRef = useRef<AbortController | null>(null)
   const scanIdRef = useRef<string | null>(selectedScanId)
+
+  // Closing / reloading the tab mid-upload kills the stream. The upload would
+  // resume from the server's last byte if the same file is picked again, but
+  // warn first so it does not happen by accident.
+  const uploading = job !== null
+  useEffect(() => {
+    if (!uploading) return
+    const warn = (e: BeforeUnloadEvent) => {
+      e.preventDefault()
+      e.returnValue = ''
+    }
+    window.addEventListener('beforeunload', warn)
+    return () => window.removeEventListener('beforeunload', warn)
+  }, [uploading])
   // Follow the dashboard's selection: when the user picks "New scan" (null) or
   // another history entry, drop any stale id so uploads never land in an old scan.
   const prevSelectedRef = useRef<string | null>(selectedScanId)
@@ -122,9 +136,11 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
         total: file.size,
         bytesPerSec: null,
         peakBytesPerSec: 0,
+        avgBytesPerSec: null,
         etaSec: null,
         reconnects: 0,
         resumedFrom: 0,
+        offline: false,
       },
     })
 
@@ -359,7 +375,9 @@ function UploadMeter({ p }: { p: UploadProgress }) {
       status = p.reconnects > 0 ? 'Checking what already reached the server…' : 'Connecting…'
       break
     case 'reconnecting':
-      status = `Connection dropped — resuming from ${fmtBytes(p.sent)} (retry ${p.reconnects})`
+      status = p.offline
+        ? `No internet — waiting for the connection to come back (will resume from ${fmtBytes(p.sent)})`
+        : `Connection dropped — resuming from ${fmtBytes(p.sent)} (retry ${p.reconnects})`
       break
     case 'finalizing':
       status = 'All bytes sent — server is verifying the file…'
@@ -370,6 +388,8 @@ function UploadMeter({ p }: { p: UploadProgress }) {
           ? `Resumed from ${fmtBytes(p.resumedFrom)} — one continuous stream, you can keep working`
           : 'One continuous stream — you can keep working'
   }
+
+  const trouble = p.phase === 'reconnecting'
 
   return (
     <div className="flex w-full flex-col gap-1.5">
@@ -384,7 +404,12 @@ function UploadMeter({ p }: { p: UploadProgress }) {
         <div className="progress-fill" style={{ width: `${pct}%` }} />
       </div>
       <div className="flex w-full flex-wrap items-baseline gap-x-3 gap-y-0.5 font-mono text-xs tabular-nums">
-        <span className={`text-sm font-semibold ${live ? 'text-primary' : 'text-muted-foreground'}`}>
+        {/* Live line speed — the number to compare with your internet plan. */}
+        <span
+          className={`text-base font-semibold leading-none ${live ? 'text-primary' : 'text-muted-foreground'}`}
+          aria-live="polite"
+          aria-label="Current upload speed"
+        >
           {live ? fmtMbps(p.bytesPerSec!) : p.phase === 'uploading' ? 'measuring…' : '— Mbps'}
         </span>
         {live && <span className="text-muted-foreground">{fmtBytes(p.bytesPerSec!)}/s</span>}
@@ -398,11 +423,15 @@ function UploadMeter({ p }: { p: UploadProgress }) {
           </span>
         )}
       </div>
-      <span className={`flex items-center gap-1 text-[11px] ${p.phase === 'reconnecting' ? 'text-destructive' : 'text-primary'}`}>
-        {p.phase === 'reconnecting' && <RefreshCw className="size-3 animate-spin" aria-hidden />}
-        {status}
-        {p.peakBytesPerSec > 0 && p.phase === 'uploading' && (
-          <span className="ml-auto text-muted-foreground">peak {fmtMbps(p.peakBytesPerSec)}</span>
+      <span className={`flex items-center gap-1 text-[11px] ${trouble ? 'text-destructive' : 'text-primary'}`}>
+        {trouble && (p.offline ? <WifiOff className="size-3" aria-hidden /> : <RefreshCw className="size-3 animate-spin" aria-hidden />)}
+        <span className="truncate">{status}</span>
+        {p.phase === 'uploading' && (p.avgBytesPerSec !== null || p.peakBytesPerSec > 0) && (
+          <span className="ml-auto shrink-0 font-mono text-muted-foreground">
+            {p.avgBytesPerSec !== null && <>avg {fmtMbps(p.avgBytesPerSec)}</>}
+            {p.avgBytesPerSec !== null && p.peakBytesPerSec > 0 && ' · '}
+            {p.peakBytesPerSec > 0 && <>peak {fmtMbps(p.peakBytesPerSec)}</>}
+          </span>
         )}
       </span>
     </div>

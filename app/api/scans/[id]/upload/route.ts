@@ -167,6 +167,14 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   if (!Number.isFinite(total) || total <= 0 || !Number.isFinite(offset) || offset < 0 || offset > total) {
     return NextResponse.json({ error: 'Invalid offset/total' }, { status: 400 })
   }
+  // Reject an over-long body BEFORE reading it (browser always sends Content-Length).
+  const declared = Number.parseInt(req.headers.get('content-length') || '', 10)
+  if (Number.isFinite(declared) && declared > 0 && offset + declared > total) {
+    return NextResponse.json(
+      { error: `Body of ${declared.toLocaleString()} bytes from offset ${offset.toLocaleString()} exceeds the file size ${total.toLocaleString()}` },
+      { status: 400 },
+    )
+  }
 
   const key = `${id}/${kind}`
   if (!(await waitIdle(key))) {
@@ -227,10 +235,15 @@ async function streamToDisk(req: Request, p: StreamParams): Promise<NextResponse
   let pos = offset
   let cutShort: string | null = null
   let overflow = false
+  const startedAt = Date.now()
 
   if (offset < total) {
     if (!req.body) return NextResponse.json({ error: 'Missing request body' }, { status: 400 })
     const source = Readable.fromWeb(req.body as unknown as WebReadableStream<Uint8Array>)
+    // Safety net: if the client vanishes and the body stream does not end on its
+    // own, tear it down ourselves so the per-file lock is always released.
+    const onAbort = () => source.destroy(new Error('client aborted'))
+    req.signal.addEventListener('abort', onAbort, { once: true })
     const fh = await fs.promises.open(part, 'r+')
     const buf = Buffer.allocUnsafe(WRITE_BUF)
     let fill = 0
@@ -282,12 +295,25 @@ async function streamToDisk(req: Request, p: StreamParams): Promise<NextResponse
         // disk error while flushing the tail — received stays at last good pos
       }
     } finally {
+      req.signal.removeEventListener('abort', onAbort)
       try {
         await fh.close()
       } catch {
         // ignore
       }
       persist()
+    }
+  }
+
+  // Server-side throughput of THIS stream — the number to compare with the
+  // Mbps shown in the browser when debugging a slow link (docker compose logs).
+  {
+    const got = Math.max(0, pos - offset)
+    const sec = Math.max(0.001, (Date.now() - startedAt) / 1000)
+    if (got > 0) {
+      console.log(
+        `[upload] ${kind} of ${id}: +${(got / 1048576).toFixed(1)} MB in ${sec.toFixed(1)}s = ${((got * 8) / 1e6 / sec).toFixed(1)} Mbps (${(pos / 1048576).toFixed(1)}/${(total / 1048576).toFixed(1)} MB on disk)`,
+      )
     }
   }
 
