@@ -1,8 +1,6 @@
 'use client'
 
 import { useRef, useState, type DragEvent } from 'react'
-import { upload as blobUpload } from '@vercel/blob/client'
-import { fastBlobUpload } from '@/lib/fast-blob-upload'
 import { Film, Clapperboard, Loader2, CheckCircle2 } from 'lucide-react'
 import type { Scan } from '@/lib/types'
 import { fmtTime, fmtBytes } from '@/lib/format'
@@ -56,52 +54,41 @@ function readLocalDuration(file: File): Promise<number | null> {
   })
 }
 
-/** Rolling-window speed meter (bytes/s over the last ~6 s). A cumulative
- *  average hides stalls and a per-event delta is far too noisy — this is the
- *  middle ground that reads steady on screen. */
-function createSpeedMeter(windowMs = 6000) {
-  const samples: { t: number; loaded: number }[] = []
-  return (loaded: number): number | null => {
-    const now = performance.now()
-    samples.push({ t: now, loaded })
-    while (samples.length > 2 && now - samples[0].t > windowMs) samples.shift()
-    if (samples.length < 2) return null
-    const dt = (now - samples[0].t) / 1000
-    if (dt < 1) return null
-    return Math.max(0, (loaded - samples[0].loaded) / dt)
-  }
-}
-
-// ---- PRIMARY path: browser → app server in 4 MB chunks (XHR, parallel),
-// then the server mirrors the file to Blob at datacenter speed. The app is
-// fronted by an edge POP near the user, so TCP/TLS terminate close by and the
-// link stays full. Measured on real uploads this is many times faster than
-// sending parts straight to the Blob origin (a distant datacenter).
+// ---- The ONLY upload path: browser → app server (EC2) → EBS disk.
+// The video is sliced into CHUNK_BYTES pieces and PARALLEL of them are on the
+// wire at once. Each chunk is written at its byte offset on the server, so
+// order does not matter and a lost chunk is simply re-sent. ffprobe starts the
+// instant the last byte lands; the S3 backup happens in the background.
 //
-// WHY IT USED TO GO "15 Mbps → freeze 10 s → burst": the old code used
-// fetch(), which reports nothing until a whole chunk is accepted, and started
-// all 8 chunks at the same instant so they also FINISHED at the same instant.
-// The meter therefore saw 32 MB land at once (huge speed), then nothing for
-// the next round trip (zero). Now: XHR gives continuous per-byte progress,
-// chunks are launched out of phase, speed is sampled on a fixed clock with a
-// 10 s window + EMA, and the bar glides at that rate. One steady number.
+// Resume: the upload session id is a fingerprint of the file (name + size +
+// lastModified). Before sending, the browser asks the server which byte
+// ranges it already has and only sends the rest — so a page refresh mid-way
+// through a 4 GB movie picks up where it left off.
 //
-// FALLBACK path: browser → Vercel Blob directly (lib/fast-blob-upload.ts),
-// used only if the server can't accept/assemble the chunks.
-const CHUNK_BYTES = 4 * 1024 * 1024
-/** Chunks in flight. Enough to keep the pipe full on a high-latency link
- *  without buffering tens of MB in the browser (which is what makes the
- *  freeze visible). */
-const PARALLEL = 5
+// Speed meter: sampled on a fixed clock over a 10 s window + EMA, and the bar
+// glides at that rate — one steady number instead of bursts and freezes.
+const DEFAULT_CHUNK_MB = 16
+const CHUNK_BYTES = Math.max(1, Number.parseInt(process.env.NEXT_PUBLIC_UPLOAD_CHUNK_MB || '', 10) || DEFAULT_CHUNK_MB) * 1024 * 1024
+/** Chunks in flight at all times. */
+const PARALLEL = Math.max(1, Number.parseInt(process.env.NEXT_PUBLIC_UPLOAD_PARALLEL || '', 10) || 8)
 /** A chunk that accepts NO new bytes for this long is aborted and re-sent.
  *  Measured on upload progress, so a slow-but-moving chunk is never killed. */
-const CHUNK_TIMEOUT_MS = 30_000
+const CHUNK_TIMEOUT_MS = 45_000
+const MAX_ATTEMPTS = 8
+
+function fileFingerprint(file: File): string {
+  // Stable across page reloads for the same file on the same machine.
+  let h = 0
+  const s = `${file.name}|${file.size}|${file.lastModified}`
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0
+  return `${(h >>> 0).toString(36)}${file.size.toString(36)}`
+}
 
 export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Props) {
   const [uploading, setUploading] = useState<Kind | null>(null)
   const [progress, setProgress] = useState(0)
   const [speed, setSpeed] = useState<number | null>(null)
-  /** Parts currently on the wire (adaptive uploader) — 0 when not applicable. */
+  /** Chunks currently on the wire. */
   const [inFlight, setInFlight] = useState(0)
   const [error, setError] = useState<string | null>(null)
   const [local, setLocal] = useState<Partial<Record<Kind, LocalPick>>>({})
@@ -131,110 +118,40 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
   }
 
   /**
-   * PRIMARY: direct browser → Vercel Blob upload, then a small /complete call
-   * so the server pulls the file down and runs ffmpeg.
-   *
-   * Returns true when everything succeeded. Returns false ONLY when the Blob
-   * upload itself could not even start / transfer (token endpoint unreachable,
-   * network blocked, etc.). Errors from the finalize step are thrown.
+   * Parallel, resumable chunked upload to the app server. Resolves when the
+   * server confirmed the assembled file + ffprobe finalize. Throws on failure.
    */
-  async function uploadDirectToBlob(id: string, kind: Kind, file: File): Promise<boolean> {
-    const contentType = file.type || 'application/octet-stream'
-    let transferred = false
-
-    // 1) Steady-rate multipart uploader (acked-bytes speed, rate-limited bar,
-    //    deadline-based stall detection). Needs a scoped client token.
-    try {
-      const tokRes = await fetch(`/api/scans/${id}/upload/token`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ type: 'direct', kind, contentType }),
-      })
-      if (!tokRes.ok) throw new Error(`token ${tokRes.status}`)
-      const { token, pathname } = (await tokRes.json()) as { token: string; pathname: string }
-      await fastBlobUpload(file, {
-        token,
-        pathname,
-        contentType,
-        onProgress: ({ percentage, speed: bps, inFlight }) => {
-          if (bps !== null) setSpeed(bps)
-          setInFlight(inFlight)
-          // Cap at 99 — the server-side ffmpeg finalize is the real 100%.
-          setProgress(Math.min(99, Math.round(percentage)))
-        },
-      })
-      transferred = true
-    } catch (err) {
-      console.warn('[upload] fast multipart upload failed, trying stock Blob upload:', err instanceof Error ? err.message : err)
-    }
-
-    // 2) Stock @vercel/blob upload() (6 parallel parts) as a safety net.
-    if (!transferred) {
-      setProgress(0)
-      setSpeed(null)
-      setInFlight(0)
-      const meter = createSpeedMeter()
-      try {
-        await blobUpload(`media/${id}/${kind}.mp4`, file, {
-          access: 'private',
-          handleUploadUrl: `/api/scans/${id}/upload/token`,
-          contentType,
-          multipart: true,
-          onUploadProgress: ({ loaded, percentage }) => {
-            const bps = meter(loaded)
-            if (bps !== null) setSpeed(bps)
-            setProgress(Math.min(99, Math.round(percentage)))
-          },
-        })
-      } catch (err) {
-        console.warn('[upload] direct Blob upload failed, falling back to chunked upload:', err instanceof Error ? err.message : err)
-        return false
-      }
-    }
-
-    // Finalize: server downloads from Blob (datacenter speed) + ffmpeg probe.
-    setSpeed(null)
-    setInFlight(0)
-    const res = await fetch(`/api/scans/${id}/upload/complete`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ kind, name: file.name }),
-    })
-    if (!res.ok) {
-      let msg = 'Upload finished but processing failed. Please try again.'
-      try {
-        msg = ((await res.json()) as { error?: string }).error || msg
-      } catch {
-        // keep default
-      }
-      throw new Error(msg)
-    }
-    return true
-  }
-
-  /**
-   * FALLBACK: parallel chunked upload to the app server. Resolves true when the
-   * server confirmed the assembled file + ffmpeg finalize. Resolves false when
-   * the transport itself is unusable (network unreachable / 5xx storms /
-   * server never confirmed assembly). Real 4xx errors (bad video etc.) are
-   * thrown as-is.
-   */
-  async function uploadChunkedToServer(id: string, kind: Kind, file: File): Promise<boolean> {
-    const session = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`
+  async function uploadChunkedToServer(id: string, kind: Kind, file: File): Promise<void> {
+    const session = fileFingerprint(file)
     const base = `/api/scans/${id}/upload?kind=${kind}&name=${encodeURIComponent(file.name)}&total=${file.size}&session=${session}`
     const videoType = file.type || 'video/mp4'
 
+    // ---- Resume: ask the server which byte ranges already landed.
+    let have: Array<[number, number]> = []
+    try {
+      const r = await fetch(base, { method: 'GET' })
+      if (r.ok) {
+        const j = (await r.json()) as { ranges?: Array<[number, number]> }
+        if (Array.isArray(j.ranges)) have = j.ranges
+      }
+    } catch {
+      // fresh upload
+    }
+    const isCovered = (s: number, e: number) => have.some(([rs, re]) => rs <= s && re >= e)
+
     const offsets: number[] = []
-    for (let o = 0; o < file.size; o += CHUNK_BYTES) offsets.push(o)
+    let committed = 0
+    for (let o = 0; o < file.size; o += CHUNK_BYTES) {
+      const end = Math.min(o + CHUNK_BYTES, file.size)
+      if (isCovered(o, end)) committed += end - o
+      else offsets.push(o)
+    }
+    if (committed > 0) console.log(`[upload] resuming ${kind}: ${committed} of ${file.size} bytes already on the server`)
 
     // ---- Byte accounting.
     // `committed` = bytes the server has confirmed. `inflight[i]` = bytes the
-    // browser has pushed onto the wire for chunk i (from XHR upload progress,
-    // which fires continuously — unlike fetch, which only tells us when the
-    // WHOLE chunk is done). Together they give a smooth, continuous number
-    // instead of one 4 MB jump per finished chunk.
-    let committed = 0
-    const inflight = new Float64Array(offsets.length)
+    // browser has pushed onto the wire for chunk i (from XHR upload progress).
+    const inflight = new Float64Array(offsets.length + 1)
     const wireBytes = () => {
       let n = committed
       for (let i = 0; i < inflight.length; i++) n += inflight[i]
@@ -243,22 +160,17 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
 
     let done = false
     let failed: Error | null = null
-    // Object so TS control-flow can't narrow it to `false` (assigned in a closure).
-    const transport = { broken: false }
     let next = 0
     let active = 0
 
-    // ---- ONE steady speed number.
-    // Sampled on a fixed clock (not on network events) over a 10 s window,
-    // then EMA-smoothed. The displayed byte count is monotonic and rate-limited
-    // so the bar glides at the measured speed instead of sprinting/freezing.
+    // ---- ONE steady speed number (acked + wire bytes, 10 s window, EMA).
     const startedAt = performance.now()
-    const samples: { t: number; n: number }[] = [{ t: startedAt, n: 0 }]
+    const startBytes = committed
+    const samples: { t: number; n: number }[] = [{ t: startedAt, n: startBytes }]
     let smoothed: number | null = null
-    let shown = 0
+    let shown = committed
     let lastTick = startedAt
-    /** Before the window has enough samples: plain average since start. */
-    const rate0 = (n: number, now: number) => (now - startedAt > 500 ? n / ((now - startedAt) / 1000) : 0)
+    const rate0 = (n: number, now: number) => (now - startedAt > 500 ? (n - startBytes) / ((now - startedAt) / 1000) : 0)
     const tick = () => {
       const now = performance.now()
       const n = wireBytes()
@@ -270,27 +182,23 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
         smoothed = smoothed === null ? rate : smoothed * 0.8 + rate * 0.2
         setSpeed(smoothed)
       }
-      // Glide toward the real wire position at the measured rate (small
-      // headroom so it can catch up) — never backwards, never past reality.
       const step = ((smoothed ?? rate0(n, now)) * 1.15 * (now - lastTick)) / 1000
       lastTick = now
       shown = Math.min(Math.max(shown, committed), Math.max(shown + step, committed), n, file.size)
-      // Cap at 99 — server-side ffmpeg probe finishing is the real 100%.
+      // Cap at 99 — server-side ffprobe finishing is the real 100%.
       setProgress(Math.min(99, Math.floor((shown / file.size) * 100)))
       setInFlight(active)
     }
     const reporter = setInterval(tick, 250)
 
-    function postChunk(index: number, piece: Blob): Promise<{ status: number; body: string }> {
+    function postChunk(offset: number, index: number, piece: Blob): Promise<{ status: number; body: string }> {
       return new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest()
         let lastProgressAt = performance.now()
-        // Stall = no NEW bytes accepted by the network for CHUNK_TIMEOUT_MS.
-        // A slow-but-moving chunk is never killed; a dead one is re-sent.
         const watchdog = setInterval(() => {
           if (performance.now() - lastProgressAt > CHUNK_TIMEOUT_MS) xhr.abort()
         }, 1000)
-        xhr.open('POST', `${base}&offset=${offsets[index]}`)
+        xhr.open('POST', `${base}&offset=${offset}`)
         xhr.setRequestHeader('Content-Type', 'application/octet-stream')
         xhr.setRequestHeader('x-video-type', videoType)
         xhr.upload.onprogress = (e) => {
@@ -315,15 +223,15 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
       })
     }
 
-    async function sendChunk(index: number) {
-      const offset = offsets[index]
+    async function sendChunk(offset: number, index: number, countBytes = true) {
       const piece = file.slice(offset, Math.min(offset + CHUNK_BYTES, file.size))
       let lastErr: Error | null = null
-      for (let attempt = 0; attempt < 5; attempt++) {
-        if (attempt > 0) await new Promise((r) => setTimeout(r, Math.min(4000, 600 * 2 ** (attempt - 1))))
+      for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+        // Exponential backoff with jitter: 0.6s, 1.2s, 2.4s ... capped at 10s.
+        if (attempt > 0) await new Promise((r) => setTimeout(r, Math.min(10_000, 600 * 2 ** (attempt - 1)) + Math.random() * 300))
         inflight[index] = 0
         try {
-          const res = await postChunk(index, piece)
+          const res = await postChunk(offset, index, piece)
           if (res.status >= 200 && res.status < 300) {
             let j: { done?: boolean } = {}
             try {
@@ -333,7 +241,7 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
             }
             if (j.done) done = true
             inflight[index] = 0
-            committed += piece.size
+            if (countBytes) committed += piece.size
             return
           }
           let msg = 'Upload failed. Please try again.'
@@ -348,14 +256,12 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
         } catch (err) {
           inflight[index] = 0
           if (err instanceof TypeError || (err instanceof DOMException && err.name === 'AbortError')) {
-            // network error or our own stall timeout — re-send this chunk
             lastErr = new Error('Upload failed — network error. Please try again.')
           } else {
             throw err
           }
         }
       }
-      transport.broken = true
       throw lastErr ?? new Error('Upload failed. Please try again.')
     }
 
@@ -367,7 +273,7 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
           const i = next++
           if (i >= offsets.length) return
           try {
-            await sendChunk(i)
+            await sendChunk(offsets[i], i)
           } catch (err) {
             failed = err instanceof Error ? err : new Error('Upload failed. Please try again.')
             return
@@ -381,31 +287,25 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
       const workers: Promise<void>[] = []
       for (let w = 0; w < Math.min(PARALLEL, offsets.length); w++) {
         workers.push(worker())
-        // Stagger launches so chunks finish OUT OF PHASE. If all start together
-        // they all finish together → one big jump, then a long silence.
-        if (w < PARALLEL - 1) await new Promise((r) => setTimeout(r, 700))
+        // Stagger launches so chunks finish OUT OF PHASE.
+        if (w < PARALLEL - 1) await new Promise((r) => setTimeout(r, 400))
       }
       await Promise.all(workers)
+
+      const failure = failed as Error | null
+      if (failure) throw failure
+      if (!done) {
+        // Every chunk accepted but no request saw full coverage (e.g. the
+        // resume probe said everything was already there). Re-send the last
+        // chunk so the server re-checks coverage and finalizes.
+        const lastOffset = Math.floor((file.size - 1) / CHUNK_BYTES) * CHUNK_BYTES
+        await sendChunk(lastOffset, offsets.length, false)
+        if (!done) throw new Error('Upload finished but the server did not confirm the file. Please try again.')
+      }
     } finally {
       clearInterval(reporter)
       setInFlight(0)
     }
-
-    const failure = failed as Error | null
-    if (failure) {
-      if (transport.broken) {
-        console.warn('[upload] chunked upload transport failed, falling back to direct Blob upload:', failure.message)
-        return false
-      }
-      throw failure
-    }
-    if (!done) {
-      // Every chunk was accepted but no request saw full coverage — the server
-      // is probably spread over several instances/disks. Blob handles that.
-      console.warn('[upload] server never confirmed assembly, falling back to direct Blob upload')
-      return false
-    }
-    return true
   }
 
   function uploadFile(kind: Kind, file: File) {
@@ -429,19 +329,7 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
     void (async () => {
       try {
         const id = await ensureScan()
-
-        // PRIMARY: chunked upload through the app server (nearest edge POP —
-        // measured far faster than the Blob origin from here; see note above
-        // CHUNK_BYTES).
-        const viaServer = await uploadChunkedToServer(id, kind, file)
-        if (!viaServer) {
-          // FALLBACK: direct browser → Vercel Blob multipart upload.
-          setProgress(0)
-          setSpeed(null)
-          setInFlight(0)
-          const direct = await uploadDirectToBlob(id, kind, file)
-          if (!direct) throw new Error('Upload failed — could not reach the server or storage. Please try again.')
-        }
+        await uploadChunkedToServer(id, kind, file)
 
         setProgress(100)
         setUploading(null)

@@ -1,20 +1,22 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import { Readable } from 'node:stream'
-import { pipeline } from 'node:stream/promises'
-import { get, list, put } from '@vercel/blob'
 import { getScan, saveScan, addLog, scanMediaDir } from './store'
 import type { Scan } from './types'
 import { probeDuration, chunkShort, cleanupSegments } from './ffmpeg'
 import { CHUNK_SECONDS } from './models'
 import { deleteEmbeddings } from './twelvelabs'
+import { getFile, putFile, storageEnabled } from './storage'
+import { MEDIA_DIR, DISK_LIMIT_BYTES } from './paths'
+import { scanWorkRoot } from './work-dir'
 
 export type MediaKind = 'short' | 'movie'
 
-// Videos are stored A-to-Z in Vercel Blob (source of truth). /tmp is only a
-// working copy for ffmpeg — after a cold start the video is pulled back down.
+// Originals live on the EBS disk (DATA_DIR/media/<id>/<kind>.mp4) — that is
+// what ffmpeg reads. Each file is copied to S3 (media/<id>/<kind>.mp4) in the
+// background for durability; if the local file ever goes missing (fresh
+// instance / disk replaced) it is pulled back down from S3 on demand.
 
-export function mediaBlobPath(id: string, kind: MediaKind): string {
+export function mediaStorageKey(id: string, kind: MediaKind): string {
   return `media/${id}/${kind}.mp4`
 }
 
@@ -26,13 +28,13 @@ export function localMediaPath(id: string, kind: MediaKind): string {
 const inflight = new Map<string, Promise<string | null>>()
 
 /**
- * Make sure the video exists locally for ffmpeg/preview. If /tmp was wiped
- * (cold start / new instance) the file is re-downloaded from Blob.
- * Pass force=true right after a fresh upload to replace any stale local copy.
+ * Make sure the video exists locally for ffmpeg/preview. Only hits S3 when
+ * the local file is missing. Pass force=true to replace a stale local copy.
  */
 export async function ensureLocalMedia(id: string, kind: MediaKind, force = false): Promise<string | null> {
   const local = localMediaPath(id, kind)
   if (!force && fs.existsSync(/*turbopackIgnore: true*/ local) && fs.statSync(local).size > 0) return local
+  if (!storageEnabled()) return null
 
   const key = `${id}/${kind}`
   const existing = inflight.get(key)
@@ -40,14 +42,13 @@ export async function ensureLocalMedia(id: string, kind: MediaKind, force = fals
 
   const job = (async (): Promise<string | null> => {
     try {
-      const result = await get(mediaBlobPath(id, kind), { access: 'private' })
-      if (!result || !('stream' in result) || !result.stream) return null
-      const tmp = `${local}.dl-${process.pid}`
-      await pipeline(Readable.fromWeb(result.stream as never), fs.createWriteStream(tmp))
-      fs.renameSync(tmp, local)
+      const startedAt = Date.now()
+      const ok = await getFile(mediaStorageKey(id, kind), local)
+      if (!ok) return null
+      console.log(`[media] restored ${kind} of ${id} from S3 in ${((Date.now() - startedAt) / 1000).toFixed(1)}s`)
       return local
     } catch (err) {
-      console.error('[media] download from Blob failed:', err instanceof Error ? err.message : err)
+      console.error('[media] download from S3 failed:', err instanceof Error ? err.message : err)
       return null
     } finally {
       inflight.delete(key)
@@ -57,15 +58,14 @@ export async function ensureLocalMedia(id: string, kind: MediaKind, force = fals
   return job
 }
 
-// ---------- Local → Blob mirror ----------
-// The browser uploads to the APP SERVER (chunked, edge-terminated — by far the
-// fastest path from the user's uplink). The server then pushes the finished
-// file to Blob at datacenter speed so Blob stays the source of truth for
-// cold starts / other instances. Best-effort + de-duplicated per (id, kind).
+// ---------- Local → S3 mirror ----------
+// Runs in the background right after an upload finishes — never blocks the
+// user, ffmpeg starts on the local file immediately. De-duplicated per
+// (id, kind).
 
 const mirroring = new Map<string, Promise<boolean>>()
 
-export function mirrorMediaToBlob(id: string, kind: MediaKind, contentType = 'video/mp4'): Promise<boolean> {
+export function mirrorMediaToStorage(id: string, kind: MediaKind, contentType = 'video/mp4'): Promise<boolean> {
   const key = `${id}/${kind}`
   const existing = mirroring.get(key)
   if (existing) return existing
@@ -73,23 +73,16 @@ export function mirrorMediaToBlob(id: string, kind: MediaKind, contentType = 'vi
   const job = (async (): Promise<boolean> => {
     const local = localMediaPath(id, kind)
     try {
-      if (!process.env.BLOB_READ_WRITE_TOKEN) return false
+      if (!storageEnabled()) return false
       if (!fs.existsSync(/*turbopackIgnore: true*/ local)) return false
       const size = fs.statSync(local).size
       if (size === 0) return false
       const startedAt = Date.now()
-      await put(mediaBlobPath(id, kind), fs.createReadStream(local), {
-        access: 'private',
-        addRandomSuffix: false,
-        allowOverwrite: true,
-        contentType,
-        multipart: size > 8 * 1024 * 1024,
-      })
-      invalidateUsageCache()
-      console.log(`[media] mirrored ${kind} of ${id} to Blob (${(size / 1048576).toFixed(1)} MB in ${((Date.now() - startedAt) / 1000).toFixed(1)}s)`)
+      await putFile(mediaStorageKey(id, kind), local, contentType)
+      console.log(`[media] backed up ${kind} of ${id} to S3 (${(size / 1048576).toFixed(1)} MB in ${((Date.now() - startedAt) / 1000).toFixed(1)}s)`)
       return true
     } catch (err) {
-      console.error('[media] mirror to Blob failed:', err instanceof Error ? err.message : err)
+      console.error('[media] S3 backup failed:', err instanceof Error ? err.message : err)
       return false
     } finally {
       mirroring.delete(key)
@@ -99,32 +92,52 @@ export function mirrorMediaToBlob(id: string, kind: MediaKind, contentType = 'vi
   return job
 }
 
-// ---------- Storage usage (10 GB free tier) ----------
+// ---------- Storage usage (local EBS disk) ----------
 
-export const BLOB_LIMIT_BYTES = 10 * 1024 * 1024 * 1024
+export const STORAGE_LIMIT_BYTES = DISK_LIMIT_BYTES
 
 let usageCache: { used: number; at: number } | null = null
 
-/** Total bytes stored in Blob (all scans + videos). Cached for 30s. */
-export async function getBlobUsage(): Promise<number> {
-  if (usageCache && Date.now() - usageCache.at < 30_000) return usageCache.used
-  let used = 0
-  let cursor: string | undefined
+function dirSize(dir: string): number {
+  let total = 0
+  let entries: fs.Dirent[]
   try {
-    do {
-      const res = await list({ cursor, limit: 1000 })
-      for (const b of res.blobs) used += b.size
-      cursor = res.hasMore ? res.cursor : undefined
-    } while (cursor)
-    usageCache = { used, at: Date.now() }
-  } catch (err) {
-    console.error('[media] usage check failed:', err instanceof Error ? err.message : err)
+    entries = fs.readdirSync(dir, { withFileTypes: true })
+  } catch {
+    return 0
   }
+  for (const e of entries) {
+    const p = path.join(dir, e.name)
+    try {
+      if (e.isDirectory()) total += dirSize(p)
+      else if (e.isFile()) total += fs.statSync(p).size
+    } catch {
+      // file vanished mid-walk
+    }
+  }
+  return total
+}
+
+/** Bytes used by all scan media on the local disk. Cached for 30s. */
+export async function getStorageUsage(): Promise<number> {
+  if (usageCache && Date.now() - usageCache.at < 30_000) return usageCache.used
+  const used = dirSize(MEDIA_DIR)
+  usageCache = { used, at: Date.now() }
   return used
 }
 
 export function invalidateUsageCache() {
   usageCache = null
+}
+
+/** Free bytes on the volume that holds DATA_DIR (for /api/health). */
+export function diskFree(): { free: number; total: number } {
+  try {
+    const st = fs.statfsSync(MEDIA_DIR)
+    return { free: Number(st.bavail) * Number(st.bsize), total: Number(st.blocks) * Number(st.bsize) }
+  } catch {
+    return { free: 0, total: 0 }
+  }
 }
 
 // ---------- Post-upload finalize ----------

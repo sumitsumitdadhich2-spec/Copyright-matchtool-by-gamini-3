@@ -1,17 +1,16 @@
 import fs from 'node:fs'
 import { getScan, SCANS_DIR } from '@/lib/store'
-import { restoreScansFromBlob } from '@/lib/scan-blob'
+import { restoreScans } from '@/lib/scan-store'
 import { ensureLocalMedia } from '@/lib/media'
 
 export const runtime = 'nodejs'
-export const maxDuration = 300
 
 /** Serve uploaded videos with HTTP Range support so previews are seekable.
- *  If /tmp was wiped (cold start) the video is pulled back from Blob first. */
+ *  If the local file is missing it is pulled back from S3 first. */
 export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params
   if (!getScan(id)) {
-    await restoreScansFromBlob(SCANS_DIR)
+    await restoreScans(SCANS_DIR)
     if (!getScan(id)) return new Response('Not found', { status: 404 })
   }
 

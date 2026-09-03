@@ -3,7 +3,7 @@ import 'server-only'
 import fs from 'node:fs'
 import path from 'node:path'
 import { openAsBlob } from 'node:fs'
-import { put, get, del } from '@vercel/blob'
+import { putObject, getObjectJSON, deleteObject } from './storage'
 import { scanMediaDir } from './store'
 import { normalizeForTwelveLabs } from './ffmpeg'
 import { CHUNK_SECONDS } from './models'
@@ -230,7 +230,7 @@ export async function fetchVideoEmbeddings(apiKey: string, indexId: string, vide
   throw new TwelveLabsError('No segment embeddings returned for the indexed video')
 }
 
-// ---------- Local + Blob persistence of embeddings ----------
+// ---------- Local + S3 persistence of embeddings ----------
 // Saved once at index time, reused on every scan — the API is NOT hit again.
 
 export interface StoredEmbeddings {
@@ -244,11 +244,11 @@ function embFile(scanId: string, kind: 'movie' | 'short'): string {
   return path.join(scanMediaDir(scanId), `tl-${kind}-embeddings.json`)
 }
 
-function embBlobPath(scanId: string, kind: 'movie' | 'short'): string {
-  return `cmt-tl/${scanId}-${kind}.json`
+function embStorageKey(scanId: string, kind: 'movie' | 'short'): string {
+  return `tl/${scanId}-${kind}.json`
 }
 
-/** Persist embeddings locally (fast reuse) AND to Blob (survives /tmp wipes). */
+/** Persist embeddings locally (fast reuse) AND to S3 (survives instance loss). */
 export async function saveEmbeddings(scanId: string, kind: 'movie' | 'short', data: StoredEmbeddings): Promise<void> {
   // Round to 5 decimals to keep a 4h movie's JSON manageable.
   const compact: StoredEmbeddings = {
@@ -259,22 +259,16 @@ export async function saveEmbeddings(scanId: string, kind: 'movie' | 'short', da
   try {
     fs.writeFileSync(embFile(scanId, kind), json)
   } catch {
-    // local write is best-effort — Blob is the durable copy
+    // local write is best-effort — S3 is the durable copy
   }
   try {
-    await put(embBlobPath(scanId, kind), json, {
-      access: 'private',
-      addRandomSuffix: false,
-      allowOverwrite: true,
-      contentType: 'application/json',
-      cacheControlMaxAge: 0,
-    })
+    await putObject(embStorageKey(scanId, kind), json, 'application/json')
   } catch {
-    // Blob backup is best-effort — the local copy still works this session
+    // S3 backup is best-effort — the local copy still works this session
   }
 }
 
-/** Delete saved embeddings (local + Blob) — used when a video is re-uploaded
+/** Delete saved embeddings (local + S3) — used when a video is re-uploaded
  *  so a stale merged-index split can never be reused. Best-effort. */
 export async function deleteEmbeddings(scanId: string, kind: 'movie' | 'short'): Promise<void> {
   try {
@@ -284,13 +278,13 @@ export async function deleteEmbeddings(scanId: string, kind: 'movie' | 'short'):
     // best-effort
   }
   try {
-    await del(embBlobPath(scanId, kind))
+    await deleteObject(embStorageKey(scanId, kind))
   } catch {
     // best-effort
   }
 }
 
-/** Load saved embeddings: local file first, Blob mirror as cross-instance fallback. */
+/** Load saved embeddings: local file first, S3 mirror as fallback. */
 export async function loadEmbeddings(scanId: string, kind: 'movie' | 'short'): Promise<StoredEmbeddings | null> {
   try {
     const local = embFile(scanId, kind)
@@ -299,13 +293,11 @@ export async function loadEmbeddings(scanId: string, kind: 'movie' | 'short'): P
       if (Array.isArray(data?.segments) && data.segments.length > 0) return data
     }
   } catch {
-    // fall through to Blob
+    // fall through to S3
   }
   try {
-    const result = await get(embBlobPath(scanId, kind), { access: 'private' })
-    if (!result || !result.stream) return null
-    const data = (await new Response(result.stream).json()) as StoredEmbeddings
-    if (!Array.isArray(data?.segments) || data.segments.length === 0) return null
+    const data = await getObjectJSON<StoredEmbeddings>(embStorageKey(scanId, kind))
+    if (!data || !Array.isArray(data.segments) || data.segments.length === 0) return null
     try {
       fs.writeFileSync(embFile(scanId, kind), JSON.stringify(data))
     } catch {
