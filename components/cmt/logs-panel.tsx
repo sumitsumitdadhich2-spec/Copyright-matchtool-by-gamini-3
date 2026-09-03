@@ -3,6 +3,7 @@
 import { useEffect, useRef } from 'react'
 import { Terminal } from 'lucide-react'
 import type { Scan } from '@/lib/types'
+import { EngineBadge } from './engine-badge'
 
 const LEVEL_CLS: Record<string, string> = {
   info: 'text-muted-foreground',
@@ -25,7 +26,8 @@ export function LogsPanel({ scan }: { scan: Scan }) {
       <div className="flex items-center gap-2">
         <Terminal className="size-4 text-primary" aria-hidden />
         <h2 className="text-sm font-semibold">Live Logs</h2>
-        <span className="ml-auto font-mono text-xs text-muted-foreground">{scan.logs.length}</span>
+        <EngineBadge live={scan.status === 'scanning' || scan.status === 'chunking' || scan.renderJob?.status === 'rendering'} className="ml-auto" />
+        <span className="font-mono text-xs text-muted-foreground">{scan.logs.length}</span>
       </div>
       <div
         ref={boxRef}

@@ -219,8 +219,8 @@ export interface PrefilterInfo {
 
 export type MergePipelineStatus =
   | 'idle'
-  | 'checking' // ffprobe codec/resolution compat check
-  | 'merging' // stream-copy concat (short + movie)
+  | 'checking' // ffprobe both files → target = movie resolution/fps
+  | 'merging' // precise re-encode merge (short + movie normalized, parallel parts, one join)
   | 'uploading' // merged video → TwelveLabs asset
   | 'indexing' // Marengo index via indexed-assets + embeddings download
   | 'splitting' // time-split embeddings at short-end into short/movie sets

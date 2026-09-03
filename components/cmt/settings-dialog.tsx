@@ -3,6 +3,7 @@
 import { useEffect, useRef } from 'react'
 import { X, Settings } from 'lucide-react'
 import { ApiKeyPanel } from './api-key-panel'
+import { EngineBadge } from './engine-badge'
 
 interface SettingsDialogProps {
   open: boolean
@@ -44,6 +45,7 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
         <div className="flex items-center gap-2 border-b border-border px-4 py-3">
           <Settings className="size-4 text-primary" aria-hidden />
           <h2 className="text-sm font-semibold">Settings — API Keys</h2>
+          <EngineBadge className="ml-2 hidden sm:inline-flex" />
           <button
             type="button"
             onClick={onClose}
