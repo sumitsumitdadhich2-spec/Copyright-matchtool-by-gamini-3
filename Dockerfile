@@ -7,18 +7,28 @@
 FROM node:22-bookworm-slim AS base
 ENV PNPM_HOME=/pnpm
 ENV PATH=$PNPM_HOME:$PATH
-RUN corepack enable && corepack prepare pnpm@latest --activate
+# Pin pnpm. `pnpm@latest` silently moved from 10.x to 11.x, which changed the
+# defaults that broke this build (minimumReleaseAge=1 day, strictDepBuilds,
+# `pnpm` field in package.json + non-auth .npmrc settings no longer read).
+# MUST match "packageManager" in package.json - corepack errors on mismatch.
+ARG PNPM_VERSION=11.25.0
+RUN corepack enable && corepack prepare "pnpm@${PNPM_VERSION}" --activate
 
 # ---------- deps ----------
 FROM base AS deps
 WORKDIR /app
-COPY package.json pnpm-lock.yaml ./
-# ffmpeg-static/ffprobe-static are devDependencies used ONLY as a local-dev
-# fallback (lib/ffmpeg-bin.ts). In production the static /usr/bin/ffmpeg
-# installed below is used, so skip their binary-download postinstall here
-# (no other dependency in this project needs a build script).
+# pnpm-workspace.yaml is the ONLY place pnpm 11 reads project settings from
+# (overrides, allowBuilds, minimumReleaseAge...). Without it the lockfile's
+# `overrides` no longer matches the config and --frozen-lockfile fails with
+# ERR_PNPM_LOCKFILE_CONFIG_MISMATCH.
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+# --frozen-lockfile: reproducible; the lockfile is verified against the
+# supply-chain policy in pnpm-workspace.yaml (minimumReleaseAge).
+# No --ignore-scripts: build scripts are governed by `allowBuilds` in
+# pnpm-workspace.yaml (true = run, false = skip). Anything unlisted fails the
+# install on purpose (strictDepBuilds) instead of running silently.
 RUN --mount=type=cache,id=pnpm,target=/pnpm/store \
-  pnpm install --frozen-lockfile --ignore-scripts
+  pnpm install --frozen-lockfile
 
 # ---------- build ----------
 FROM base AS build
