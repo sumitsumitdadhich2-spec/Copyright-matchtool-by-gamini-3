@@ -37,7 +37,11 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 ENV NEXT_TELEMETRY_DISABLED=1
 ENV NODE_ENV=production
-RUN pnpm build
+# The standalone tracer leaves dangling pnpm symlinks for some transitive deps
+# (gcp-metadata -> json-bigint -> bignumber.js under @google/genai), which
+# crashes the server with "Cannot find module 'gcp-metadata'". The script copies
+# the missing packages in from node_modules and fails the build if any remain.
+RUN pnpm build && node scripts/fix-standalone-symlinks.mjs
 
 # ---------- runtime ----------
 FROM node:22-bookworm-slim AS runtime

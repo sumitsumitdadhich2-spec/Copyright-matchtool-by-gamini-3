@@ -8,6 +8,12 @@ const nextConfig = {
   outputFileTracingExcludes: {
     '*': ['./data/**', './public/**'],
   },
+  // NOTE: the standalone tracer drops some transitive pnpm packages (it copies
+  // the symlink `.pnpm/google-auth-library@*/node_modules/gcp-metadata` but
+  // not its target), which crashes @google/genai at runtime with
+  // "Cannot find module 'gcp-metadata'". `outputFileTracingIncludes` cannot
+  // fix this (it copies files, not the sibling symlinks pnpm relies on), so
+  // the Dockerfile runs scripts/fix-standalone-symlinks.mjs after `next build`.
   typescript: {
     ignoreBuildErrors: true,
   },
