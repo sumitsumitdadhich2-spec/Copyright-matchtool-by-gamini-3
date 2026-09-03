@@ -13,7 +13,6 @@ import {
 import { CHUNK_MODEL_POOL } from '@/lib/models'
 
 export const runtime = 'nodejs'
-export const maxDuration = 300
 
 /** GET: Gemini Minute Finder state for the UI panel. */
 export async function GET(_req: Request, ctx: { params: Promise<{ id: string }> }) {

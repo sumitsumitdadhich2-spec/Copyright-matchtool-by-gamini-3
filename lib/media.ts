@@ -7,7 +7,6 @@ import { CHUNK_SECONDS } from './models'
 import { deleteEmbeddings } from './twelvelabs'
 import { getFile, putFile, storageEnabled } from './storage'
 import { MEDIA_DIR, DISK_LIMIT_BYTES } from './paths'
-import { scanWorkRoot } from './work-dir'
 
 export type MediaKind = 'short' | 'movie'
 

@@ -3,7 +3,6 @@ import { getScan } from '@/lib/store'
 import { startRender, validateRenderSettings, buildRenderSegments } from '@/lib/render'
 
 export const runtime = 'nodejs'
-export const maxDuration = 300
 
 /** Start a background render/export. Body = RenderSettings. Responds immediately;
  *  progress is polled through the existing GET /api/scans/[id] (scan.renderJob). */
