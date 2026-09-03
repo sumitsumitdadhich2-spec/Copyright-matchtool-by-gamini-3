@@ -185,7 +185,9 @@ Rollback: `git checkout <purana-commit>` → `docker compose up -d --build`.
 |---------|-----|
 | `S3: AccessDenied` | IAM role instance se attached hai? Policy me sahi bucket ARN? |
 | `SESSION_SECRET is required` | `.env` me secret daalo, `docker compose up -d` |
-| Upload slow | Security group / Caddy theek hai; `docker compose logs caddy`. Browser 8 parallel × 16 MB chunks bhejta hai. |
+| Upload slow | Browser ek hi continuous stream bhejta hai (koi chunking nahi) — card me live Mbps dikhta hai, wahi aapke internet ka real upload speed hai. Security group / Caddy check karo: `docker compose logs caddy`. |
+| `Request body exceeded 10MB` log me | Upload route `proxy.ts` matcher se bahar hona chahiye (default hai). Agar matcher badla hai to `/api/scans/<id>/upload` ko exclude rakho, warna Next.js body RAM me buffer karke 10 MB par kaat deta hai. |
+| Upload beech me ruka / 408 | Connection tootne par browser server ke confirmed byte se khud resume karta hai. Dockerfile ka `--require ./server-timeouts.cjs` Node ka 5-minute body timeout hatata hai — `docker compose up -d --build` ke baad `docker compose top app` me `node --require ./server-timeouts.cjs server.js` dikhna chahiye. |
 | `/dev/shm` full | `WORK_RAM_BUDGET_MB` kam karo ya `shm_size` badhao (compose me) |
 | Sirf 1 ffmpeg process | `.env` me `FFMPEG_ENGINES=auto` hai? `/api/health` me `engines` dekho |
 | Cert nahi mila | Port 80 + 443 open hain? DNS A record sahi IP par? `docker compose logs caddy` |

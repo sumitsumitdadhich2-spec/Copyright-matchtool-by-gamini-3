@@ -17,7 +17,8 @@
 {$SITE_ADDRESS} {
 	encode zstd gzip
 
-	# No request body limit — movie chunks are 16 MB, renders download multi-GB.
+	# No request body limit — a video upload is ONE multi-GB request body that is
+	# streamed through to the app as it arrives (never buffered here).
 	request_body {
 		max_size 0
 	}
@@ -26,7 +27,9 @@
 		flush_interval -1
 		transport http {
 			dial_timeout 10s
-			response_header_timeout 30m
+			# The upload route answers only after the LAST byte + ffprobe, which
+			# on a slow link can take well over 30 minutes — never time it out.
+			response_header_timeout 0
 			read_timeout 0
 			write_timeout 0
 		}

@@ -27,5 +27,11 @@ export function proxy(request: NextRequest) {
 }
 
 export const config = {
-  matcher: ['/api/:path*'],
+  // Every /api route EXCEPT the video upload stream (/api/scans/<id>/upload).
+  // When the proxy runs on a request, Next.js clones the request body into RAM
+  // (capped at experimental.proxyClientMaxBodySize, 10 MB by default) and
+  // silently truncates the rest — fatal for a multi-GB video body. The upload
+  // route therefore verifies the session cookie itself and streams the body
+  // straight to disk.
+  matcher: ['/api/((?!scans/[^/]+/upload(?:/|$)).*)'],
 }
