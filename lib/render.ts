@@ -1,6 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import { IN_FLAGS, OUT_FLAGS, joinParts, probeDuration, probeHasAudio, scalePadFilter, verifyDuration } from './ffmpeg'
+import { IN_FLAGS, OUT_FLAGS, PART_AUDIO, PART_EXT, joinParts, probeDuration, probeHasAudio, scalePadFilter, verifyDuration } from './ffmpeg'
 import { CancelToken, FfmpegCancelled, engineCount, parallelMap, runFfmpeg, sliceProgress } from './ffmpeg-pool'
 import { estimateBitrateBytes, placeWork, removeStageWork } from './work-dir'
 import { getScan, saveScan, scanMediaDir, addLog } from './store'
@@ -154,7 +154,9 @@ function partArgs(movieFile: string, hasAudio: boolean, seg: RenderSegment, w: n
     `[0:v]${scalePadFilter(w, h, fps)}[v];${hasAudio ? '[0:a]' : '[1:a]'}aresample=48000:async=1,aformat=channel_layouts=stereo[a]`,
     '-map', '[v]', '-map', '[a]',
     '-c:v', 'libx264', '-preset', 'medium', '-crf', '18',
-    '-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-ac', '2',
+    // Lossless PCM audio in parts: AAC priming/padding per part stacked up to
+    // +2.3 s over 48 scenes (audio ran long, seams shifted, A/V drifted).
+    ...PART_AUDIO, '-ac', '2',
     ...OUT_FLAGS,
     partFile,
   )
@@ -204,7 +206,7 @@ async function runRenderPipeline(
     log('info', `Render parts → ${placement.inRam ? 'RAM' : 'disk'} work dir (est ${(estimate / 1048576).toFixed(0)} MB)`)
 
     // ---- Phase 1: every scene as its own part, all engines busy (0..70 %). ----
-    const partFiles = segments.map((_, i) => path.join(partsDir, `part-${String(i).padStart(4, '0')}.mp4`))
+    const partFiles = segments.map((_, i) => path.join(partsDir, `part-${String(i).padStart(4, '0')}${PART_EXT}`))
     const startedAt = Date.now()
     const progress = sliceProgress((doneSec, speed) => {
       const pct = Math.min(70, Math.round((doneSec / Math.max(0.1, totalOut)) * 70))

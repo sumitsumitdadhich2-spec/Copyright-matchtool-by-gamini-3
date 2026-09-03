@@ -1,7 +1,7 @@
 import path from 'node:path'
 import fs from 'node:fs'
 import type { GoogleGenAI } from '@google/genai'
-import type { Scan, ChunkState, ChunkMatch, CandidateGroup, ShortSegmentState } from './types'
+import type { Scan, ChunkState, ChunkMatch, CandidateGroup, ShortSegmentState, ScanReport } from './types'
 import {
   MODEL_POOL,
   CHUNK_MODEL_POOL,
@@ -929,26 +929,10 @@ class Scheduler {
 
     for (const seg of segments) if (seg.status !== 'done') seg.status = 'done'
 
-    const allChunks = segments.flatMap((s) => s.chunks)
     scan.status = 'done'
     scan.finishedAt = Date.now()
     scan.matches.sort((a, b) => a.shortStart - b.shortStart || a.movieStart - b.movieStart)
-    scan.report = {
-      totalScanTimeMs: scan.finishedAt - (scan.startedAt || scan.finishedAt),
-      chunksScanned: allChunks.filter((c) => c.status === 'match' || c.status === 'no_match').length,
-      chunksFailed: allChunks.filter((c) => c.status === 'failed').length,
-      modelsUsed: MODEL_POOL.filter((m) => job.lanes.some((l) => getModelUsage(m.id, l.apiKey) > 0)).map((m) => m.id),
-      matches: scan.matches,
-      groupsTotal: groups.length,
-      groupsConfirmed: groups.filter((g) => g.status === 'confirmed').length,
-      groupsRejected: groups.filter((g) => g.status === 'rejected').length,
-      groupsUnverified: groups.filter((g) => g.status === 'unverified').length,
-      // How the chunk set was chosen for THIS run (results themselves are 100% Gemini).
-      prefilterMode:
-        scan.prefilter?.mode === 'prefiltered' ? 'twelvelabs' : scan.geminiPrescan?.appliedMinutes?.length ? 'gemini' : 'full',
-      prefilterSelected: scan.prefilter?.selectedChunks,
-      prefilterTotal: scan.prefilter?.totalChunks,
-    }
+    scan.report = this.reportStats(job, false)
     addLog(
       scan,
       'success',
@@ -1251,7 +1235,7 @@ class Scheduler {
           if (g.attempts >= MAX_GROUP_ATTEMPTS) {
             g.status = 'unverified'
             this.applyGroupResult(job, g)
-            addLog(scan, 'error', `Group ${g.id} (short ${ts(g.shortStart)}–${ts(g.shortEnd)}) could not be verified after ${g.attempts} attempts — original match kept, flagged unverified: ${e.message.slice(0, 120)}`)
+            addLog(scan, 'error', `Group ${g.id} (short ${ts(g.shortStart)}–${ts(g.shortEnd)}) could not be verified after ${g.attempts} attempts �� original match kept, flagged unverified: ${e.message.slice(0, 120)}`)
           } else {
             job.verifyQueue.push(gi)
             addLog(scan, 'warn', `Verifier attempt ${g.attempts} failed for group ${g.id} on ${m.id} (key ${lane.idx}) — re-queued: ${e.message.slice(0, 120)}`)
@@ -1629,26 +1613,10 @@ class Scheduler {
    *  Resume phir bhi wahi se continue karta hai (pending chunks/groups untouched). */
   private buildPartialReport(job: Job) {
     const { scan } = job
-    const segments = scan.shortSegments || []
-    const allChunks = segments.flatMap((s) => s.chunks)
-    const groups = scan.candidateGroups || []
     if (!Array.isArray(scan.matches)) scan.matches = []
     scan.matches.sort((a, b) => a.shortStart - b.shortStart || a.movieStart - b.movieStart)
-    scan.report = {
-      totalScanTimeMs: Date.now() - (scan.startedAt || Date.now()),
-      chunksScanned: allChunks.filter((c) => c.status === 'match' || c.status === 'no_match').length,
-      chunksFailed: allChunks.filter((c) => c.status === 'failed').length,
-      modelsUsed: MODEL_POOL.filter((m) => job.lanes.some((l) => getModelUsage(m.id, l.apiKey) > 0)).map((m) => m.id),
-      matches: scan.matches,
-      groupsTotal: groups.length,
-      groupsConfirmed: groups.filter((g) => g.status === 'confirmed').length,
-      groupsRejected: groups.filter((g) => g.status === 'rejected').length,
-      groupsUnverified: groups.filter((g) => g.status === 'unverified').length,
-      prefilterMode:
-        scan.prefilter?.mode === 'prefiltered' ? 'twelvelabs' : scan.geminiPrescan?.appliedMinutes?.length ? 'gemini' : 'full',
-      prefilterSelected: scan.prefilter?.selectedChunks,
-      prefilterTotal: scan.prefilter?.totalChunks,
-    }
+    scan.report = this.reportStats(job, true)
+    const r = scan.report
     if (scan.matches.length > 0) {
       addLog(
         scan,
@@ -1656,7 +1624,49 @@ class Scheduler {
         `Partial results saved: ${scan.matches.length} match(es) (verified + unverified dono) — export/preview ab available hai, Resume karne par scan wahi se continue hoga`,
       )
     }
+    // Make the gaps LOUD: a partial report used to say "Chunks failed: 0" while
+    // re-queued chunks (fetch failed / 429) never ran, and in-flight verifier
+    // groups vanished from the confirmed/rejected/unverified totals.
+    if ((r.chunksPending || 0) > 0 || (r.groupsPending || 0) > 0) {
+      addLog(
+        scan,
+        'warn',
+        `INCOMPLETE: ${r.chunksPending || 0} chunk(s) never scanned (pending/re-queued) · ${r.groupsPending || 0} candidate group(s) still verifying/rescanning — ye report ke totals me alag dikhte hain, Resume se complete hoga`,
+      )
+    }
     this.mark(job)
+  }
+
+  /** Report stats shared by the final and partial report. EVERY chunk and EVERY
+   *  candidate group lands in exactly one bucket, so the totals add up:
+   *  chunks = scanned + failed + pending, groups = confirmed + rejected + unverified + pending. */
+  private reportStats(job: Job, partial: boolean): ScanReport {
+    const { scan } = job
+    const segments = scan.shortSegments || []
+    const allChunks = segments.flatMap((s) => s.chunks)
+    const groups = scan.candidateGroups || []
+    const now = Date.now()
+    return {
+      totalScanTimeMs: (scan.finishedAt || now) - (scan.startedAt || now),
+      chunksScanned: allChunks.filter((c) => c.status === 'match' || c.status === 'no_match').length,
+      chunksFailed: allChunks.filter((c) => c.status === 'failed').length,
+      // pending (never started / re-queued after fetch failed or 429), scanning
+      // (in flight at Stop) and cancelled all mean "this chunk was NOT scanned".
+      chunksPending: allChunks.filter((c) => c.status === 'pending' || c.status === 'scanning' || c.status === 'cancelled').length,
+      partial: partial || undefined,
+      modelsUsed: MODEL_POOL.filter((m) => job.lanes.some((l) => getModelUsage(m.id, l.apiKey) > 0)).map((m) => m.id),
+      matches: scan.matches,
+      groupsTotal: groups.length,
+      groupsConfirmed: groups.filter((g) => g.status === 'confirmed').length,
+      groupsRejected: groups.filter((g) => g.status === 'rejected').length,
+      groupsUnverified: groups.filter((g) => g.status === 'unverified').length,
+      groupsPending: groups.filter((g) => g.status === 'pending' || g.status === 'verifying' || g.status === 'rescanning').length,
+      // How the chunk set was chosen for THIS run (results themselves are 100% Gemini).
+      prefilterMode:
+        scan.prefilter?.mode === 'prefiltered' ? 'twelvelabs' : scan.geminiPrescan?.appliedMinutes?.length ? 'gemini' : 'full',
+      prefilterSelected: scan.prefilter?.selectedChunks,
+      prefilterTotal: scan.prefilter?.totalChunks,
+    }
   }
 
   private finish(job: Job) {
