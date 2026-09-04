@@ -18,7 +18,19 @@ export interface ChunkMatch {
   /** USER CHOICE: the user hand-picked this candidate as the main clip for its
    *  short window (overrides the AI confirmed/unverified/rejected verdict) */
   userPick?: boolean
+  /** REJECTED-KEPT: the verifier said DIFFERENT for every candidate of this
+   *  group, but the best candidate is still kept in the merge (user rule:
+   *  rejected matches are "almost right" — never drop them). verified=false. */
+  rejected?: boolean
+  /** PROVENANCE: where this match came from. */
+  origin?: MatchOrigin
 }
+
+/** Where a match / candidate group was produced:
+ *  'chunk' = normal chunk scan, 'rescan' = full-chunk rescan window,
+ *  'gap-backup' = automatic GAP BACKUP PASS (short parts no chunk matched),
+ *  'user' = user pick ("Make main"). */
+export type MatchOrigin = 'chunk' | 'rescan' | 'gap-backup' | 'user'
 
 /** Full raw model output captured for a chunk request (for the UI expander). */
 export interface ChunkRawOutput {
@@ -196,6 +208,14 @@ export interface CandidateGroup {
     viaRescan: boolean
     at: number
   }
+  /** PROVENANCE: 'chunk' (normal chunk scan) or 'gap-backup' (gap backup pass). */
+  origin?: MatchOrigin
+  /** Set when this group was settled as rejected WITHOUT a verifier call because
+   *  a confirmed group already owns its short window. Superseded groups push
+   *  NOTHING into scan.matches (the winner covers the window). */
+  supersededBy?: string
+  /** gap-backup groups: index of the GAP part (GapBackupPart.index) they came from */
+  gapPart?: number
 }
 
 // ---------- Twelve Labs pre-filter (optional) ----------
