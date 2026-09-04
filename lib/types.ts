@@ -1,5 +1,13 @@
 export type ChunkStatus = 'pending' | 'scanning' | 'no_match' | 'match' | 'failed' | 'cancelled'
 
+/** PROVENANCE — where a match / candidate group came from:
+ *  'chunk'      = normal chunk-mapping pass (short minute vs movie chunk)
+ *  'rescan'     = window found by the full-chunk rescan after verify said DIFFERENT
+ *  'gap-backup' = post-verification GAP BACKUP pass (never-found short parts re-searched
+ *                 in every 20-min movie window at high fps, then chunk-scanned + verified)
+ *  'user'       = hand-picked by the user ("Make main") */
+export type MatchOrigin = 'chunk' | 'rescan' | 'gap-backup' | 'user'
+
 /** One parsed "Short X --> Movie Y" mapping line from the model's HISSA 2 output. */
 export interface ChunkMatch {
   /** seconds within the short video */
@@ -18,6 +26,14 @@ export interface ChunkMatch {
   /** USER CHOICE: the user hand-picked this candidate as the main clip for its
    *  short window (overrides the AI confirmed/unverified/rejected verdict) */
   userPick?: boolean
+  /** REJECTED — KEPT: the verifier said DIFFERENT for every candidate of this
+   *  short window, but the best candidate is kept in the merge anyway ("almost
+   *  right" beats a hole in the output). verified is always false here. */
+  rejected?: boolean
+  /** where this match came from (see MatchOrigin) */
+  origin?: MatchOrigin
+  /** gap-backup only: 20-min movie window (#index) that found this part */
+  originWindow?: number
 }
 
 /** Full raw model output captured for a chunk request (for the UI expander). */
@@ -119,6 +135,10 @@ export interface RenderJob {
   finishedAt: number | null
   /** final rendered file size in bytes */
   fileSize: number | null
+  /** short coverage of the scenes actually being rendered (+ MISSING list) */
+  coverage?: ShortCoverage
+  /** short duration the output is compared against */
+  shortSeconds?: number
 }
 
 export interface LogEntry {
@@ -186,6 +206,13 @@ export interface CandidateGroup {
   confirmedIndex: number | null
   confirmedViaRescan: boolean
   attempts: number
+  /** where the group's candidates came from ('chunk' when unset — legacy scans) */
+  origin?: MatchOrigin
+  /** gap-backup only: 20-min movie window (#index) that found this short part */
+  originWindow?: number
+  /** SUPERSEDED: settled as rejected WITHOUT a verifier call because a confirmed
+   *  group already owns this short window. Never kept in the merge (duplicate). */
+  superseded?: boolean
   /** USER CHOICE (preview/compare "Make main"): which candidate window the
    *  user wants as the main clip for this short window. Wins over the AI
    *  verdict in scan.matches → preview → export. Unset = AI decision. */
@@ -412,6 +439,111 @@ export interface GeminiPrescanState {
   finishedAt?: number | null
 }
 
+// ---------- Short coverage + GAP BACKUP pass (post-verification) ----------
+
+/** A [start, end) range of the SHORT video (absolute seconds). */
+export interface ShortRange {
+  start: number
+  end: number
+}
+
+/** How much of the short video the current match set covers (union of every
+ *  match's short window — verified, unverified AND rejected-kept). */
+export interface ShortCoverage {
+  coveredSec: number
+  totalSec: number
+  /** 0-100, rounded to 1 decimal */
+  pct: number
+  /** short ranges with NO match at all (gaps < 0.15 s ignored) */
+  gaps: ShortRange[]
+  missingSec: number
+  at: number
+}
+
+export type GapBackupStatus =
+  | 'idle'
+  | 'skipped' // coverage already 100 % (or gaps too small)
+  | 'cutting' // ffmpeg: concatenated gap clip from the short
+  | 'uploading' // gap clip → Gemini Files API, once per key
+  | 'searching' // every 20-min movie window in flight
+  | 'chunking' // found minutes → chunk-mapping restricted to the gap range
+  | 'verifying' // gap candidate groups in the normal verifier (+ rescan)
+  | 'done'
+  | 'error'
+
+/** One PART of the gap clip = one true gap of the short (already padded ±2 s). */
+export interface GapBackupPart {
+  /** 1-based PART number as written in the prompt's PART MAP */
+  index: number
+  /** ABSOLUTE seconds within the short video (padded) */
+  shortStart: number
+  shortEnd: number
+  /** the UNPADDED gap this part was built for */
+  gapStart: number
+  gapEnd: number
+  /** seconds within the CONCATENATED gap clip */
+  clipStart: number
+  clipEnd: number
+  /** best FOUND result across every window (movie seconds, ORIGINAL clock) */
+  found?: { movieStart: number; movieEnd: number; windowIndex: number; confidence: number; reason: string }
+  /** final verdict after chunk scan + verifier */
+  result?: 'pending' | 'confirmed' | 'rejected_kept' | 'unverified' | 'unresolved'
+}
+
+/** Candidate produced by the gap-backup finder before chunk scan + verification. */
+export interface GapBackupCandidate {
+  part: number
+  shortStart: number
+  shortEnd: number
+  /** ABSOLUTE original-movie seconds */
+  movieStart: number
+  movieEnd: number
+  source: 'gap-backup'
+  windowIndex: number
+  confidence: number
+  reason: string
+}
+
+/**
+ * GAP BACKUP PASS state (mirrors GeminiBackupState). Runs automatically at the
+ * end of a scan when coverage < 100 %, or manually from the scan page.
+ * Persisted on every state change so Resume continues where it stopped.
+ */
+export interface GapBackupState {
+  status: GapBackupStatus
+  progress?: string
+  skipReason?: string
+  /** how many times the pass ran (auto + manual) */
+  runs?: number
+  parts: GapBackupPart[]
+  clip?: {
+    path: string
+    durationSec: number
+    sizeBytes: number
+    /** fps = clamp(floor(900 / clipSeconds), 5, 24) — same formula as the minute finder backup */
+    fps: number
+    /** JSON of the gap list the clip was built from — a different gap set invalidates the clip */
+    signature: string
+  }
+  /** keyed by apiKeyHash — gap clip upload per key */
+  uploads: Record<string, { uri: string; name: string; uploadedAt: number }>
+  /** keyed by apiKeyHash — movie copy upload per key (reuses the minute finder's when ACTIVE) */
+  movieUploads: Record<string, { uri: string; name: string; uploadedAt: number }>
+  /** 20-minute windows of the movie copy (same slicing as the minute finder) */
+  windows: GeminiPrescanWindow[]
+  /** hint text given to the model ({{CONTEXT}}) */
+  context?: string
+  /** candidates parsed from FOUND lines (best per part, every window) */
+  candidates: GapBackupCandidate[]
+  /** matches this pass ADDED to scan.matches (after chunk scan + verification) */
+  addedMatches: ChunkMatch[]
+  /** seconds of the short recovered by this pass (coverage delta) */
+  recoveredSec?: number
+  error?: string | null
+  startedAt?: number | null
+  finishedAt?: number | null
+}
+
 export interface ModelLiveState {
   state: 'idle' | 'active' | 'cooling' | 'exhausted' | 'waiting'
   currentChunk: number | null
@@ -437,6 +569,14 @@ export interface ScanReport {
   groupsUnverified?: number
   /** groups still pending / verifying / rescanning when the report froze — total = confirmed + rejected + unverified + pending */
   groupsPending?: number
+  /** rejected groups whose best candidate is KEPT in the merge (flagged rejected) */
+  matchesRejectedKept?: number
+  /** matches per provenance: chunk / rescan / gap-backup / user */
+  originCounts?: Partial<Record<MatchOrigin, number>>
+  /** gap-backup breakdown */
+  gapBackup?: { candidates: number; confirmed: number; rejectedKept: number; unverified: number; unresolved: number }
+  /** how much of the short the final match set covers (+ exact MISSING list) */
+  coverage?: ShortCoverage
   /** how the chunk set was chosen: 'twelvelabs' pre-filter, 'gemini' minute finder, or normal 'full' scan */
   prefilterMode?: 'twelvelabs' | 'full' | 'gemini'
   prefilterSelected?: number
@@ -486,6 +626,8 @@ export interface Scan {
   mergePipeline?: MergePipelineState
   /** GEMINI MINUTE FINDER: 20-minute window pre-scan → minute list → auto chunk scan */
   geminiPrescan?: GeminiPrescanState
+  /** GAP BACKUP PASS (post-verification): never-found short parts re-searched in every window */
+  gapBackup?: GapBackupState
   logs: LogEntry[]
   startedAt: number | null
   finishedAt: number | null
