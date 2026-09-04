@@ -1,9 +1,14 @@
+// Vercel sets VERCEL=1 at build time. `output: 'standalone'` is only for the
+// Docker image — on Vercel it breaks the platform's own output tracing
+// ("ENOENT .next/next-server.js.nft.json" in onBuildComplete), so skip it there.
+const isVercel = process.env.VERCEL === '1'
+
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   // Long-lived Node server inside Docker (see Dockerfile) — the standalone
   // output bundles only what the server needs. ffmpeg/ffprobe come from the
   // OS package (apt-get install ffmpeg), see lib/ffmpeg-bin.ts.
-  output: 'standalone',
+  ...(isVercel ? {} : { output: 'standalone' }),
   serverExternalPackages: ['@google/genai', '@aws-sdk/client-s3', '@aws-sdk/lib-storage'],
   outputFileTracingExcludes: {
     '*': ['./data/**', './public/**'],
