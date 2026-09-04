@@ -15,6 +15,9 @@ export interface ChunkMatch {
   verified?: boolean
   /** the confirmed window came from a rescan, not the original chunk mapping */
   viaRescan?: boolean
+  /** USER CHOICE: the user hand-picked this candidate as the main clip for its
+   *  short window (overrides the AI confirmed/unverified/rejected verdict) */
+  userPick?: boolean
 }
 
 /** Full raw model output captured for a chunk request (for the UI expander). */
@@ -183,6 +186,16 @@ export interface CandidateGroup {
   confirmedIndex: number | null
   confirmedViaRescan: boolean
   attempts: number
+  /** USER CHOICE (preview/compare "Make main"): which candidate window the
+   *  user wants as the main clip for this short window. Wins over the AI
+   *  verdict in scan.matches → preview → export. Unset = AI decision. */
+  userPick?: {
+    /** index into candidates[] */
+    index: number
+    /** use the candidate's rescan window instead of its original window */
+    viaRescan: boolean
+    at: number
+  }
 }
 
 // ---------- Twelve Labs pre-filter (optional) ----------

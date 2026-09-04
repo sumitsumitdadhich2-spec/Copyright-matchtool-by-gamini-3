@@ -1,28 +1,53 @@
 'use client'
 
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { ChevronLeft, ChevronRight, Pause, Play, RotateCcw, SplitSquareHorizontal } from 'lucide-react'
 import type { Scan } from '@/lib/types'
 import { fmtTime } from '@/lib/format'
 import { displayModelName } from '@/lib/models'
+import { candidateOptionsFor, hasAlternatives } from '@/lib/candidate-pick'
+import { CandidateChooser } from './candidate-chooser'
 
 /** Side-by-side preview of matched windows: each parsed "Short X --> Movie Y" line
- *  is one pair with (near-)equal durations on both sides. */
+ *  is one pair with (near-)equal durations on both sides.
+ *
+ *  CANDIDATES: when the short window of a pair has alternative movie windows
+ *  (other candidates of its group — confirmed, unverified, rejected or not yet
+ *  checked), extra Prev/Next-candidate buttons appear. Browsing swaps ONLY the
+ *  movie side so the user compares each candidate against the same short clip,
+ *  and "Make this the main clip" turns that candidate into the pair used by the
+ *  stitched preview and the export. */
 export function ComparePanel({ scan }: { scan: Scan }) {
   const pairs = scan.matches || []
   const [idx, setIdx] = useState(0)
   const [playing, setPlaying] = useState(false)
+  // null = the pair's own movie window; a number = options[candIdx] on the movie side
+  const [candIdx, setCandIdx] = useState<number | null>(null)
   const shortRef = useRef<HTMLVideoElement>(null)
   const movieRef = useRef<HTMLVideoElement>(null)
 
   const pair = pairs[Math.min(idx, pairs.length - 1)]
+  const options = useMemo(
+    () => (pair ? candidateOptionsFor(scan, pair.shortStart, pair.shortEnd) : []),
+    [scan, pair?.shortStart, pair?.shortEnd], // eslint-disable-line react-hooks/exhaustive-deps
+  )
+  const showChooser = hasAlternatives(options)
+  const viewing = candIdx === null ? null : options[Math.min(candIdx, options.length - 1)]
+  // Movie-side window actually shown (candidate or the pair's own window).
+  const movieStart = viewing ? viewing.movieStart : pair?.movieStart ?? 0
+  const movieEnd = viewing ? viewing.movieEnd : pair?.movieEnd ?? 0
 
   // Keep index in range when pairs change between refreshes.
   useEffect(() => {
     if (idx > 0 && idx >= pairs.length) setIdx(Math.max(0, pairs.length - 1))
   }, [idx, pairs.length])
 
-  // Seek both players to the pair start whenever the pair changes.
+  // Leaving a pair always returns to its main window.
+  useEffect(() => {
+    setCandIdx(null)
+  }, [idx, pair?.shortStart])
+
+  // Seek both players to the window start whenever the shown windows change.
   useEffect(() => {
     if (!pair) return
     const sv = shortRef.current
@@ -33,10 +58,10 @@ export function ComparePanel({ scan }: { scan: Scan }) {
     }
     if (mv) {
       mv.pause()
-      mv.currentTime = pair.movieStart
+      mv.currentTime = movieStart
     }
     setPlaying(false)
-  }, [pair?.shortStart, pair?.movieStart]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [pair?.shortStart, movieStart]) // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!pair) return null
 
@@ -60,7 +85,7 @@ export function ComparePanel({ scan }: { scan: Scan }) {
     } else {
       // Re-align both to the window start if either has drifted past the end.
       if (sv.currentTime >= pair!.shortEnd - 0.05) sv.currentTime = pair!.shortStart
-      if (mv.currentTime >= pair!.movieEnd - 0.05) mv.currentTime = pair!.movieStart
+      if (mv.currentTime >= movieEnd - 0.05) mv.currentTime = movieStart
       void sv.play()
       void mv.play()
       setPlaying(true)
@@ -71,7 +96,7 @@ export function ComparePanel({ scan }: { scan: Scan }) {
     const sv = shortRef.current
     const mv = movieRef.current
     if (sv) sv.currentTime = pair!.shortStart
-    if (mv) mv.currentTime = pair!.movieStart
+    if (mv) mv.currentTime = movieStart
   }
 
   const src = (kind: 'short' | 'movie') => `/api/scans/${scan.id}/media?kind=${kind}`
@@ -86,7 +111,13 @@ export function ComparePanel({ scan }: { scan: Scan }) {
           match {idx + 1} / {pairs.length}
         </span>
         <span className="rounded-full bg-secondary px-2 py-0.5 font-mono text-xs">{duration.toFixed(3)}s</span>
-        <span className="rounded-full bg-secondary px-2 py-0.5 font-mono text-xs">chunk {pair.chunkIndex}</span>
+        <span className="rounded-full bg-secondary px-2 py-0.5 font-mono text-xs">chunk {viewing ? viewing.chunkIndex : pair.chunkIndex}</span>
+        {showChooser && (
+          <span className="rounded-full bg-primary/15 px-2 py-0.5 font-mono text-xs text-primary">{options.length} candidates</span>
+        )}
+        {pair.userPick && !viewing && (
+          <span className="rounded-full bg-success/15 px-2 py-0.5 font-mono text-xs text-success">your choice</span>
+        )}
         <div className="ml-auto flex items-center gap-2">
           <button
             type="button"
@@ -127,9 +158,9 @@ export function ComparePanel({ scan }: { scan: Scan }) {
         </figure>
         <figure className="flex flex-col gap-1.5">
           <figcaption className="flex flex-col gap-0.5 text-xs sm:flex-row sm:items-center sm:justify-between">
-            <span className="font-medium">Movie</span>
+            <span className="font-medium">{viewing ? 'Movie — candidate' : 'Movie'}</span>
             <span className="font-mono text-muted-foreground">
-              {fmtTime(pair.movieStart)} – {fmtTime(pair.movieEnd)}
+              {fmtTime(movieStart)} – {fmtTime(movieEnd)}
             </span>
           </figcaption>
           <video
@@ -138,11 +169,17 @@ export function ComparePanel({ scan }: { scan: Scan }) {
             preload="metadata"
             muted
             playsInline
-            onTimeUpdate={() => clampLoop(movieRef.current, pair.movieStart, pair.movieEnd)}
-            className="aspect-video w-full rounded-md border border-border bg-black object-contain"
+            onTimeUpdate={() => clampLoop(movieRef.current, movieStart, movieEnd)}
+            className={`aspect-video w-full rounded-md border bg-black object-contain ${viewing ? 'border-primary' : 'border-border'}`}
           />
         </figure>
       </div>
+
+      {showChooser && (
+        <div className="mt-3">
+          <CandidateChooser scan={scan} options={options} viewIdx={candIdx} onView={setCandIdx} />
+        </div>
+      )}
 
       <div className="mt-3 flex flex-wrap items-center gap-2">
         <button
@@ -160,7 +197,9 @@ export function ComparePanel({ scan }: { scan: Scan }) {
         >
           <RotateCcw className="size-3.5" aria-hidden /> Restart match
         </button>
-        <span className="ml-auto rounded-full bg-secondary px-2 py-0.5 font-mono text-xs">{displayModelName(pair.model)}</span>
+        <span className="ml-auto rounded-full bg-secondary px-2 py-0.5 font-mono text-xs">
+          {displayModelName(viewing ? viewing.model : pair.model)}
+        </span>
       </div>
     </section>
   )
