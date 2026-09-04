@@ -22,6 +22,7 @@ import {
   type BackupPartSpec,
 } from './gemini'
 import { applyApprovedMinutes } from './minute-ranges'
+import { mergeRanges, missingRanges as sharedMissingRanges } from './short-coverage'
 import { scheduler } from './scheduler'
 import { deductTokens, refundTokens, SCAN_TOKEN_COST } from './tokens'
 import type {
@@ -32,6 +33,7 @@ import type {
   GeminiBackupState,
   GeminiBackupPart,
   MinuteSuggestion,
+  ShortRange,
 } from './types'
 
 // ---------------------------------------------------------------------------
@@ -785,21 +787,7 @@ async function laneWorker(id: string, ctrl: Ctrl, lane: Lane, env: LaneEnv, pass
 // BACKUP PASS
 // ---------------------------------------------------------------------------
 
-interface Range {
-  start: number
-  end: number
-}
-
-function mergeRanges(rs: Range[]): Range[] {
-  const s = [...rs].filter((r) => r.end > r.start).sort((a, b) => a.start - b.start)
-  const out: Range[] = []
-  for (const r of s) {
-    const last = out[out.length - 1]
-    if (last && r.start <= last.end + 0.01) last.end = Math.max(last.end, r.end)
-    else out.push({ ...r })
-  }
-  return out
-}
+type Range = ShortRange
 
 /**
  * Which parts of the short did the NORMAL pass find (MATCH or POSSIBLE, in ANY
@@ -823,17 +811,10 @@ function normalCoverage(windows: GeminiPrescanWindow[]): { covered: Range[]; fou
   return { covered: mergeRanges(covered), found }
 }
 
-/** Gaps = short minus coverage, padded ±2 s (clamped), merged, < 4 s dropped. */
+/** Gaps = short minus coverage, padded ±2 s (clamped), merged, < 4 s dropped.
+ *  Shared implementation: lib/short-coverage.ts (also used by the gap-backup pass). */
 function missingRanges(covered: Range[], shortDuration: number): Range[] {
-  const gaps: Range[] = []
-  let cursor = 0
-  for (const c of covered) {
-    if (c.start > cursor) gaps.push({ start: cursor, end: c.start })
-    cursor = Math.max(cursor, c.end)
-  }
-  if (cursor < shortDuration) gaps.push({ start: cursor, end: shortDuration })
-  const padded = gaps.map((g) => ({ start: Math.max(0, g.start - BACKUP_GAP_PAD_SEC), end: Math.min(shortDuration, g.end + BACKUP_GAP_PAD_SEC) }))
-  return mergeRanges(padded).filter((g) => g.end - g.start >= BACKUP_MIN_GAP_SEC)
+  return sharedMissingRanges(covered, shortDuration, { padSec: BACKUP_GAP_PAD_SEC, minGapSec: BACKUP_MIN_GAP_SEC })
 }
 
 /** "short 00:00-01:00 => movie 23:10-24:05 ; ..." for {{FOUND_SUMMARY}} (movie-copy clock, same as WINDOW_START). */
