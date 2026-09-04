@@ -53,6 +53,7 @@ import {
   GeminiError,
   classifyError,
 } from './gemini'
+import { applyGroupMatches, sameShortSegment } from './candidate-pick'
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
@@ -131,14 +132,6 @@ function chunkAbsWindow(scan: Scan, chunkIndex: number): { start: number; end: n
   const rangeEnd = scan.movieTrimEnd ?? scan.movieDuration ?? Number.POSITIVE_INFINITY
   const start = trimStart + chunkIndex * CHUNK_SECONDS
   return { start, end: Math.min(start + CHUNK_SECONDS, rangeEnd) }
-}
-
-/** Two short-video ranges are "the same segment" when they overlap ≥50% of the shorter one. */
-function sameShortSegment(aStart: number, aEnd: number, bStart: number, bEnd: number): boolean {
-  const overlap = Math.min(aEnd, bEnd) - Math.max(aStart, bStart)
-  if (overlap <= 0) return false
-  const shorter = Math.min(aEnd - aStart, bEnd - bStart)
-  return shorter <= 0 ? false : overlap / shorter >= 0.5
 }
 
 class Scheduler {
@@ -1696,33 +1689,9 @@ class Scheduler {
    *  unverified → original candidate windows kept, flagged verified=false. */
   private applyGroupResult(job: Job, g: CandidateGroup) {
     const { scan } = job
-    scan.matches = (scan.matches || []).filter((m) => !sameShortSegment(g.shortStart, g.shortEnd, m.shortStart, m.shortEnd))
-    if (g.status === 'confirmed' && g.confirmedIndex !== null) {
-      const c = g.candidates[g.confirmedIndex]
-      scan.matches.push({
-        shortStart: g.shortStart,
-        shortEnd: g.shortEnd,
-        movieStart: g.confirmedViaRescan ? c.rescanMovieStart! : c.movieStart,
-        movieEnd: g.confirmedViaRescan ? c.rescanMovieEnd! : c.movieEnd,
-        chunkIndex: c.chunkIndex,
-        model: c.model,
-        verified: true,
-        viaRescan: g.confirmedViaRescan || undefined,
-      })
-    } else if (g.status === 'unverified') {
-      for (const c of g.candidates) {
-        scan.matches.push({
-          shortStart: g.shortStart,
-          shortEnd: g.shortEnd,
-          movieStart: c.movieStart,
-          movieEnd: c.movieEnd,
-          chunkIndex: c.chunkIndex,
-          model: c.model,
-          verified: false,
-        })
-      }
-    }
-    scan.matches.sort((a, b) => a.shortStart - b.shortStart || a.movieStart - b.movieStart)
+    // USER PICK (preview/compare "Make main") wins over the AI verdict — shared
+    // helper so a Resume never overwrites the user's choice.
+    applyGroupMatches(scan, g)
     this.mark(job)
   }
 

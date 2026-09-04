@@ -2,10 +2,12 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useSWRConfig } from 'swr'
-import { Clapperboard, Download, Loader2, Pause, Play, RotateCcw, Square, X } from 'lucide-react'
+import { ChevronLeft, ChevronRight, Clapperboard, Download, Loader2, Pause, Play, RotateCcw, Square, X } from 'lucide-react'
 import type { Scan, RenderResolution } from '@/lib/types'
 import { fmtTime, fmtBytes } from '@/lib/format'
 import { buildRenderSegments, type RenderSegment } from '@/lib/render-segments'
+import { candidateOptionsFor, hasAlternatives } from '@/lib/candidate-pick'
+import { CandidateChooser } from './candidate-chooser'
 
 const RESOLUTIONS: { value: RenderResolution; label: string; defaultKbps: number }[] = [
   { value: '480p', label: '480p (854×480)', defaultKbps: 2000 },
@@ -423,6 +425,9 @@ function StitchedPreview({
   const [segIdx, setSegIdx] = useState(0)
   const [playing, setPlaying] = useState(false)
   const [stitchedPos, setStitchedPos] = useState(0)
+  // CANDIDATE VIEW: null = the scene's MAIN window plays; a number = that
+  // candidate window (from candidateOptions) is previewed in place of the scene.
+  const [candIdx, setCandIdx] = useState<number | null>(null)
 
   // Seconds of stitched output before segment i starts.
   const offsets = useMemo(() => {
@@ -435,11 +440,25 @@ function StitchedPreview({
     return out
   }, [segments])
 
+  // Every scene's alternative windows (candidates of the groups covering its short window).
+  const optionsPerSegment = useMemo(
+    () => segments.map((s) => candidateOptionsFor(scan, s.shortStart, s.shortEnd)),
+    [scan, segments],
+  )
+  const current = segments[segIdx]
+  const candidateOptions = optionsPerSegment[segIdx] ?? []
+  const showChooser = hasAlternatives(candidateOptions)
+  const viewing = candIdx === null ? null : candidateOptions[Math.min(candIdx, candidateOptions.length - 1)]
+  // The window the player is clamped to right now.
+  const activeStart = viewing ? viewing.movieStart : current?.movieStart ?? 0
+  const activeEnd = viewing ? viewing.movieEnd : current?.movieEnd ?? 0
+
   // Reset when the segment list changes (new matches between refreshes).
   useEffect(() => {
     setSegIdx(0)
     setPlaying(false)
     setStitchedPos(0)
+    setCandIdx(null)
   }, [segments.length])
 
   function seekToSegment(i: number, autoplay: boolean) {
@@ -447,6 +466,7 @@ function StitchedPreview({
     const seg = segments[i]
     if (!v || !seg) return
     setSegIdx(i)
+    setCandIdx(null)
     v.currentTime = seg.movieStart
     if (autoplay) {
       void v.play()
@@ -454,10 +474,29 @@ function StitchedPreview({
     }
   }
 
+  /** Candidate browser → show that window (or back to main) at the same scene. */
+  function viewCandidate(idx: number | null) {
+    const v = videoRef.current
+    setCandIdx(idx)
+    const win = idx === null ? current : candidateOptions[idx]
+    if (!v || !win) return
+    v.currentTime = win.movieStart
+    if (playing) void v.play()
+  }
+
   function onTimeUpdate() {
     const v = videoRef.current
     const seg = segments[segIdx]
     if (!v || !seg) return
+    if (viewing) {
+      // Candidate preview: loop inside the candidate window only, never auto-advance.
+      if (v.currentTime < activeStart - 0.3 || v.currentTime >= activeEnd - 0.05) {
+        v.currentTime = activeStart
+        v.pause()
+        setPlaying(false)
+      }
+      return
+    }
     setStitchedPos(offsets[segIdx] + Math.max(0, v.currentTime - seg.movieStart))
     // Drifted before the window (user scrubbed native controls are hidden, but seek safety):
     if (v.currentTime < seg.movieStart - 0.3) {
@@ -483,9 +522,8 @@ function StitchedPreview({
       v.pause()
       setPlaying(false)
     } else {
-      const seg = segments[segIdx]
-      if (seg && (v.currentTime < seg.movieStart - 0.3 || v.currentTime >= seg.movieEnd - 0.05)) {
-        v.currentTime = seg.movieStart
+      if (current && (v.currentTime < activeStart - 0.3 || v.currentTime >= activeEnd - 0.05)) {
+        v.currentTime = activeStart
       }
       void v.play()
       setPlaying(true)
@@ -497,8 +535,6 @@ function StitchedPreview({
     setStitchedPos(0)
   }
 
-  const current = segments[segIdx]
-
   return (
     <div className="mt-3 rounded-md border border-border bg-background p-3">
       <div className="flex flex-wrap items-center gap-2">
@@ -508,8 +544,16 @@ function StitchedPreview({
         </span>
         {current && (
           <span className="rounded-full bg-secondary px-2 py-0.5 font-mono text-[10px]">
-            movie {fmtTime(current.movieStart)}–{fmtTime(current.movieEnd)}
+            {viewing ? 'candidate' : 'movie'} {fmtTime(activeStart)}–{fmtTime(activeEnd)}
           </span>
+        )}
+        {showChooser && (
+          <span className="rounded-full bg-primary/15 px-2 py-0.5 font-mono text-[10px] text-primary">
+            {candidateOptions.length} candidates
+          </span>
+        )}
+        {current && candidateOptions.some((o) => o.isMain && o.isUserPick) && (
+          <span className="rounded-full bg-success/15 px-2 py-0.5 font-mono text-[10px] text-success">your choice</span>
         )}
         <span className="ml-auto font-mono text-[10px] text-muted-foreground">
           {fmtTime(stitchedPos)} / {fmtTime(totalSeconds)}
@@ -535,19 +579,29 @@ function StitchedPreview({
         {segments.map((s, i) => {
           const w = totalSeconds > 0 ? (Math.max(0, s.movieEnd - s.movieStart) / totalSeconds) * 100 : 0
           const active = i === segIdx
+          const alts = hasAlternatives(optionsPerSegment[i] ?? [])
           return (
             <button
               key={`${s.movieStart}-${i}`}
               type="button"
               onClick={() => seekToSegment(i, playing)}
-              title={`Scene ${i + 1}: movie ${fmtTime(s.movieStart)}–${fmtTime(s.movieEnd)} (short ${fmtTime(s.shortStart)}–${fmtTime(s.shortEnd)})`}
-              aria-label={`Jump to scene ${i + 1}`}
-              className={`h-full min-w-1 transition-colors ${active ? 'bg-primary' : 'bg-muted hover:bg-primary/50'}`}
+              title={`Scene ${i + 1}: movie ${fmtTime(s.movieStart)}–${fmtTime(s.movieEnd)} (short ${fmtTime(s.shortStart)}–${fmtTime(s.shortEnd)})${alts ? ` · ${optionsPerSegment[i].length} candidates` : ''}`}
+              aria-label={`Jump to scene ${i + 1}${alts ? ' (has candidates)' : ''}`}
+              className={`h-full min-w-1 transition-colors ${
+                active ? 'bg-primary' : alts ? 'bg-primary/35 hover:bg-primary/60' : 'bg-muted hover:bg-primary/50'
+              }`}
               style={{ width: `${w}%` }}
             />
           )
         })}
       </div>
+
+      {/* CANDIDATE BROWSER — only for scenes that have alternative movie windows */}
+      {showChooser && (
+        <div className="mt-2">
+          <CandidateChooser scan={scan} options={candidateOptions} viewIdx={candIdx} onView={viewCandidate} compact />
+        </div>
+      )}
 
       <div className="mt-2.5 flex flex-wrap items-center gap-2">
         <button
@@ -556,7 +610,25 @@ function StitchedPreview({
           className="flex items-center gap-1.5 rounded-md bg-primary px-4 py-2 text-xs font-medium text-primary-foreground"
         >
           {playing ? <Pause className="size-3.5" aria-hidden /> : <Play className="size-3.5" aria-hidden />}
-          {playing ? 'Pause' : 'Play stitched'}
+          {playing ? 'Pause' : viewing ? 'Play candidate' : 'Play stitched'}
+        </button>
+        <button
+          type="button"
+          onClick={() => seekToSegment(segIdx - 1, playing)}
+          disabled={segIdx === 0}
+          aria-label="Previous scene"
+          className="flex items-center gap-1 rounded-md border border-input px-2.5 py-2 text-xs font-medium hover:bg-secondary disabled:opacity-40"
+        >
+          <ChevronLeft className="size-3.5" aria-hidden /> Prev scene
+        </button>
+        <button
+          type="button"
+          onClick={() => seekToSegment(segIdx + 1, playing)}
+          disabled={segIdx >= segments.length - 1}
+          aria-label="Next scene"
+          className="flex items-center gap-1 rounded-md border border-input px-2.5 py-2 text-xs font-medium hover:bg-secondary disabled:opacity-40"
+        >
+          Next scene <ChevronRight className="size-3.5" aria-hidden />
         </button>
         <button
           type="button"
