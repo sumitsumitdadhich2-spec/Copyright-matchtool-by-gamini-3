@@ -3,7 +3,7 @@
 import { useState } from 'react'
 import useSWR from 'swr'
 import { Layers, Loader2, Check, AlertTriangle, RotateCcw, Play, Square, ChevronDown, ChevronRight, Sparkles } from 'lucide-react'
-import type { Scan, GeminiPrescanState, GeminiPrescanStatus, GeminiPrescanWindow, MinuteFinderMode } from '@/lib/types'
+import type { Scan, GeminiPrescanState, GeminiPrescanStatus, GeminiPrescanWindow, GeminiBackupState, GeminiBackupPart, MinuteFinderMode } from '@/lib/types'
 import { fetcher, fmtTime, fmtBytes } from '@/lib/format'
 import { displayModelName } from '@/lib/models'
 import { MinuteFinderToggle } from './minute-finder-toggle'
@@ -23,11 +23,12 @@ const STEPS: { key: string; label: string }[] = [
   { key: 'preparing', label: 'Prepare movie copy' },
   { key: 'uploading', label: 'Upload' },
   { key: 'scanning', label: 'Scan windows' },
+  { key: 'backup', label: 'Backup finder' },
   { key: 'starting_scan', label: 'Minutes found' },
   { key: 'done', label: 'Chunk scan started' },
 ]
 
-const ACTIVE: GeminiPrescanStatus[] = ['preparing', 'uploading', 'scanning', 'starting_scan']
+const ACTIVE: GeminiPrescanStatus[] = ['preparing', 'uploading', 'scanning', 'backup', 'starting_scan']
 
 /** Which step the finder reached — for the running AND the error state. */
 function reachedStep(p: GeminiPrescanState): number {
@@ -35,7 +36,8 @@ function reachedStep(p: GeminiPrescanState): number {
   const i = STEPS.findIndex((s) => s.key === p.status)
   if (i >= 0) return i
   // error / idle: infer from what exists
-  if (p.minuteSuggestions && p.minuteSuggestions.length > 0) return 3
+  if (p.minuteSuggestions && p.minuteSuggestions.length > 0) return 4
+  if (p.backup && p.backup.status !== 'idle') return 3
   if (p.windows.length > 0) return 2
   if (Object.keys(p.uploads || {}).length > 0) return 1
   return 0
@@ -48,6 +50,7 @@ export function MinuteFinderPanel({ scan, mode, onModeChanged }: { scan: Scan; m
   const [acting, setActing] = useState<string | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
   const [openWindow, setOpenWindow] = useState<number | null>(null)
+  const [openBackupWindow, setOpenBackupWindow] = useState<number | null>(null)
 
   const { data, mutate } = useSWR<FinderResponse>(scan.id && mode === 'gemini' ? `/api/scans/${scan.id}/minute-finder` : null, fetcher, {
     refreshInterval: (latest) => (latest && (ACTIVE.includes(latest.prescan?.status) || latest.running) ? 2000 : 10000),
@@ -66,6 +69,23 @@ export function MinuteFinderPanel({ scan, mode, onModeChanged }: { scan: Scan; m
   const doneWindows = windows.filter((w) => w.status === 'done').length
   const failedWindows = windows.filter((w) => w.status === 'failed').length
   const windowsWithHits = windows.filter((w) => (w.matches || 0) > 0).length
+  const backup: GeminiBackupState | undefined = prescan.backup
+  const backupWindows = backup?.windows || []
+  const backupDone = backupWindows.filter((w) => w.status === 'done').length
+  const backupFailed = backupWindows.filter((w) => w.status === 'failed').length
+  const backupAdded = backup?.addedMinutes || []
+  const backupStepLabel =
+    !backup || backup.status === 'idle'
+      ? 'Backup finder'
+      : backup.status === 'skipped'
+        ? 'Backup finder (skipped)'
+        : backup.status === 'preparing'
+          ? 'Backup finder (cutting clip)'
+          : backup.status === 'uploading'
+            ? 'Backup finder (uploading)'
+            : backupWindows.length > 0
+              ? `Backup finder (${backupDone}/${backupWindows.length})`
+              : 'Backup finder'
   const minutes = prescan.appliedMinutes ?? prescan.minuteSuggestions?.map((s) => s.minute) ?? []
   // ACTUAL chunk-scan plan: per short minute the scheduler only touches chunks
   // whose absolute movie minute is in that minute's exact allow-list.
@@ -103,7 +123,8 @@ export function MinuteFinderPanel({ scan, mode, onModeChanged }: { scan: Scan; m
   }
 
   const canStart = mode === 'gemini' && Boolean(data?.ready) && !isActive && !data?.scanRunning && (status === 'idle' || isError) && !isDone
-  const canRetry = mode === 'gemini' && !isActive && !data?.scanRunning && (failedWindows > 0 || (isError && windows.length > 0))
+  const totalFailed = failedWindows + backupFailed
+  const canRetry = mode === 'gemini' && !isActive && !data?.scanRunning && (totalFailed > 0 || (isError && windows.length > 0))
   const canRerun = mode === 'gemini' && Boolean(data?.ready) && !isActive && !data?.scanRunning && windows.length > 0
 
   return (
@@ -175,7 +196,7 @@ export function MinuteFinderPanel({ scan, mode, onModeChanged }: { scan: Scan; m
                 className="btn-press flex items-center gap-1 rounded-lg bg-primary px-3 py-1.5 text-xs font-semibold text-primary-foreground shadow-sm disabled:opacity-40"
               >
                 <RotateCcw className="size-3" aria-hidden />
-                {acting === 'retry' ? 'Retrying...' : `Retry failed windows${failedWindows ? ` (${failedWindows})` : ''}`}
+                {acting === 'retry' ? 'Retrying...' : `Retry failed windows${totalFailed ? ` (${totalFailed})` : ''}`}
               </button>
             )}
             {canRerun && (
@@ -225,6 +246,7 @@ export function MinuteFinderPanel({ scan, mode, onModeChanged }: { scan: Scan; m
                 let label = s.label
                 if (s.key === 'uploading' && keyCount > 0) label = `Upload (keys ${Math.min(uploadedKeys, keyCount)}/${keyCount})`
                 if (s.key === 'scanning' && windows.length > 0) label = `Scan windows (${doneWindows}/${windows.length})`
+                if (s.key === 'backup') label = backupStepLabel
                 if (s.key === 'starting_scan' && minutes.length > 0) label = `Minutes found (${minutes.length})`
                 return (
                   <li key={s.key} className="flex items-center gap-1">
@@ -288,19 +310,26 @@ export function MinuteFinderPanel({ scan, mode, onModeChanged }: { scan: Scan; m
                     the chunk index / log lines ("chunk 66" = 1:06:00–1:07:00). Never +1. */}
                 Movie minute {minutes.join(', ')}{' '}
                 <span className="font-normal text-muted-foreground">
-                  ({windowsWithHits}/{windows.length} window{windows.length === 1 ? '' : 's'} me match · ±1 min buffer · chunk scan sirf inhi par)
+                  ({windowsWithHits}/{windows.length} window{windows.length === 1 ? '' : 's'} me match
+                  {backupAdded.length > 0 ? ` · backup pass se +${backupAdded.length}` : ''} · ±1 min buffer · chunk scan sirf inhi par)
                 </span>
               </p>
               <div className="mt-1.5 flex flex-wrap gap-1">
-                {minutes.map((m) => (
-                  <span
-                    key={m}
-                    title={`Movie minute ${m} = chunk ${m}`}
-                    className="rounded-md border border-success/30 bg-card px-2 py-0.5 font-mono text-[11px] text-success"
-                  >
-                    <span className="text-muted-foreground">{m}:</span> {fmtTime(m * 60)}–{fmtTime((m + 1) * 60)}
-                  </span>
-                ))}
+                {minutes.map((m) => {
+                  const fromBackup = backupAdded.includes(m)
+                  return (
+                    <span
+                      key={m}
+                      title={`Movie minute ${m} = chunk ${m}${fromBackup ? ' — backup pass se mila' : ''}`}
+                      className={`rounded-md border px-2 py-0.5 font-mono text-[11px] ${
+                        fromBackup ? 'border-primary/40 bg-primary/10 text-primary' : 'border-success/30 bg-card text-success'
+                      }`}
+                    >
+                      <span className="text-muted-foreground">{m}:</span> {fmtTime(m * 60)}–{fmtTime((m + 1) * 60)}
+                      {fromBackup && <span className="ml-1 text-[10px] uppercase">bk</span>}
+                    </span>
+                  )
+                })}
               </div>
               {listSegs.length > 0 && (
                 <p className="mt-1.5 text-[11px] text-muted-foreground">
@@ -325,14 +354,145 @@ export function MinuteFinderPanel({ scan, mode, onModeChanged }: { scan: Scan; m
             </div>
           )}
 
+          {/* BACKUP PASS — missing short parts, high-fps clip, every window again */}
+          {backup && backup.status !== 'idle' && (
+            <BackupSection
+              backup={backup}
+              trimStart={trimStart}
+              backupDone={backupDone}
+              backupFailed={backupFailed}
+              openWindow={openBackupWindow}
+              onToggleWindow={(i) => setOpenBackupWindow(openBackupWindow === i ? null : i)}
+            />
+          )}
+
           <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
             Auto flow: trim confirm hote hi trimmed movie ki ek upload-copy banti hai (≤1.9 GB), short + copy har API key par Files API me upload hote hain,
             phir movie 20-minute windows me {data?.models?.map(displayModelName).join(' + ') || 'gemini-3.6-flash + gemini-3.7-flash'} par scan hoti hai (short 5 fps, window 1 fps).
+            Short ke jo hisse (≥4 s) kisi window me nahi mile, unhe cut karke high-fps (5–24) backup clip banti hai aur har window me dobara dhundha jata hai — ek hi baar.
             Jo minutes milte hain unpar 24 fps chunk-time scan apne aap start ho jata hai — koi approval nahi.
           </p>
         </>
       )}
     </section>
+  )
+}
+
+const PART_RESULT: Record<NonNullable<GeminiBackupPart['result']>, { label: string; cls: string }> = {
+  found: { label: 'FOUND', cls: 'bg-success/15 text-success' },
+  possible: { label: 'POSSIBLE', cls: 'border border-primary/30 bg-primary/15 text-primary' },
+  not_in_movie: { label: 'NOT IN MOVIE', cls: 'bg-secondary text-muted-foreground' },
+  non_movie: { label: 'NON-MOVIE', cls: 'bg-warning/15 text-warning' },
+  pending: { label: 'pending', cls: 'bg-secondary text-muted-foreground' },
+}
+
+/** BACKUP PASS block: status line, PART MAP (missing short ranges + verdict), backup window grid. */
+function BackupSection({
+  backup,
+  trimStart,
+  backupDone,
+  backupFailed,
+  openWindow,
+  onToggleWindow,
+}: {
+  backup: GeminiBackupState
+  trimStart: number
+  backupDone: number
+  backupFailed: number
+  openWindow: number | null
+  onToggleWindow: (i: number) => void
+}) {
+  const active = backup.status === 'preparing' || backup.status === 'uploading' || backup.status === 'scanning'
+  const statusChip =
+    backup.status === 'skipped'
+      ? { text: 'skipped', cls: 'bg-secondary text-muted-foreground' }
+      : backup.status === 'done'
+        ? { text: 'done', cls: 'bg-success/15 text-success' }
+        : backup.status === 'error'
+          ? { text: 'error', cls: 'bg-destructive/15 text-destructive' }
+          : { text: backup.status, cls: 'border border-primary/30 bg-primary/15 text-primary' }
+
+  return (
+    <div className="mt-3 rounded-lg border border-border bg-card p-2.5" aria-label="Backup minute finder">
+      <div className="flex flex-wrap items-center gap-2">
+        <h3 className="text-xs font-semibold">
+          Backup finder <span className="font-normal text-muted-foreground">(missing parts · high fps · 2nd pass)</span>
+        </h3>
+        <span className={`ml-auto flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] ${statusChip.cls}`}>
+          {active && <Loader2 className="size-3 animate-spin" aria-hidden />}
+          {backup.status === 'done' && <Check className="size-3" aria-hidden />}
+          {statusChip.text}
+        </span>
+      </div>
+
+      {backup.status === 'skipped' && backup.skipReason && <p className="mt-1.5 text-[11px] text-muted-foreground">{backup.skipReason}</p>}
+      {backup.error && (
+        <p className="mt-1.5 flex items-start gap-1.5 text-[11px] text-destructive">
+          <AlertTriangle className="mt-0.5 size-3 shrink-0" aria-hidden />
+          <span>{backup.error}</span>
+        </p>
+      )}
+      {active && backup.progress && (
+        <p className="mt-1.5 flex items-center gap-1.5 text-[11px] text-muted-foreground">
+          <Loader2 className="size-3 animate-spin text-primary" aria-hidden />
+          {backup.progress}
+        </p>
+      )}
+
+      {backup.clip && (
+        <p className="mt-1.5 text-[11px] text-muted-foreground">
+          Clip: {fmtTime(backup.clip.durationSec)}, {fmtBytes(backup.clip.sizeBytes)} · <span className="font-mono text-foreground">{backup.clip.fps} fps</span> (900-frame budget) · movie window @1fps (same upload)
+        </p>
+      )}
+
+      {backup.parts.length > 0 && (
+        <div className="mt-2">
+          <p className="text-[11px] font-medium text-muted-foreground">PART MAP — short ke missing hisse (±2 s padded)</p>
+          <ul className="mt-1 flex flex-wrap gap-1.5">
+            {backup.parts.map((p) => {
+              const r = PART_RESULT[p.result || 'pending']
+              return (
+                <li key={p.index} className="flex items-center gap-1.5 rounded-md border border-border bg-background px-2 py-1 font-mono text-[11px]">
+                  <span className="font-semibold">P{p.index}</span>
+                  <span className="text-muted-foreground">
+                    short {fmtTime(p.shortStart)}–{fmtTime(p.shortEnd)}
+                  </span>
+                  <span className="text-muted-foreground/60">·</span>
+                  <span className="text-muted-foreground">
+                    clip {fmtTime(p.clipStart)}–{fmtTime(p.clipEnd)}
+                  </span>
+                  <span className={`rounded-full px-1.5 py-0.5 font-sans text-[10px] ${r.cls}`}>{r.label}</span>
+                  {p.type && <span className="font-sans text-[10px] text-muted-foreground">[{p.type}]</span>}
+                </li>
+              )
+            })}
+          </ul>
+        </div>
+      )}
+
+      {backup.addedMinutes && backup.addedMinutes.length > 0 && (
+        <p className="mt-2 text-[11px] text-success">
+          <Sparkles className="mr-1 inline size-3" aria-hidden />
+          Backup se +{backup.addedMinutes.length} extra movie minute(s): {backup.addedMinutes.join(', ')}
+        </p>
+      )}
+      {backup.status === 'done' && (!backup.addedMinutes || backup.addedMinutes.length === 0) && (
+        <p className="mt-2 text-[11px] text-muted-foreground">Backup pass se koi naya minute nahi mila.</p>
+      )}
+
+      {backup.windows.length > 0 && (
+        <div className="mt-2">
+          <p className="text-[11px] font-medium text-muted-foreground">
+            Backup windows ({backupDone}/{backup.windows.length} done{backupFailed ? `, ${backupFailed} failed` : ''}) — clip @{backup.clip?.fps ?? '?'}fps + window @1fps · found range first
+          </p>
+          <ul className="mt-1 grid gap-1.5 sm:grid-cols-2 lg:grid-cols-3">
+            {backup.windows.map((w) => (
+              <WindowCard key={w.index} w={w} trimStart={trimStart} open={openWindow === w.index} onToggle={() => onToggleWindow(w.index)} />
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
   )
 }
 
