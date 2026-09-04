@@ -9,6 +9,7 @@ import {
   DeleteObjectsCommand,
   HeadObjectCommand,
   ListObjectsV2Command,
+  CopyObjectCommand,
 } from '@aws-sdk/client-s3'
 import { Upload } from '@aws-sdk/lib-storage'
 
@@ -181,6 +182,29 @@ export async function deletePrefix(prefix: string): Promise<number> {
     )
   }
   return objects.length
+}
+
+/**
+ * Server-side copy inside the bucket (no download/upload through this box).
+ * Returns false when the source is missing or storage is disabled.
+ */
+export async function copyObject(fromKey: string, toKey: string, contentType = 'application/octet-stream'): Promise<boolean> {
+  if (!storageEnabled()) return false
+  try {
+    await s3().send(
+      new CopyObjectCommand({
+        Bucket: S3_BUCKET,
+        CopySource: `${S3_BUCKET}/${encodeURIComponent(fromKey).replace(/%2F/g, '/')}`,
+        Key: toKey,
+        ContentType: contentType,
+        MetadataDirective: 'REPLACE',
+      }),
+    )
+    return true
+  } catch (err) {
+    if (isNotFound(err)) return false
+    throw err
+  }
 }
 
 export async function objectExists(key: string): Promise<boolean> {

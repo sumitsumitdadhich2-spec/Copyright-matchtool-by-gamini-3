@@ -2,9 +2,17 @@ import { NextResponse } from 'next/server'
 import fs from 'node:fs'
 import { Readable } from 'node:stream'
 import type { ReadableStream as WebReadableStream } from 'node:stream/web'
-import { getScan, SCANS_DIR } from '@/lib/store'
+import { addLog, getScan, saveScan, SCANS_DIR } from '@/lib/store'
 import { restoreScans } from '@/lib/scan-store'
-import { finalizeUploadedMedia, localMediaPath, mirrorMediaToStorage, type MediaKind } from '@/lib/media'
+import {
+  finalizeUploadedMedia,
+  findReusableMedia,
+  localMediaPath,
+  mirrorMediaToStorage,
+  mirrorReusedMedia,
+  reuseMedia,
+  type MediaKind,
+} from '@/lib/media'
 import { getSession } from '@/lib/users'
 import { pipelineReady } from '@/lib/merge-pipeline'
 import { dispatchMinuteFinder } from '@/lib/minute-finder-dispatch'
@@ -31,7 +39,11 @@ export const runtime = 'nodejs'
  * `proxyClientMaxBodySize`, 10 MB by default) and silently truncates the rest.
  * Auth is therefore checked inside the handlers below.
  *
- *   GET  ?kind=short|movie&session=&total=            → { received }
+ *   GET  ?kind=short|movie&session=&total=&name=      → { received, reuse? }
+ *        reuse = { scanId, source } when an earlier scan already holds this
+ *        exact video (same name + size) on disk or in S3 → no upload needed.
+ *   POST ?kind=&name=&total=&reuse=<scanId>            (empty body)
+ *        → { ok, done, duration, size, reused: true } linked/fetched server-side
  *   POST ?kind=short|movie&name=&total=&session=&offset=   body = bytes from offset
  *        → { ok, received }            more bytes still needed (resume)
  *        → { ok, done, duration, size } file complete + ffprobe OK
@@ -146,10 +158,68 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
   const part = `${dest}.part`
   const meta = readMeta(`${dest}.meta`)
   if (!meta || meta.session !== session || meta.total !== total || !fs.existsSync(/*turbopackIgnore: true*/ part)) {
+    // Nothing partial for this file — but maybe it was ALREADY uploaded in an
+    // earlier scan (same name + size). Offer the server-side link instead of a
+    // second multi-GB upload. Sirf dhundhna hai, copy POST ?reuse= par hoti hai.
+    const name = (url.searchParams.get('name') || '').trim()
+    if (name && Number.isFinite(total) && total > 0) {
+      const reuse = await findReusableMedia(kind, name, total)
+      if (reuse) {
+        console.log(`[upload] ${kind} "${name}" (${total} bytes) already in scan ${reuse.scanId} (${reuse.source}) — offering reuse to ${id}`)
+        return NextResponse.json({ received: 0, reuse: { scanId: reuse.scanId, source: reuse.source } })
+      }
+    }
     return NextResponse.json({ received: 0 })
   }
   // Never promise more than what is physically on disk.
   return NextResponse.json({ received: Math.min(meta.received, fileSize(part), total) })
+}
+
+/** POST ?reuse=<scanId> — link/fetch an already-uploaded video into this scan. */
+async function reuseFromScan(req: Request, id: string, kind: MediaKind, name: string, total: number, sourceId: string): Promise<NextResponse> {
+  const startedAt = Date.now()
+  const dest = localMediaPath(id, kind)
+  safeUnlink(`${dest}.part`)
+  safeUnlink(`${dest}.meta`)
+
+  const local = await reuseMedia(id, kind, sourceId, total)
+  if (!local) {
+    // Source vanished between probe and now (pruned) → browser falls back to a real upload.
+    return NextResponse.json({ error: 'Previous copy of this video is no longer available — uploading normally', received: 0 }, { status: 410 })
+  }
+
+  const scan = getScan(id)
+  if (!scan) return NextResponse.json({ error: 'Scan not found' }, { status: 404 })
+  const result = await finalizeUploadedMedia(scan, kind, name)
+  if (!result.ok) return NextResponse.json({ error: result.error }, { status: 400 })
+
+  const fresh = getScan(id)
+  if (fresh) {
+    addLog(fresh, 'success', `${kind === 'short' ? 'Short' : 'Movie'} "${name}" pehle se server par tha (scan ${sourceId}) — bina upload ${((Date.now() - startedAt) / 1000).toFixed(1)}s me link ho gaya`)
+    saveScan(fresh, { immediate: true })
+  }
+
+  void mirrorReusedMedia(id, kind, sourceId, req.headers.get('x-video-type') || 'video/mp4')
+  await afterMediaReady(id, kind)
+  return NextResponse.json({ ok: true, done: true, reused: true, duration: result.duration, size: result.size })
+}
+
+/** Post-upload hooks shared by the stream path and the reuse path. */
+async function afterMediaReady(id: string, kind: MediaKind) {
+  // AUTO MINUTE FINDER trigger (short-after-movie order): agar short abhi
+  // aaya hai aur movie ka trim pehle se confirmed hai → user ke toggle ke
+  // hisaab se Gemini Minute Finder / TwelveLabs pipeline / nothing.
+  // (Movie-after-short order trim route se trigger hota hai.)
+  if (kind !== 'short') return
+  try {
+    const fresh = getScan(id)
+    if (fresh && pipelineReady(fresh)) {
+      const s = await getSession()
+      await dispatchMinuteFinder(id, s ? { username: s.username, role: s.role } : null)
+    }
+  } catch (err) {
+    console.error('[upload] minute finder auto-trigger failed:', err instanceof Error ? err.message : err)
+  }
 }
 
 export async function POST(req: Request, ctx: { params: Promise<{ id: string }> }) {
@@ -172,8 +242,33 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   const kind = parseKind(url.searchParams.get('kind'))
   if (!kind) return NextResponse.json({ error: 'kind must be short or movie' }, { status: 400 })
   const name = (url.searchParams.get('name') || '').trim() || 'video.mp4'
-  const offset = Number.parseInt(url.searchParams.get('offset') || '', 10)
   const total = Number.parseInt(url.searchParams.get('total') || '', 10)
+
+  // Re-use path: no body, the bytes already live in another scan.
+  const reuseId = (url.searchParams.get('reuse') || '').trim()
+  if (reuseId) {
+    if (!/^[a-f0-9]{16}$/i.test(reuseId)) return NextResponse.json({ error: 'Invalid reuse id' }, { status: 400 })
+    if (!Number.isFinite(total) || total <= 0) return NextResponse.json({ error: 'Invalid total' }, { status: 400 })
+    const key = `${id}/${kind}`
+    if (!(await waitIdle(key))) {
+      return NextResponse.json({ error: 'A previous stream for this file is still closing — retrying', received: 0 }, { status: 409 })
+    }
+    let release: () => void = () => {}
+    active.set(
+      key,
+      new Promise<void>((r) => {
+        release = r
+      }),
+    )
+    try {
+      return await reuseFromScan(req, id, kind, name, total, reuseId)
+    } finally {
+      active.delete(key)
+      release()
+    }
+  }
+
+  const offset = Number.parseInt(url.searchParams.get('offset') || '', 10)
   const session = (url.searchParams.get('session') || '').slice(0, 64) || 'legacy'
   if (!Number.isFinite(total) || total <= 0 || !Number.isFinite(offset) || offset < 0 || offset > total) {
     return NextResponse.json({ error: 'Invalid offset/total' }, { status: 400 })
@@ -377,22 +472,7 @@ async function streamToDisk(req: Request, p: StreamParams): Promise<NextResponse
 
   // Durable copy to S3 in the background — the user never waits for it.
   void mirrorMediaToStorage(id, kind, req.headers.get('x-video-type') || 'video/mp4')
-
-  // AUTO MINUTE FINDER trigger (short-after-movie order): agar short abhi
-  // aaya hai aur movie ka trim pehle se confirmed hai → user ke toggle ke
-  // hisaab se Gemini Minute Finder / TwelveLabs pipeline / nothing.
-  // (Movie-after-short order trim route se trigger hota hai.)
-  if (kind === 'short') {
-    try {
-      const fresh = getScan(id)
-      if (fresh && pipelineReady(fresh)) {
-        const s = await getSession()
-        await dispatchMinuteFinder(id, s ? { username: s.username, role: s.role } : null)
-      }
-    } catch (err) {
-      console.error('[upload] minute finder auto-trigger failed:', err instanceof Error ? err.message : err)
-    }
-  }
+  await afterMediaReady(id, kind)
 
   return NextResponse.json({ ok: true, done: true, duration: result.duration, size: result.size })
 }

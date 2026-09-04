@@ -31,6 +31,9 @@ export type UploadPhase =
   | 'finalizing'
   /** Connection dropped or stalled — backing off before resuming. */
   | 'reconnecting'
+  /** The server already has this exact video from an earlier scan — it is
+   *  linking / fetching it server-side, nothing is uploaded. */
+  | 'linking'
 
 export interface UploadProgress {
   phase: UploadPhase
@@ -57,6 +60,8 @@ export interface UploadProgress {
 export interface UploadResult {
   duration: number
   size: number
+  /** true when no bytes were uploaded — the server linked an earlier copy. */
+  reused: boolean
 }
 
 export class UploadError extends Error {
@@ -152,14 +157,50 @@ function waitOnline(signal?: AbortSignal) {
   })
 }
 
-/** GET → how many contiguous bytes of this exact file the server already has. */
-async function probeOnce(base: string, signal?: AbortSignal): Promise<number> {
+interface ProbeResult {
+  received: number
+  /** Set when an earlier scan already holds this exact video. */
+  reuse: { scanId: string; source: 'disk' | 's3' } | null
+}
+
+/** GET → how many contiguous bytes of this exact file the server already has
+ *  (and whether the whole file already exists in another scan). */
+async function probeOnce(base: string, signal?: AbortSignal): Promise<ProbeResult> {
   const res = await fetch(base, { method: 'GET', cache: 'no-store', signal })
   if (res.status === 401) throw new UploadError('Session expired — please log in again', true)
   if (res.status === 404) throw new UploadError('Scan not found — please refresh the page', true)
   if (!res.ok) throw new UploadError(`Server error while checking upload state (HTTP ${res.status})`)
-  const j = (await res.json()) as { received?: number }
-  return Number.isFinite(j.received) && j.received! > 0 ? j.received! : 0
+  const j = (await res.json()) as { received?: number; reuse?: { scanId?: string; source?: string } }
+  const reuse =
+    j.reuse && typeof j.reuse.scanId === 'string' && j.reuse.scanId
+      ? { scanId: j.reuse.scanId, source: j.reuse.source === 's3' ? ('s3' as const) : ('disk' as const) }
+      : null
+  return { received: Number.isFinite(j.received) && j.received! > 0 ? j.received! : 0, reuse }
+}
+
+/**
+ * POST ?reuse= → the server hard-links (disk) or pulls (S3) the earlier copy
+ * into this scan and runs the normal finalize. Resolves null when the earlier
+ * copy vanished (410) so the caller falls back to a real upload.
+ */
+async function requestReuse(base: string, sourceScanId: string, videoType: string, signal?: AbortSignal): Promise<UploadResult | null> {
+  const res = await fetch(`${base}&reuse=${encodeURIComponent(sourceScanId)}`, {
+    method: 'POST',
+    cache: 'no-store',
+    signal,
+    headers: { 'x-video-type': videoType, [UPLOAD_PROTOCOL_HEADER]: UPLOAD_PROTOCOL },
+  })
+  let j: { done?: boolean; duration?: number; size?: number; error?: string } = {}
+  try {
+    j = (await res.json()) as typeof j
+  } catch {
+    // handled below
+  }
+  if (res.status === 401) throw new UploadError('Session expired — please log in again', true)
+  if (res.status === 410) return null
+  if (!res.ok) throw new UploadError(j.error || `Could not link the existing video (HTTP ${res.status})`, res.status >= 400 && res.status < 500 && res.status !== 409)
+  if (!j.done) return null
+  return { duration: j.duration ?? 0, size: j.size ?? 0, reused: true }
 }
 
 /**
@@ -170,7 +211,7 @@ async function probeOnce(base: string, signal?: AbortSignal): Promise<number> {
  * us). If that is too optimistic the server answers 409 with its real count
  * and we probe again; if it is too low the overlap is rewritten identically.
  */
-async function probeReceived(base: string, lastKnown: number, signal?: AbortSignal): Promise<number> {
+async function probeReceived(base: string, lastKnown: number, signal?: AbortSignal): Promise<ProbeResult> {
   let lastErr: unknown = null
   for (let attempt = 0; attempt < PROBE_ATTEMPTS; attempt++) {
     if (signal?.aborted) throw new UploadError('Upload cancelled', true)
@@ -185,7 +226,7 @@ async function probeReceived(base: string, lastKnown: number, signal?: AbortSign
     }
   }
   console.warn(`[upload] probe failed repeatedly — continuing from last confirmed byte ${lastKnown}, server will correct us`, lastErr)
-  return lastKnown
+  return { received: lastKnown, reuse: null }
 }
 
 type StreamOutcome = { done: true; duration: number; size: number } | { done: false; received: number; truncated: boolean }
@@ -306,6 +347,8 @@ export async function uploadVideoStream({ scanId, kind, file, onProgress, signal
   let truncations = 0
   let resumedFrom = 0
   let offline = false
+  /** Server-side link attempted once; on failure we upload for real. */
+  let reuseTried = false
 
   // Average speed = bytes moved during this session / seconds spent in the
   // 'uploading' phase (probing / reconnect pauses are not counted).
@@ -354,7 +397,33 @@ export async function uploadVideoStream({ scanId, kind, file, onProgress, signal
       wire = 0
       emit()
       const before = confirmed
-      confirmed = Math.min(await probeReceived(base, confirmed, signal), file.size)
+      const probe = await probeReceived(base, confirmed, signal)
+
+      // FAST PATH: the server already has this exact video (same name + size)
+      // from an earlier scan. Link it server-side — zero bytes uploaded.
+      if (probe.reuse && !reuseTried) {
+        reuseTried = true
+        setPhase('linking')
+        emit()
+        console.log(`[upload] ${kind} "${file.name}" already on server in scan ${probe.reuse.scanId} (${probe.reuse.source}) — linking instead of uploading`)
+        try {
+          const linked = await requestReuse(base, probe.reuse.scanId, videoType, signal)
+          if (linked) {
+            confirmed = file.size
+            wire = 0
+            emit()
+            return linked
+          }
+          console.warn('[upload] earlier copy vanished — falling back to a normal upload')
+        } catch (err) {
+          if (err instanceof UploadError && err.fatal) throw err
+          if (signal?.aborted) throw new UploadError('Upload cancelled', true)
+          console.warn('[upload] reuse failed — falling back to a normal upload:', err)
+        }
+        continue
+      }
+
+      confirmed = Math.min(probe.received, file.size)
       // The server has more than after the last attempt → the line is moving
       // data, however flaky. Only attempts that land NOTHING count towards
       // giving up (see MAX_CONSECUTIVE_FAILURES).
@@ -382,7 +451,7 @@ export async function uploadVideoStream({ scanId, kind, file, onProgress, signal
           confirmed = file.size
           wire = 0
           emit()
-          return { duration: out.duration, size: out.size }
+          return { duration: out.duration, size: out.size, reused: false }
         }
         // Server accepted bytes but the body ended before the declared size
         // (a proxy cut it short). Loop: re-probe and stream the remainder.
@@ -393,7 +462,7 @@ export async function uploadVideoStream({ scanId, kind, file, onProgress, signal
         if (out.truncated) {
           // The server saw the body end cleanly but SHORTER than what we sent:
           // a proxy between us and the disk is cutting bodies. Each round still
-          // lands a slice, so "progress" never trips the failure counter — stop
+          // lands a slice, so "progress" never trips the failure counter �� stop
           // after a few rounds with a message that names the real cause instead
           // of crawling through a 5 GB file 10 MB at a time.
           truncations++

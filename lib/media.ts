@@ -1,11 +1,11 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import { getScan, saveScan, addLog, scanMediaDir } from './store'
+import { getScan, saveScan, addLog, scanMediaDir, listScans } from './store'
 import type { Scan } from './types'
 import { probeDuration, chunkShort, cleanupSegments } from './ffmpeg'
 import { CHUNK_SECONDS } from './models'
 import { deleteEmbeddings } from './twelvelabs'
-import { getFile, putFile, storageEnabled } from './storage'
+import { copyObject, getFile, objectExists, putFile, storageEnabled } from './storage'
 import { MEDIA_DIR, DISK_LIMIT_BYTES } from './paths'
 
 export type MediaKind = 'short' | 'movie'
@@ -89,6 +89,119 @@ export function mirrorMediaToStorage(id: string, kind: MediaKind, contentType = 
   })()
   mirroring.set(key, job)
   return job
+}
+
+// ---------- Re-use an already uploaded video (no second upload) ----------
+// Same file name + same byte size in an earlier scan = same video. If that
+// scan's original is still on the EBS disk we hard-link it into the new scan
+// (instant, zero extra bytes); if only the S3 backup survives we pull it down
+// from S3 (server-side, LAN speed) — either way the browser sends nothing.
+
+export interface ReusableMedia {
+  scanId: string
+  /** Where the bytes are right now. */
+  source: 'disk' | 's3'
+  duration: number | null
+}
+
+function fileSizeSafe(p: string): number {
+  try {
+    return fs.statSync(/*turbopackIgnore: true*/ p).size
+  } catch {
+    return 0
+  }
+}
+
+/**
+ * Find a previous scan that holds THIS exact video (name + size match) and
+ * still has the bytes somewhere (local disk first, then S3). Newest first.
+ */
+export async function findReusableMedia(kind: MediaKind, name: string, size: number, excludeId?: string): Promise<ReusableMedia | null> {
+  if (!name || !Number.isFinite(size) || size <= 0) return null
+  const nameKey = kind === 'short' ? 'shortName' : 'movieName'
+  const sizeKey = kind === 'short' ? 'shortSize' : 'movieSize'
+  const durKey = kind === 'short' ? 'shortDuration' : 'movieDuration'
+
+  const candidates = listScans()
+    .filter((s) => s.id !== excludeId && s[nameKey] === name)
+    .map((s) => getScan(s.id))
+    .filter((s): s is Scan => Boolean(s) && s![sizeKey] === size)
+
+  // 1) Local disk — instant.
+  for (const s of candidates) {
+    const local = localMediaPath(s.id, kind)
+    if (fileSizeSafe(local) === size) return { scanId: s.id, source: 'disk', duration: s[durKey] }
+  }
+  // 2) S3 backup — server pulls it, browser still sends nothing.
+  if (storageEnabled()) {
+    for (const s of candidates) {
+      try {
+        if (await objectExists(mediaStorageKey(s.id, kind))) return { scanId: s.id, source: 's3', duration: s[durKey] }
+      } catch (err) {
+        console.warn('[media] S3 head failed while looking for a reusable video:', err instanceof Error ? err.message : err)
+      }
+    }
+  }
+  return null
+}
+
+/**
+ * Put the bytes of `sourceId`'s video into `targetId` without an upload.
+ * Hard-link when the source is on disk (falls back to a copy across devices),
+ * otherwise download from S3 straight into the target path. Resolves the
+ * local path or null when the source vanished in the meantime.
+ */
+export async function reuseMedia(targetId: string, kind: MediaKind, sourceId: string, expectedSize: number): Promise<string | null> {
+  const dest = localMediaPath(targetId, kind)
+  if (sourceId === targetId) return fileSizeSafe(dest) === expectedSize ? dest : null
+
+  const src = localMediaPath(sourceId, kind)
+  const startedAt = Date.now()
+  if (fileSizeSafe(src) === expectedSize) {
+    try {
+      fs.unlinkSync(dest)
+    } catch {
+      // nothing to replace
+    }
+    try {
+      fs.linkSync(src, dest)
+      console.log(`[media] reused ${kind} of ${sourceId} → ${targetId} via hard link (instant)`)
+    } catch {
+      fs.copyFileSync(src, dest)
+      console.log(`[media] reused ${kind} of ${sourceId} → ${targetId} via copy in ${((Date.now() - startedAt) / 1000).toFixed(1)}s`)
+    }
+    return fileSizeSafe(dest) === expectedSize ? dest : null
+  }
+
+  if (!storageEnabled()) return null
+  try {
+    const ok = await getFile(mediaStorageKey(sourceId, kind), dest)
+    if (!ok) return null
+    console.log(`[media] reused ${kind} of ${sourceId} → ${targetId} from S3 in ${((Date.now() - startedAt) / 1000).toFixed(1)}s`)
+  } catch (err) {
+    console.error('[media] S3 fetch for reuse failed:', err instanceof Error ? err.message : err)
+    return null
+  }
+  return fileSizeSafe(dest) === expectedSize ? dest : null
+}
+
+/**
+ * Durable copy for a reused video: S3→S3 server-side copy when the source is
+ * already backed up (no bytes leave AWS), otherwise a normal mirror upload.
+ */
+export async function mirrorReusedMedia(targetId: string, kind: MediaKind, sourceId: string, contentType = 'video/mp4'): Promise<boolean> {
+  if (!storageEnabled()) return false
+  if (sourceId !== targetId) {
+    try {
+      if (await copyObject(mediaStorageKey(sourceId, kind), mediaStorageKey(targetId, kind), contentType)) {
+        console.log(`[media] S3 copy media/${sourceId}/${kind}.mp4 → media/${targetId}/${kind}.mp4`)
+        return true
+      }
+    } catch (err) {
+      console.warn('[media] S3 server-side copy failed, falling back to upload:', err instanceof Error ? err.message : err)
+    }
+  }
+  return mirrorMediaToStorage(targetId, kind, contentType)
 }
 
 // ---------- Storage usage (local EBS disk) ----------
