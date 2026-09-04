@@ -1,4 +1,4 @@
-import type { CandidateEntry, CandidateGroup, ChunkMatch, Scan } from './types'
+import type { CandidateEntry, CandidateGroup, ChunkMatch, MatchOrigin, Scan } from './types'
 
 // ---------------------------------------------------------------------------
 // CANDIDATE PICK — user choice of the main clip for one short window.
@@ -15,13 +15,53 @@ export function sameShortSegment(aStart: number, aEnd: number, bStart: number, b
   return shorter <= 0 ? false : overlap / shorter >= 0.5
 }
 
+/** Provenance of a match produced from group `g`. A rescan-found window is
+ *  'rescan' — unless the group itself came from the gap-backup pass, whose
+ *  origin is the more useful thing to know downstream. */
+export function groupMatchOrigin(g: CandidateGroup, viaRescan: boolean): MatchOrigin {
+  const base = g.origin ?? 'chunk'
+  if (viaRescan && base !== 'gap-backup') return 'rescan'
+  return base
+}
+
+/** Human label for logs: "[origin: chunk scan #12]" / "[origin: rescan]" /
+ *  "[origin: gap backup window #7]" / "[origin: user pick]". */
+export function originTag(origin: MatchOrigin | undefined, chunkIndex?: number, originWindow?: number): string {
+  switch (origin) {
+    case 'rescan':
+      return '[origin: rescan]'
+    case 'gap-backup':
+      return `[origin: gap backup${originWindow !== undefined ? ` window #${originWindow}` : ''}]`
+    case 'user':
+      return '[origin: user pick]'
+    default:
+      return `[origin: chunk scan${chunkIndex !== undefined ? ` #${chunkIndex}` : ''}]`
+  }
+}
+
+/** REJECTED — KEPT: the best candidate window of a rejected group. Prefer the
+ *  most recent rescan-found window (the rescan had the whole chunk to look at),
+ *  otherwise the first (highest-ranked) original candidate. */
+export function bestRejectedCandidate(g: CandidateGroup): { c: CandidateEntry; index: number; viaRescan: boolean } | null {
+  if (g.candidates.length === 0) return null
+  for (let i = g.candidates.length - 1; i >= 0; i--) {
+    const c = g.candidates[i]
+    if (c.rescan === 'found' && c.rescanMovieStart != null && c.rescanMovieEnd != null && c.rescanMovieEnd > c.rescanMovieStart) {
+      return { c, index: i, viaRescan: true }
+    }
+  }
+  return { c: g.candidates[0], index: 0, viaRescan: false }
+}
+
 /** Rewrite scan.matches for ONE candidate group.
  *
  *  USER PICK wins: one verified match built from the picked candidate window
  *  (rescan window when viaRescan) — even if the AI rejected / never verified it.
  *  Otherwise the AI verdict:
  *   confirmed  → ONE verified match (rescan window when confirmedViaRescan)
- *   rejected   → all this group's matches removed
+ *   rejected   → best candidate KEPT, flagged rejected=true, verified=false
+ *                ("almost right" beats a hole in the merge). Superseded groups
+ *                (a confirmed group already owns the window) push nothing.
  *   unverified → original candidate windows kept, flagged verified=false
  *   pending / verifying / rescanning → group not decided yet: matches untouched
  *     (the raw chunk matches stay in place until the verifier finishes). */
@@ -45,6 +85,8 @@ export function applyGroupMatches(scan: Scan, g: CandidateGroup): void {
       verified: true,
       viaRescan: useRescan || undefined,
       userPick: true,
+      origin: 'user',
+      originWindow: g.originWindow,
     })
   } else if (g.status === 'confirmed' && g.confirmedIndex !== null) {
     const c = g.candidates[g.confirmedIndex]
@@ -57,7 +99,26 @@ export function applyGroupMatches(scan: Scan, g: CandidateGroup): void {
       model: c.model,
       verified: true,
       viaRescan: g.confirmedViaRescan || undefined,
+      origin: groupMatchOrigin(g, g.confirmedViaRescan),
+      originWindow: g.originWindow,
     })
+  } else if (g.status === 'rejected' && !g.superseded) {
+    const best = bestRejectedCandidate(g)
+    if (best) {
+      scan.matches.push({
+        shortStart: g.shortStart,
+        shortEnd: g.shortEnd,
+        movieStart: best.viaRescan ? best.c.rescanMovieStart! : best.c.movieStart,
+        movieEnd: best.viaRescan ? best.c.rescanMovieEnd! : best.c.movieEnd,
+        chunkIndex: best.c.chunkIndex,
+        model: best.c.model,
+        verified: false,
+        rejected: true,
+        viaRescan: best.viaRescan || undefined,
+        origin: groupMatchOrigin(g, best.viaRescan),
+        originWindow: g.originWindow,
+      })
+    }
   } else if (g.status === 'unverified') {
     for (const c of g.candidates) {
       scan.matches.push({
@@ -68,6 +129,8 @@ export function applyGroupMatches(scan: Scan, g: CandidateGroup): void {
         chunkIndex: c.chunkIndex,
         model: c.model,
         verified: false,
+        origin: groupMatchOrigin(g, false),
+        originWindow: g.originWindow,
       })
     }
   }
@@ -99,6 +162,11 @@ export interface CandidateOption {
   isMain: boolean
   /** this window is the user's explicit pick */
   isUserPick: boolean
+  /** main clip of a REJECTED group kept in the merge (no user pick) — red badge */
+  rejectedKept: boolean
+  /** provenance of this window */
+  origin: MatchOrigin
+  originWindow?: number
 }
 
 function windowState(c: CandidateEntry, g: CandidateGroup, index: number, viaRescan: boolean): CandidateOptionState {
@@ -130,7 +198,8 @@ export function candidateOptionsFor(scan: Pick<Scan, 'matches' | 'candidateGroup
   for (const g of groups) {
     g.candidates.forEach((c, index) => {
       const push = (viaRescan: boolean, ms: number, me: number) => {
-        const isMain = mains.some((m) => nearlySame(m.movieStart, ms) && nearlySame(m.movieEnd, me))
+        const mainMatch = mains.find((m) => nearlySame(m.movieStart, ms) && nearlySame(m.movieEnd, me))
+        const isMain = mainMatch !== undefined
         const isUserPick = !!g.userPick && g.userPick.index === index && g.userPick.viaRescan === viaRescan
         out.push({
           groupId: g.id,
@@ -146,6 +215,9 @@ export function candidateOptionsFor(scan: Pick<Scan, 'matches' | 'candidateGroup
           state: isMain ? 'main' : windowState(c, g, index, viaRescan),
           isMain,
           isUserPick,
+          rejectedKept: isMain && !isUserPick && (mainMatch?.rejected === true || g.status === 'rejected'),
+          origin: mainMatch?.origin ?? groupMatchOrigin(g, viaRescan),
+          originWindow: g.originWindow,
         })
       }
       push(false, c.movieStart, c.movieEnd)
@@ -174,4 +246,23 @@ export function hasAlternatives(options: CandidateOption[]): boolean {
 /** Does the given match come from a user pick? (helper for badges) */
 export function isUserPicked(m: ChunkMatch): boolean {
   return m.userPick === true
+}
+
+/** Is this match a REJECTED group's best candidate kept in the merge? */
+export function isRejectedKept(m: ChunkMatch): boolean {
+  return m.rejected === true && m.userPick !== true
+}
+
+/** Short UI label for a provenance chip. */
+export function originLabel(origin: MatchOrigin | undefined, originWindow?: number): string {
+  switch (origin) {
+    case 'rescan':
+      return 'rescan'
+    case 'gap-backup':
+      return originWindow !== undefined ? `gap backup #${originWindow}` : 'gap backup'
+    case 'user':
+      return 'your pick'
+    default:
+      return 'chunk scan'
+  }
 }
