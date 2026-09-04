@@ -252,6 +252,167 @@ export async function runMinuteFinderWindow(
   }
 }
 
+// ---------------------------------------------------------------------------
+// BACKUP MINUTE FINDER — second, focused pass (word-for-word from
+// data/gemini-backup-minute-finder-prompt.md). Video 1 = concatenated clip of
+// the short parts NO normal window matched, sampled at a HIGH fps; Video 2 =
+// the same 20-minute movie window @ 1 fps.
+// ---------------------------------------------------------------------------
+
+/** Frame budget per request for the backup clip: fps = clamp(floor(900 / sec), 5, 24). */
+export const BACKUP_FRAME_BUDGET = 900
+export const BACKUP_MIN_FPS = 5
+export const BACKUP_MAX_FPS = 24
+
+export function backupClipFps(clipSeconds: number): number {
+  const f = Math.floor(BACKUP_FRAME_BUDGET / Math.max(1, clipSeconds))
+  return Math.min(BACKUP_MAX_FPS, Math.max(BACKUP_MIN_FPS, f))
+}
+
+export const BACKUP_MINUTE_FINDER_PROMPT = `You are a forensic video analyst doing a SECOND, FOCUSED search. You are given TWO videos:
+- Video 1: a SHORT CLIP cut out of a short video. Ye short video movie ke clips se edit karke banaya gaya tha. Is clip me sirf wo hisse hain jo PEHLI search me movie ke KISI BHI hisse me nahi mile. Clip is sampled at {{CLIP_FPS}} fps (high), so you have many frames per second.
+- Video 2: a 20-MINUTE WINDOW of the original movie, covering movie time {{WINDOW_START}} to {{WINDOW_END}} (sampled at 1 fps).
+
+CLIP PART MAP (Video 1 ki apni clock 00:00 se shuru hoti hai; har PART short video ke asli time se aata hai; PARTS ke beech 1 second black + silence hai):
+{{PART_MAP}}
+
+CONTEXT FROM FIRST SEARCH (short ke baaki hisse movie me yahan mile the — ye sirf hint hai, is se koi timestamp CALCULATE mat karna):
+{{FOUND_SUMMARY}}
+
+Tumhara kaam frame-perfect mapping NAHI hai. Tumhara kaam ye batana hai ki Video 1 ke PARTS Video 2 ke andar hain ya nahi, aur hain to movie ke KAUN SE MINUTE(S) par — taaki agla step un minutes ko 24 fps par frame-by-frame check kar sake.
+
+Ye clip pehli baar MISS hua tha. Iska matlab ye ho sakta hai: (a) footage movie me hai lekin fast cuts / chhote shots / dark scene / heavy crop ki wajah se pehli baar pakda nahi gaya, YA (b) ye footage movie ka hai hi nahi (text card, channel intro/outro, logo, doosri film ka footage). Dono possibilities kholi rakho. Zabardasti match banana FORBIDDEN hai, lekin genuine shak ho to POSSIBLE dena ZAROORI hai.
+
+Respond in Hinglish (Hindi written in Latin script). Spoken dialogue must always be QUOTED VERBATIM in its original language.
+
+Your answer has exactly THREE parts:
+
+=====================
+HISSA 1 — CLIP PART MAP (LIGHT)
+=====================
+Video 1 ko dekho. Har PART ke liye:
+- PART ko 1 se max 3 scenes me todo. Agar poora PART ek hi continuous shot/scene hai to ek hi line likho. Chhote-chhote tukde banana ZAROORI NAHI hai.
+- Do alag PARTS ko kabhi ek scene me merge mat karo — black frame par hamesha naya PART shuru hota hai.
+- Har scene me clip time aur SHORT time (PART MAP se) dono likho.
+- Har PART ka TYPE tag do: MOVIE-FOOTAGE (asli film ka shot dikh raha hai) / TEXT-CARD (sirf text/graphics) / LOGO-INTRO-OUTRO (channel branding) / NON-MOVIE (koi aur footage, vlog, reaction, etc.).
+- Har line ka format:
+  P<part>-S<n>: clip mm:ss - mm:ss | short mm:ss - mm:ss | TYPE: <tag> | <location + kaun kya kar raha hai, max 15 words> | DIALOGUE: "<exact quoted words>" ya NONE ya MUTED
+- Dialogue sabse strong fingerprint hai — kabhi summarize mat karo, exact words quote karo. Background music/SFX bhi note karo agar distinctive ho (e.g. "gunshot", "specific song").
+- High fps hai isliye chhote details bhi note karo jo pehli baar miss ho sakte the: props, text on screen, costume detail, camera move, background objects.
+
+=====================
+HISSA 2 — DEEP MOVIE HUNT
+=====================
+HISSA 1 ke HAR EK scene ke liye Video 2 (movie window) me EXACT wahi footage dhundho (same recording — sirf similar scene nahi).
+
+Search method (har scene ke liye follow karo, order me):
+- PASS 1 (AUDIO LOCATE — primary): Video 2 ka audio 1 fps frames se ZYADA reliable hai kyunki audio poora hota hai. Dialogue ho to exact words dhundho. Dialogue na ho to distinctive music cue, SFX, ambient sound (crowd, rain, engine) dhundho. Jahan mile, us position ke +-10 second ke frames dekho.
+- PASS 2 (VISUAL LOCATE): Video 2 ko shuru se aakhir tak scan karo — same location + same actors + same costume + same props. High-fps clip ke details (HISSA 1 me note kiye) ko movie frames me dhundho. Ye clip pehle miss hua tha, isliye DARK scenes, FAST-CUT sequences, CLOSE-UPS, aur heavily CROPPED shots ko extra dhyan se dekho — wahi sabse zyada miss hote hain.
+- PASS 3 (CONFIRM): MATCH tab hi jab (a) dialogue words same hain YA (b) actions ka sequence same hai YA (c) distinctive audio cue + same visual setup dono milte hain. Sirf "same actor, same location" MATCH nahi — POSSIBLE ho sakta hai.
+
+STRICT RULES:
+1. Movie timestamps Video 2 ki APNI clock se — frames/audio actually dekh-sun kar. Clip time ya short time ko movie column me copy karna FORBIDDEN.
+2. NO EXTRAPOLATION (CRITICAL): CONTEXT FROM FIRST SEARCH se ya kisi offset formula se movie time CALCULATE karna STRICTLY FORBIDDEN. Context sirf ye batata hai ki short ke aas-paas ke hisse kahan mile the — missing hissa kahin bhi ho sakta hai (short EDITED hai, order alag ho sakta hai). Agar context ke hint wali jagah check karo, to actually frames/audio dekh kar confirm karo — assume mat karo.
+3. DIALOGUE VERIFICATION: Dialogue wale scene ka MATCH tab hi jab WAHI words Video 2 ke audio me us position par SUNAI dein. Words alag = NOT FOUND (ya POSSIBLE agar audio unclear).
+4. QUALITY DIFFERENCE IS NOT DIFFERENT: crop, zoom, letterbox, aspect-ratio, compression, blur, color-grade, brightness, watermark, text overlay, subtitles, added music, original audio replaced/muted, mirrored image, speed change — IGNORE. Underlying footage same = MATCH. In wajahon se reject karna FORBIDDEN.
+5. LOW-FPS MOVIE SIDE: Video 2 me 1 fps hai. Agar clip ka scene movie me sirf 1-3 frames me dikh raha hai lekin location + costume + audio cue match karte hain, to use NOT FOUND mat karo — POSSIBLE likho with reason "1fps par kam frames, audio/setup match". Agla step 24 fps par verify karega.
+6. WINDOW KA END = FOOTAGE KA END: Ye poori movie ka sirf 20-minute tukda hai. Clip is window me na ho ye NORMAL aur EXPECTED hai — saaf likho NOT FOUND. Pehli baar miss hone ka matlab ye NAHI ki isi window me hona chahiye.
+7. TEXT-CARD / LOGO / NON-MOVIE type PARTS ke liye movie me dhundhne ki koshish karo lekin agar clearly movie footage nahi hai to seedha NOT FOUND — "NON-MOVIE" reason ke saath. Zabardasti match mat banao.
+8. SIMILAR IS NOT SAME: same actors, same location, same costume par DIFFERENT moment = NOT FOUND. Lekin strong shak + confirm nahi kar paaye = POSSIBLE with reason. Backup search me miss karna sabse bura hai — POSSIBLE dene me generous raho, MATCH dene me strict.
+9. Har scene ke liye movie ka minute do tarah:
+   - WINDOW time: Video 2 ki apni clock (00:00 se 20:00)
+   - MOVIE time: WINDOW time + {{WINDOW_START}} (absolute)
+   Agar Video 2 ka clock already absolute movie time dikha raha hai, to dono me wahi absolute time likho aur ek line me note karo: "CLOCK: absolute".
+10. Ek clip scene movie me EK jagah hi hoti hai. Do jagah lage to zyada confirm wali MATCH, doosri POSSIBLE.
+11. FINAL SELF-CHECK: har MATCH dobara dekho — (a) dialogue/action/audio-cue sach me same? (b) timestamp Video 2 ki clock se aaya, formula ya context-hint se nahi? Jo match sirf "context me aas-paas mila tha isliye" bana hai, use POSSIBLE ya NOT FOUND me badlo.
+
+Har scene ki line ka format (teen me se ek) — SHORT time ZAROOR likho (clip time nahi):
+  P<part>-S<n> --> MATCH | SHORT mm:ss - mm:ss | WINDOW mm:ss - mm:ss | MOVIE mm:ss - mm:ss | EVIDENCE: <dialogue words / action / audio cue, max 15 words>
+  P<part>-S<n> --> POSSIBLE | SHORT mm:ss - mm:ss | WINDOW mm:ss - mm:ss | MOVIE mm:ss - mm:ss | REASON: <kya same laga, kya confirm nahi hua>
+  P<part>-S<n> --> NOT FOUND — <chhota reason: is window me nahi / alag moment / NON-MOVIE>
+
+=====================
+HISSA 3 — MINUTE LIST (FINAL)
+=====================
+HISSA 2 ke saare MATCH aur POSSIBLE se movie ke minutes nikaalo (MOVIE time, absolute). Har wo minute jisme matched footage ka koi bhi hissa aata hai, list me aayega (e.g. MOVIE 23:50 - 24:10 => 23 aur 24 dono).
+
+Exact format, aur kuch nahi:
+  MATCH MINUTES: <comma separated minute numbers, ascending> (ya NONE)
+  POSSIBLE MINUTES: <comma separated minute numbers> (ya NONE)
+  PART STATUS: P1=<FOUND/POSSIBLE/NOT-HERE/NON-MOVIE>, P2=<...>, ...
+  WINDOW VERDICT: FOUND (kam se kam ek MATCH) / POSSIBLE ONLY / NOT IN THIS WINDOW
+
+Poore answer me sirf HISSA 1, HISSA 2 aur HISSA 3 do, aur kuch nahi.`
+
+export interface BackupPartSpec {
+  index: number
+  clipStart: number
+  clipEnd: number
+  shortStart: number
+  shortEnd: number
+}
+
+/** "PART 1: clip 00:00 - 00:30  =  short 01:00 - 01:30" lines for {{PART_MAP}}. */
+export function buildPartMap(parts: BackupPartSpec[]): string {
+  return parts
+    .map((p) => `PART ${p.index}: clip ${fmtClock(p.clipStart)} - ${fmtClock(p.clipEnd)}  =  short ${fmtClock(p.shortStart)} - ${fmtClock(p.shortEnd)}`)
+    .join('\n')
+}
+
+export function buildBackupMinuteFinderPrompt(
+  startOffsetSec: number,
+  endOffsetSec: number,
+  clipFps: number,
+  parts: BackupPartSpec[],
+  foundSummary: string,
+): string {
+  return BACKUP_MINUTE_FINDER_PROMPT.replaceAll('{{WINDOW_START}}', fmtClock(startOffsetSec))
+    .replaceAll('{{WINDOW_END}}', fmtClock(endOffsetSec))
+    .replaceAll('{{CLIP_FPS}}', String(clipFps))
+    .replaceAll('{{PART_MAP}}', buildPartMap(parts))
+    .replaceAll('{{FOUND_SUMMARY}}', foundSummary.trim() || 'NONE')
+}
+
+/** One BACKUP request: concatenated missing-parts clip @ clipFps + one 20-minute
+ * movie window (default 1 fps, startOffset/endOffset on the SAME movie upload). */
+export async function runBackupMinuteFinderWindow(
+  ai: GoogleGenAI,
+  model: string,
+  clipUri: string,
+  movieUri: string,
+  startOffsetSec: number,
+  endOffsetSec: number,
+  clipFps: number,
+  parts: BackupPartSpec[],
+  foundSummary: string,
+): Promise<{ text: string; tokens: number | null }> {
+  try {
+    const resp = await ai.models.generateContent({
+      model,
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            { fileData: { fileUri: clipUri, mimeType: 'video/mp4' }, videoMetadata: { fps: clipFps } },
+            {
+              fileData: { fileUri: movieUri, mimeType: 'video/mp4' },
+              videoMetadata: { startOffset: `${Math.floor(startOffsetSec)}s`, endOffset: `${Math.ceil(endOffsetSec)}s` },
+            },
+            { text: buildBackupMinuteFinderPrompt(startOffsetSec, endOffsetSec, clipFps, parts, foundSummary) },
+          ] as never,
+        },
+      ],
+      config: GEN_CONFIG,
+    })
+    const text = resp.text
+    if (!text) throw new Error('Empty backup minute-finder response')
+    const tokens = resp.usageMetadata?.totalTokenCount ?? null
+    return { text, tokens }
+  } catch (err) {
+    throw classifyError(err)
+  }
+}
+
 /** Parse "h:mm:ss(.mmm)" / "mm:ss(.mmm)" / "m:ss" into seconds. */
 function parseTsFlexible(ts: string): number | null {
   const t = ts.trim()
@@ -263,15 +424,44 @@ function parseTsFlexible(ts: string): number | null {
 }
 
 export interface MinuteFinderHit {
+  /** S number (normal) / S number within the part (backup) */
   scene: number
+  /** "S3" (normal) or "P1-S2" (backup) */
+  sceneId: string
+  /** backup pass only: PART number this hit belongs to */
+  part?: number
   kind: 'match' | 'possible'
-  /** seconds within the SHORT video (from HISSA 1), if the scene line was found */
+  /** seconds within the SHORT video (from HISSA 1 / SHORT column), if resolvable */
   shortStart: number | null
   shortEnd: number | null
   /** seconds within the MOVIE COPY file (window offset already resolved) */
   fileStart: number
   fileEnd: number
   evidence: string
+}
+
+export interface MinuteFinderParse {
+  hits: MinuteFinderHit[]
+  matchMinutes: number[]
+  possibleMinutes: number[]
+  clockAbsolute: boolean
+  /** backup pass only: TYPE tag per PART from HISSA 1 (P1 → "MOVIE-FOOTAGE" etc.) */
+  partTypes?: Record<number, string>
+  /** backup pass only: PART STATUS line from HISSA 3 (P1 → "FOUND" / "NOT-HERE" / "NON-MOVIE" ...) */
+  partStatus?: Record<number, string>
+}
+
+/** Parse a BACKUP minute-finder response. Scene lines are `P<part>-S<n>`; the
+ * short range comes from the SHORT column (HISSA 2), else the HISSA 1 `short`
+ * column, else the clip time mapped through the part map. */
+export function parseBackupMinuteFinderOutput(
+  raw: string,
+  startOffset: number,
+  endOffset: number,
+  assumeRelative: boolean,
+  parts: BackupPartSpec[],
+): MinuteFinderParse {
+  return parseFinderGeneric(raw, startOffset, endOffset, assumeRelative, parts)
 }
 
 /**
@@ -292,19 +482,70 @@ export function parseMinuteFinderOutput(
   startOffset: number,
   endOffset: number,
   assumeRelative: boolean,
-): { hits: MinuteFinderHit[]; matchMinutes: number[]; possibleMinutes: number[]; clockAbsolute: boolean } {
+): MinuteFinderParse {
+  return parseFinderGeneric(raw, startOffset, endOffset, assumeRelative, null)
+}
+
+/** Map a clip-clock range onto short time through the part map (backup pass). */
+function clipToShort(parts: BackupPartSpec[], clipStart: number, clipEnd: number, preferPart?: number): { start: number; end: number } | null {
+  const mid = (clipStart + clipEnd) / 2
+  const p =
+    (preferPart !== undefined ? parts.find((x) => x.index === preferPart) : undefined) ||
+    parts.find((x) => mid >= x.clipStart - 0.5 && mid <= x.clipEnd + 0.5)
+  if (!p) return null
+  const off = p.shortStart - p.clipStart
+  const s = Math.max(p.shortStart, clipStart + off)
+  const e = Math.min(p.shortEnd, clipEnd + off)
+  return e > s ? { start: s, end: e } : { start: p.shortStart, end: p.shortEnd }
+}
+
+function parseFinderGeneric(
+  raw: string,
+  startOffset: number,
+  endOffset: number,
+  assumeRelative: boolean,
+  parts: BackupPartSpec[] | null,
+): MinuteFinderParse {
   const windowLen = endOffset - startOffset
   const clockAbsolute = /CLOCK\s*:\s*absolute/i.test(raw)
+  const backup = parts !== null
+  const TSX = String.raw`(\d+:\d{1,2}(?::\d{1,2})?(?:\.\d+)?)`
 
-  // HISSA 1: S<n>: mm:ss - mm:ss | ...
-  const shortMap = new Map<number, { start: number; end: number }>()
-  const sceneRe = /^\s*S(\d+)\s*:\s*(\d+:\d{1,2}(?::\d{1,2})?(?:\.\d+)?)\s*-\s*(\d+:\d{1,2}(?::\d{1,2})?(?:\.\d+)?)/gim
+  // HISSA 1 (normal): S<n>: mm:ss - mm:ss | ...
+  // HISSA 1 (backup): P<p>-S<n>: clip mm:ss - mm:ss | short mm:ss - mm:ss | TYPE: <tag> | ...
+  const shortMap = new Map<string, { start: number; end: number }>()
+  const partTypes: Record<number, string> = {}
+  const sceneRe = backup
+    ? new RegExp(String.raw`^\s*P(\d+)\s*-\s*S(\d+)\s*:\s*(?:clip\s*)?${TSX}\s*-\s*${TSX}([^\n]*)`, 'gim')
+    : new RegExp(String.raw`^\s*S(\d+)\s*:\s*${TSX}\s*-\s*${TSX}`, 'gim')
   let sm: RegExpExecArray | null
   while ((sm = sceneRe.exec(raw)) !== null) {
-    const s = parseTsFlexible(sm[2])
-    const e = parseTsFlexible(sm[3])
-    if (s === null || e === null || e <= s) continue
-    if (!shortMap.has(Number(sm[1]))) shortMap.set(Number(sm[1]), { start: s, end: e })
+    if (backup) {
+      const part = Number(sm[1])
+      const id = `P${part}-S${sm[2]}`
+      const rest = sm[5] || ''
+      const shortCol = rest.match(new RegExp(String.raw`short\s*:?\s*${TSX}\s*-\s*${TSX}`, 'i'))
+      let sw: { start: number; end: number } | null = null
+      if (shortCol) {
+        const s = parseTsFlexible(shortCol[1])
+        const e = parseTsFlexible(shortCol[2])
+        if (s !== null && e !== null && e > s) sw = { start: s, end: e }
+      }
+      if (!sw) {
+        const cs = parseTsFlexible(sm[3])
+        const ce = parseTsFlexible(sm[4])
+        if (cs !== null && ce !== null && ce > cs) sw = clipToShort(parts!, cs, ce, part)
+      }
+      if (sw && !shortMap.has(id)) shortMap.set(id, sw)
+      const type = rest.match(/TYPE\s*:\s*([A-Z][A-Z\-\s]*?)(?=\s*\||$)/i)?.[1]?.trim().toUpperCase()
+      if (type && !partTypes[part]) partTypes[part] = type.replace(/\s+/g, '-')
+    } else {
+      const s = parseTsFlexible(sm[2])
+      const e = parseTsFlexible(sm[3])
+      if (s === null || e === null || e <= s) continue
+      const id = `S${sm[1]}`
+      if (!shortMap.has(id)) shortMap.set(id, { start: s, end: e })
+    }
   }
 
   const inWindow = (t: number) => t >= startOffset - 5 && t <= endOffset + 5
@@ -327,14 +568,15 @@ export function parseMinuteFinderOutput(
   // The model may list SEVERAL ranges per scene (comma separated) when the same
   // short scene appears at multiple movie moments — every range becomes a hit.
   const hits: MinuteFinderHit[] = []
-  const TS = String.raw`(\d+:\d{1,2}(?::\d{1,2})?(?:\.\d+)?)`
-  const hitRe = new RegExp(
-    String.raw`S(\d+)\s*-->\s*(MATCH|POSSIBLE)\b([^\n]*)`,
-    'gi',
-  )
+  const TS = TSX
+  // Normal: "S3 --> MATCH | ..."; backup: "P1-S2 --> MATCH | SHORT a - b | ...".
+  const hitRe = backup
+    ? new RegExp(String.raw`P(\d+)\s*-\s*S(\d+)\s*-->\s*(MATCH|POSSIBLE)\b([^\n]*)`, 'gi')
+    : new RegExp(String.raw`(?<![A-Z0-9-])S(\d+)\s*-->\s*(MATCH|POSSIBLE)\b([^\n]*)`, 'gi')
   // Whole column text up to the next "|" (so all comma-separated ranges are included).
   const winColRe = /WINDOW\s*:?\s*([^|\n]+)/i
   const movColRe = /MOVIE\s*:?\s*([^|\n]+)/i
+  const shortColRe = /SHORT\s*:?\s*([^|\n]+)/i
   const rangeRe = new RegExp(String.raw`${TS}\s*(?:-|–|—|to)\s*${TS}`, 'gi')
   const evRe = /(?:EVIDENCE|REASON)\s*:\s*(.+)$/i
   const rangesIn = (col: string | undefined): Array<{ s: number | null; e: number | null }> => {
@@ -345,15 +587,28 @@ export function parseMinuteFinderOutput(
   }
   let hm: RegExpExecArray | null
   while ((hm = hitRe.exec(raw)) !== null) {
-    const scene = Number(hm[1])
-    const kind = hm[2].toUpperCase() === 'MATCH' ? 'match' : 'possible'
-    const rest = hm[3] || ''
+    const part = backup ? Number(hm[1]) : undefined
+    const scene = Number(backup ? hm[2] : hm[1])
+    const kindStr = backup ? hm[3] : hm[2]
+    const kind = kindStr.toUpperCase() === 'MATCH' ? 'match' : 'possible'
+    const rest = (backup ? hm[4] : hm[3]) || ''
+    const sceneId = backup ? `P${part}-S${scene}` : `S${scene}`
     const winRanges = rangesIn(rest.match(winColRe)?.[1])
     const movRanges = rangesIn(rest.match(movColRe)?.[1])
     const n = Math.max(winRanges.length, movRanges.length)
     if (n === 0) continue
     const evidence = (rest.match(evRe)?.[1] || '').trim().slice(0, 160)
-    const sw = shortMap.get(scene) || null
+    // Short range: SHORT column (backup) → HISSA 1 map → whole PART (backup).
+    let sw: { start: number; end: number } | null = null
+    if (backup) {
+      const sr = rangesIn(rest.match(shortColRe)?.[1])[0]
+      if (sr && sr.s !== null && sr.e !== null && sr.e > sr.s) sw = { start: sr.s, end: sr.e }
+    }
+    if (!sw) sw = shortMap.get(sceneId) || null
+    if (!sw && backup) {
+      const p = parts!.find((x) => x.index === part)
+      if (p) sw = { start: p.shortStart, end: p.shortEnd }
+    }
     for (let i = 0; i < n; i++) {
       // Pair WINDOW[i] with MOVIE[i]; if one column has fewer ranges, resolve from the other alone.
       const wr = winRanges[i]
@@ -366,6 +621,8 @@ export function parseMinuteFinderOutput(
       if (fileEnd < fileStart) continue
       hits.push({
         scene,
+        sceneId,
+        part,
         kind,
         shortStart: sw?.start ?? null,
         shortEnd: sw?.end ?? null,
@@ -382,7 +639,18 @@ export function parseMinuteFinderOutput(
     if (!m || /NONE/i.test(m[1])) return []
     return [...m[1].matchAll(/\d+/g)].map((x) => Number(x[0])).filter((n) => Number.isFinite(n))
   }
-  return { hits, matchMinutes: listOf('MATCH'), possibleMinutes: listOf('POSSIBLE'), clockAbsolute }
+  const out: MinuteFinderParse = { hits, matchMinutes: listOf('MATCH'), possibleMinutes: listOf('POSSIBLE'), clockAbsolute }
+  if (backup) {
+    out.partTypes = partTypes
+    // PART STATUS: P1=FOUND, P2=NOT-HERE, ...
+    const ps = raw.match(/PART\s*STATUS\s*:\s*([^\n]+)/i)?.[1]
+    if (ps) {
+      const status: Record<number, string> = {}
+      for (const m of ps.matchAll(/P(\d+)\s*=\s*<?([A-Z][A-Z\-]*)/gi)) status[Number(m[1])] = m[2].toUpperCase()
+      out.partStatus = status
+    }
+  }
+  return out
 }
 
 /** One chunk-map request: whole short video + one movie chunk, the SAME prompt every time.

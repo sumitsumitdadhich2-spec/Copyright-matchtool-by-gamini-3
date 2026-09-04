@@ -349,6 +349,69 @@ export async function extractClipPrecise(sourceFile: string, start: number, end:
   await verifyDuration(outFile, dur, SCAN_FPS)
 }
 
+// ---------- Backup minute finder clip (missing short parts, concatenated) ----------
+
+/** Black + silence inserted between concatenated parts so PART boundaries are unmistakable. */
+export const BACKUP_GAP_SEPARATOR_SEC = 1
+
+/**
+ * Build the BACKUP finder clip: every `[start, end)` range of the short is cut
+ * precisely (24 fps / 640px scan copy), and the pieces are concatenated with a
+ * 1 s black frame + silence between them (tpad/apad on each non-last piece, so
+ * the separator automatically has the right geometry). Single ffmpeg run.
+ *
+ * Returns the clip-clock offsets of each part — the caller writes them into
+ * the prompt's PART MAP (clip mm:ss = short mm:ss).
+ */
+export async function buildBackupClip(
+  shortFile: string,
+  ranges: Array<{ start: number; end: number }>,
+  outFile: string,
+  token?: CancelToken,
+): Promise<{ durationSec: number; sizeBytes: number; parts: Array<{ clipStart: number; clipEnd: number }> }> {
+  if (ranges.length === 0) throw new Error('buildBackupClip: no ranges')
+  fs.mkdirSync(path.dirname(outFile), { recursive: true })
+  const hasAudio = await probeHasAudio(shortFile)
+
+  const args: string[] = ['-y']
+  const parts: Array<{ clipStart: number; clipEnd: number }> = []
+  let clock = 0
+  for (const r of ranges) {
+    const s = Math.max(0, r.start)
+    const dur = Math.max(1, r.end - r.start)
+    args.push(...IN_FLAGS, '-ss', s.toFixed(3), '-t', dur.toFixed(3), '-i', shortFile)
+    parts.push({ clipStart: clock, clipEnd: clock + dur })
+    clock += dur + BACKUP_GAP_SEPARATOR_SEC
+  }
+  const total = clock - BACKUP_GAP_SEPARATOR_SEC
+
+  const chains: string[] = []
+  const labels: string[] = []
+  ranges.forEach((_, i) => {
+    const last = i === ranges.length - 1
+    const vpad = last ? '' : `,tpad=stop_mode=add:stop_duration=${BACKUP_GAP_SEPARATOR_SEC}:color=black`
+    chains.push(`[${i}:v]${SCAN_VF},setsar=1${vpad}[v${i}]`)
+    labels.push(`[v${i}]`)
+    if (hasAudio) {
+      const apad = last ? '' : `,apad=pad_dur=${BACKUP_GAP_SEPARATOR_SEC}`
+      chains.push(`[${i}:a]aresample=48000:async=1,aformat=channel_layouts=mono${apad}[a${i}]`)
+      labels.push(`[a${i}]`)
+    }
+  })
+  chains.push(`${labels.join('')}concat=n=${ranges.length}:v=1:a=${hasAudio ? 1 : 0}[v]${hasAudio ? '[a]' : ''}`)
+
+  args.push('-filter_complex', chains.join(';'), '-map', '[v]')
+  if (hasAudio) args.push('-map', '[a]', ...SCAN_AUDIO)
+  else args.push('-an')
+  args.push(...SCAN_VIDEO, ...OUT_FLAGS, '-movflags', '+faststart', outFile)
+
+  await runFfmpeg(args, { label: `backup clip (${ranges.length} part${ranges.length === 1 ? '' : 's'}, ${total.toFixed(1)}s)`, token })
+  await verifyDuration(outFile, total, SCAN_FPS)
+  const durationSec = await probeDuration(outFile).catch(() => total)
+  const sizeBytes = fs.statSync(outFile).size
+  return { durationSec, sizeBytes, parts }
+}
+
 // ---------- Generic slice → encode → join pipeline ----------
 
 export interface SliceEncodeSpec {

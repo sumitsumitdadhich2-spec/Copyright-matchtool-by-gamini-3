@@ -287,6 +287,7 @@ export type GeminiPrescanStatus =
   | 'preparing' // ffmpeg upload-copy of the trimmed movie
   | 'uploading' // short + movie copy → Gemini Files API (per key)
   | 'scanning' // 20-minute windows in flight
+  | 'backup' // BACKUP pass: missing short parts (high fps clip) re-searched in every window
   | 'starting_scan' // minutes found — kicking off the chunk scan
   | 'done'
   | 'error'
@@ -320,10 +321,64 @@ export interface GeminiPrescanUpload {
   uploadedAt: number
 }
 
+/** One PART of the backup clip = one missing short range (already padded ±2 s). */
+export interface GeminiBackupPart {
+  /** 1-based PART number as written in the prompt's PART MAP */
+  index: number
+  /** seconds within the CONCATENATED backup clip */
+  clipStart: number
+  clipEnd: number
+  /** ABSOLUTE seconds within the short video */
+  shortStart: number
+  shortEnd: number
+  /** model's TYPE tag from HISSA 1 (MOVIE-FOOTAGE / TEXT-CARD / LOGO-INTRO-OUTRO / NON-MOVIE) — best of all windows */
+  type?: string
+  /** final verdict across every backup window */
+  result?: 'found' | 'possible' | 'not_in_movie' | 'non_movie' | 'pending'
+}
+
+export type GeminiBackupStatus = 'idle' | 'skipped' | 'preparing' | 'uploading' | 'scanning' | 'done' | 'error'
+
+/**
+ * BACKUP MINUTE FINDER (second pass). Short parts that NO normal window matched
+ * (neither MATCH nor POSSIBLE) are cut out, concatenated (1 s black + silence
+ * between parts) and searched again in EVERY window at a HIGH fps. The movie
+ * side is unchanged (same 20-min windows @ 1 fps, same Files API upload).
+ */
+export interface GeminiBackupState {
+  status: GeminiBackupStatus
+  progress?: string
+  /** why the pass was skipped (short fully covered / gaps all < 4 s) */
+  skipReason?: string
+  parts: GeminiBackupPart[]
+  clip?: {
+    path: string
+    durationSec: number
+    sizeBytes: number
+    /** fps = clamp(floor(900 / clipSeconds), 5, 24) */
+    fps: number
+    /** JSON of the part list the clip was built from — a different gap set invalidates the clip */
+    signature: string
+  }
+  /** keyed by apiKeyHash — clip upload per key */
+  uploads: Record<string, { uri: string; name: string; uploadedAt: number }>
+  /** same offsets as the normal windows; queue order is smart (found range first) */
+  windows: GeminiPrescanWindow[]
+  /** FOUND_SUMMARY text given to the model as context */
+  foundSummary?: string
+  /** ABSOLUTE movie minutes the backup pass ADDED on top of the normal pass */
+  addedMinutes?: number[]
+  error?: string | null
+  startedAt?: number | null
+  finishedAt?: number | null
+}
+
 export interface GeminiPrescanState {
   status: GeminiPrescanStatus
   progress?: string
   windowLen: number
+  /** second pass for the short parts the normal windows missed */
+  backup?: GeminiBackupState
   movieCopy?: {
     path: string
     durationSec: number
