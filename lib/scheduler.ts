@@ -53,7 +53,8 @@ import {
   GeminiError,
   classifyError,
 } from './gemini'
-import { applyGroupMatches, sameShortSegment } from './candidate-pick'
+import { applyGroupMatches, bestRejectedCandidate, groupMatchOrigin, originTag, sameShortSegment } from './candidate-pick'
+import { computeShortCoverage, coverageLine } from './short-coverage'
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
@@ -1003,6 +1004,9 @@ class Scheduler {
           confirmedIndex: null,
           confirmedViaRescan: false,
           attempts: 0,
+          // PROVENANCE: gap-backup matches carry their origin; everything else is the chunk scan.
+          origin: m.origin ?? 'chunk',
+          originWindow: m.originWindow,
         }
         groups.push(g)
       }
@@ -1290,7 +1294,7 @@ class Scheduler {
           if (g.attempts >= MAX_GROUP_ATTEMPTS) {
             g.status = 'unverified'
             this.applyGroupResult(job, g)
-            addLog(scan, 'error', `Group ${g.id} (short ${ts(g.shortStart)}–${ts(g.shortEnd)}) could not be verified after ${g.attempts} attempts �� original match kept, flagged unverified: ${e.message.slice(0, 120)}`)
+            addLog(scan, 'error', `Group ${g.id} (short ${ts(g.shortStart)}–${ts(g.shortEnd)}) could not be verified after ${g.attempts} attempts — original match kept, flagged unverified: ${e.message.slice(0, 120)} ${originTag(groupMatchOrigin(g, false), g.candidates[0]?.chunkIndex, g.originWindow)}`)
           } else {
             job.verifyQueue.push(gi)
             addLog(scan, 'warn', `Verifier attempt ${g.attempts} failed for group ${g.id} on ${m.id} (key ${lane.idx}) — re-queued: ${e.message.slice(0, 120)}`)
@@ -1529,7 +1533,7 @@ class Scheduler {
           g.confirmedIndex = i
           g.confirmedViaRescan = false
           this.applyGroupResult(job, g)
-          addLog(scan, 'success', `CONFIRMED: short ${ts(g.shortStart)}–${ts(g.shortEnd)} = movie ${ts(c.movieStart)}–${ts(c.movieEnd)} (verifier: ${vm.id})`)
+          addLog(scan, 'success', `CONFIRMED: short ${ts(g.shortStart)}–${ts(g.shortEnd)} = movie ${ts(c.movieStart)}–${ts(c.movieEnd)} (verifier: ${vm.id}) ${originTag(groupMatchOrigin(g, false), c.chunkIndex, g.originWindow)}`)
           // EARLY-STOP QUICK-CONFIRM: is chunk ka 1 segment SAME confirm hua —
           // check karo ki current minute ke bache chunks ab skip ho sakte hain.
           this.checkEarlyStop(job)
@@ -1655,7 +1659,7 @@ class Scheduler {
           g.confirmedIndex = i
           g.confirmedViaRescan = true
           this.applyGroupResult(job, g)
-          addLog(scan, 'success', `CONFIRMED via rescan: short ${ts(g.shortStart)}–${ts(g.shortEnd)} = movie ${ts(c.rescanMovieStart!)}–${ts(c.rescanMovieEnd!)}`)
+          addLog(scan, 'success', `CONFIRMED via rescan: short ${ts(g.shortStart)}–${ts(g.shortEnd)} = movie ${ts(c.rescanMovieStart!)}–${ts(c.rescanMovieEnd!)} ${originTag(groupMatchOrigin(g, true), c.chunkIndex, g.originWindow)}`)
           // EARLY-STOP QUICK-CONFIRM: rescan-confirm bhi count hota hai.
           this.checkEarlyStop(job)
           return
@@ -1663,10 +1667,23 @@ class Scheduler {
         addLog(scan, 'warn', `Rescan window rejected by verifier — final DIFFERENT for candidate ${i} (chunk ${c.chunkIndex})`)
       }
 
-      // ----- STEP 3: everything failed — FINAL decision: not a match -----
+      // ----- STEP 3: everything failed — FINAL verdict: rejected, but KEPT in the merge -----
+      // User rule: rejected matches are "almost right" — a hole in the output is
+      // worse than the best candidate. applyGroupMatches keeps the best window
+      // flagged rejected=true; the user can swap it via "Make main".
       g.status = 'rejected'
       this.applyGroupResult(job, g)
-      addLog(scan, 'error', `REJECTED (final): short ${ts(g.shortStart)}–${ts(g.shortEnd)} — every candidate and rescan failed verification, removed from matches`)
+      const best = bestRejectedCandidate(g)
+      const bestWin = best
+        ? best.viaRescan
+          ? `${ts(best.c.rescanMovieStart!)}–${ts(best.c.rescanMovieEnd!)}`
+          : `${ts(best.c.movieStart)}–${ts(best.c.movieEnd)}`
+        : 'none'
+      addLog(
+        scan,
+        'error',
+        `REJECTED (kept): short ${ts(g.shortStart)}–${ts(g.shortEnd)} — verifier said DIFFERENT for every candidate; best candidate movie ${bestWin} kept in merge, flagged rejected ${originTag(groupMatchOrigin(g, best?.viaRescan ?? false), best?.c.chunkIndex, g.originWindow)}`,
+      )
       // EARLY-STOP SAFETY: is short window ki coverage toot gayi to us minute
       // ke early-stop-skipped chunks wapas scan queue me daalo (accuracy first).
       this.reviveEarlyStopSkipped(job, g)
@@ -1734,6 +1751,25 @@ class Scheduler {
     const allChunks = segments.flatMap((s) => s.chunks)
     const groups = scan.candidateGroups || []
     const now = Date.now()
+    const matches = scan.matches || []
+    // PROVENANCE totals: chunk / rescan / gap-backup / user.
+    const originCounts: Partial<Record<NonNullable<ChunkMatch['origin']>, number>> = {}
+    for (const m of matches) {
+      const o = m.origin ?? 'chunk'
+      originCounts[o] = (originCounts[o] || 0) + 1
+    }
+    const gapGroups = groups.filter((g) => g.origin === 'gap-backup')
+    const gb = scan.gapBackup
+    const gapBackup =
+      gapGroups.length > 0 || (gb && gb.status !== 'idle')
+        ? {
+            candidates: gb?.candidates.length ?? 0,
+            confirmed: gapGroups.filter((g) => g.status === 'confirmed').length,
+            rejectedKept: gapGroups.filter((g) => g.status === 'rejected' && !g.superseded).length,
+            unverified: gapGroups.filter((g) => g.status === 'unverified').length,
+            unresolved: gb?.parts.filter((p) => p.result === 'unresolved').length ?? 0,
+          }
+        : undefined
     return {
       totalScanTimeMs: (scan.finishedAt || now) - (scan.startedAt || now),
       chunksScanned: allChunks.filter((c) => c.status === 'match' || c.status === 'no_match').length,
@@ -1749,6 +1785,10 @@ class Scheduler {
       groupsRejected: groups.filter((g) => g.status === 'rejected').length,
       groupsUnverified: groups.filter((g) => g.status === 'unverified').length,
       groupsPending: groups.filter((g) => g.status === 'pending' || g.status === 'verifying' || g.status === 'rescanning').length,
+      matchesRejectedKept: matches.filter((m) => m.rejected === true && m.userPick !== true).length,
+      originCounts,
+      gapBackup,
+      coverage: computeShortCoverage(scan),
       // How the chunk set was chosen for THIS run (results themselves are 100% Gemini).
       prefilterMode:
         scan.prefilter?.mode === 'prefiltered' ? 'twelvelabs' : scan.geminiPrescan?.appliedMinutes?.length ? 'gemini' : 'full',
