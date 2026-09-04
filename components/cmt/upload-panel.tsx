@@ -71,6 +71,8 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
   const [job, setJob] = useState<Job | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [local, setLocal] = useState<Partial<Record<Kind, LocalPick>>>({})
+  /** Per card: the last pick was linked from an earlier scan (no upload). */
+  const [reused, setReused] = useState<Partial<Record<Kind, boolean>>>({})
   const abortRef = useRef<AbortController | null>(null)
   const scanIdRef = useRef<string | null>(selectedScanId)
 
@@ -99,6 +101,7 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
     if (selectedScanId !== scanIdRef.current) {
       scanIdRef.current = selectedScanId
       if (Object.keys(local).length) setLocal({})
+      if (Object.keys(reused).length) setReused({})
     }
   }
 
@@ -145,6 +148,7 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
     })
 
     // 1) INSTANT: show the file in the card right away from local metadata.
+    setReused((prev) => ({ ...prev, [kind]: false }))
     setLocal((prev) => ({ ...prev, [kind]: { name: file.name, size: file.size, duration: null } }))
     void readLocalDuration(file).then((d) => {
       setLocal((prev) => (prev[kind]?.name === file.name ? { ...prev, [kind]: { ...prev[kind]!, duration: d } } : prev))
@@ -154,7 +158,7 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
     void (async () => {
       try {
         const id = await ensureScan()
-        await uploadVideoStream({
+        const result = await uploadVideoStream({
           scanId: id,
           kind,
           file,
@@ -163,6 +167,7 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
         })
         setJob(null)
         setError(null)
+        setReused((prev) => ({ ...prev, [kind]: result.reused }))
         refresh()
       } catch (err) {
         setJob(null)
@@ -209,11 +214,12 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
           disabled={job !== null}
           onFile={(f) => uploadFile('short', f)}
           onCancel={cancelUpload}
-          extraInfo={
-            scan?.shortSegments && scan.shortSegments.length > 1
-              ? `${scan.shortSegments.length} minutes — scanned minute-by-minute`
-              : undefined
-          }
+          extraInfo={[
+            reused.short ? 'Already on server — linked instantly, nothing uploaded' : null,
+            scan?.shortSegments && scan.shortSegments.length > 1 ? `${scan.shortSegments.length} minutes — scanned minute-by-minute` : null,
+          ]
+            .filter(Boolean)
+            .join(' · ') || undefined}
         />
         <Dropzone
           kind="movie"
@@ -227,6 +233,7 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
           disabled={job !== null}
           onFile={(f) => uploadFile('movie', f)}
           onCancel={cancelUpload}
+          extraInfo={reused.movie ? 'Already on server — linked instantly, nothing uploaded' : undefined}
         />
       </div>
       {chunking && (
@@ -382,6 +389,9 @@ function UploadMeter({ p }: { p: UploadProgress }) {
     case 'finalizing':
       status = 'All bytes sent — server is verifying the file…'
       break
+    case 'linking':
+      status = 'Same video already on the server from an earlier scan — linking it, no upload needed…'
+      break
     default:
       status =
         p.resumedFrom > 0
@@ -410,16 +420,16 @@ function UploadMeter({ p }: { p: UploadProgress }) {
           aria-live="polite"
           aria-label="Current upload speed"
         >
-          {live ? fmtMbps(p.bytesPerSec!) : p.phase === 'uploading' ? 'measuring…' : '— Mbps'}
+          {live ? fmtMbps(p.bytesPerSec!) : p.phase === 'uploading' ? 'measuring…' : p.phase === 'linking' ? 'instant' : '— Mbps'}
         </span>
         {live && <span className="text-muted-foreground">{fmtBytes(p.bytesPerSec!)}/s</span>}
         <span className="text-muted-foreground">
           {fmtBytes(p.sent)} / {fmtBytes(p.total)}
         </span>
         {p.etaSec !== null && <span className="ml-auto text-muted-foreground">{fmtEta(p.etaSec)}</span>}
-        {p.phase === 'finalizing' && (
+        {(p.phase === 'finalizing' || p.phase === 'linking') && (
           <span className="ml-auto flex items-center gap-1 text-muted-foreground">
-            <Loader2 className="size-3 animate-spin" aria-hidden /> verifying
+            <Loader2 className="size-3 animate-spin" aria-hidden /> {p.phase === 'linking' ? 'linking' : 'verifying'}
           </span>
         )}
       </div>
