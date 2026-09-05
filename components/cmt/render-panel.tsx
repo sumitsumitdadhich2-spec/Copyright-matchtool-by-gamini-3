@@ -19,6 +19,14 @@ const RESOLUTIONS: { value: RenderResolution; label: string; defaultKbps: number
 ]
 
 const AUDIO_BITRATES = [96, 128, 192, 256, 320]
+const COMMON_FPS = [23.976, 24, 25, 29.97, 30, 50, 59.94, 60]
+
+function parseFpsDraft(value: string): number | null {
+  if (!value.trim()) return null
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed) || parsed < 1 || parsed > 120) return null
+  return Number(parsed.toFixed(3))
+}
 
 export function RenderPanel({ scan }: { scan: Scan }) {
   const segments = useMemo(() => buildRenderSegments(scan), [scan])
@@ -29,11 +37,18 @@ export function RenderPanel({ scan }: { scan: Scan }) {
   const coverage = useMemo(() => computeShortCoverage(scan), [scan])
 
   // ---- Render settings ----
-  const [resolution, setResolution] = useState<RenderResolution>('1080p')
-  const [fps, setFps] = useState(24)
-  const [videoKbps, setVideoKbps] = useState(9000)
-  const [audioKbps, setAudioKbps] = useState(192)
-  const [bitrateTouched, setBitrateTouched] = useState(false)
+  const previousSettings = scan.renderJob?.settings
+  const savedResolution = previousSettings?.resolution ?? '1080p'
+  const savedFps = previousSettings?.fps ?? 24
+  const savedVideoKbps = previousSettings?.videoBitrateKbps ?? 9000
+  const savedAudioKbps = previousSettings?.audioBitrateKbps ?? 192
+  const hasSavedSettings = Boolean(previousSettings)
+  const [resolution, setResolution] = useState<RenderResolution>(savedResolution)
+  const [fpsDraft, setFpsDraft] = useState(String(savedFps))
+  const [fpsError, setFpsError] = useState<string | null>(null)
+  const [videoKbps, setVideoKbps] = useState(savedVideoKbps)
+  const [audioKbps, setAudioKbps] = useState(savedAudioKbps)
+  const [bitrateTouched, setBitrateTouched] = useState(hasSavedSettings)
   const [actionBusy, setActionBusy] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
   // ---- Blob-based download state (never navigates the page) ----
@@ -42,6 +57,26 @@ export function RenderPanel({ scan }: { scan: Scan }) {
   const [downloadedBytes, setDownloadedBytes] = useState(0)
   const [downloadError, setDownloadError] = useState<string | null>(null)
   const { mutate } = useSWRConfig()
+
+  useEffect(() => {
+    setResolution(savedResolution)
+    setFpsDraft(String(savedFps))
+    setFpsError(null)
+    setVideoKbps(savedVideoKbps)
+    setAudioKbps(savedAudioKbps)
+    setBitrateTouched(hasSavedSettings)
+  }, [scan.id, savedResolution, savedFps, savedVideoKbps, savedAudioKbps, hasSavedSettings])
+
+  function commitFpsDraft(): number | null {
+    const parsed = parseFpsDraft(fpsDraft)
+    if (parsed === null) {
+      setFpsError('FPS 1 se 120 ke beech number hona chahiye; 23.976 aur 29.97 supported hain.')
+      return null
+    }
+    setFpsDraft(String(parsed))
+    setFpsError(null)
+    return parsed
+  }
 
   function pickResolution(r: RenderResolution) {
     setResolution(r)
@@ -56,13 +91,15 @@ export function RenderPanel({ scan }: { scan: Scan }) {
   const failed = job?.status === 'error'
 
   async function startRender() {
+    const selectedFps = commitFpsDraft()
+    if (selectedFps === null) return
     setActionBusy(true)
     setActionError(null)
     try {
       const res = await fetch(`/api/scans/${scan.id}/render`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ resolution, fps, videoBitrateKbps: videoKbps, audioBitrateKbps: audioKbps }),
+        body: JSON.stringify({ resolution, fps: selectedFps, videoBitrateKbps: videoKbps, audioBitrateKbps: audioKbps }),
       })
       if (!res.ok) {
         const j = await res.json().catch(() => ({}))
@@ -253,17 +290,28 @@ export function RenderPanel({ scan }: { scan: Scan }) {
             </select>
           </label>
           <label className="flex flex-col gap-1 text-xs">
-            <span className="text-muted-foreground">FPS (1–120)</span>
+            <span className="text-muted-foreground">FPS (1–120, decimals allowed)</span>
             <input
               type="number"
               min={1}
               max={120}
-              step={1}
-              value={fps}
-              onChange={(e) => setFps(Math.max(1, Math.min(120, Math.round(Number(e.target.value) || 24))))}
+              step="any"
+              list={`render-fps-${scan.id}`}
+              value={fpsDraft}
+              onChange={(event) => {
+                setFpsDraft(event.target.value)
+                setFpsError(null)
+              }}
+              onBlur={() => void commitFpsDraft()}
               disabled={rendering}
+              aria-invalid={Boolean(fpsError)}
+              aria-describedby={fpsError ? `render-fps-error-${scan.id}` : undefined}
               className="rounded-md border border-input bg-background px-2 py-1.5 font-mono text-xs"
             />
+            <datalist id={`render-fps-${scan.id}`}>
+              {COMMON_FPS.map((rate) => <option key={rate} value={rate} />)}
+            </datalist>
+            {fpsError && <span id={`render-fps-error-${scan.id}`} className="text-destructive">{fpsError}</span>}
           </label>
           <label className="flex flex-col gap-1 text-xs">
             <span className="text-muted-foreground">Video bitrate (kbps)</span>
@@ -321,7 +369,7 @@ export function RenderPanel({ scan }: { scan: Scan }) {
             </button>
           )}
           <span className="ml-auto font-mono text-[11px] text-muted-foreground">
-            {resolution} · {fps}fps · {videoKbps}k video / {audioKbps}k audio
+            {resolution} · {parseFpsDraft(fpsDraft) ?? '—'}fps · {videoKbps}k video / {audioKbps}k audio
           </span>
         </div>
 

@@ -350,7 +350,7 @@ export async function finalizeUploadedMedia(
             s.shortSegmentingProgress = pct
             saveScan(s)
           }
-        })
+        }, { owner: id })
         const s = getScan(id)
         if (s) {
           s.shortSegmentingProgress = 100

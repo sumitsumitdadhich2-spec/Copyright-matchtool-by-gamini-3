@@ -95,6 +95,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
         },
         isFull ? 0 : start,
         isFull ? undefined : end,
+        { owner: id },
       )
       const s = getScan(id)
       if (s) {

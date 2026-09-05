@@ -23,6 +23,7 @@ import { CHUNK_SECONDS } from './models'
 interface JobInfo {
   id: number
   label: string
+  owner: string
   startedAt: number
 }
 
@@ -31,7 +32,7 @@ interface PoolState {
   engines: number
   active: number
   nextId: number
-  queue: Array<{ start: () => void; token?: CancelToken }>
+  queue: Array<{ start: () => void; token?: CancelToken; owner: string }>
   jobs: Map<number, JobInfo>
   booted: boolean
 }
@@ -83,7 +84,7 @@ export interface PoolSnapshot {
   engines: number
   active: number
   queued: number
-  jobs: Array<{ label: string; runningMs: number }>
+  jobs: Array<{ label: string; owner: string; runningMs: number }>
 }
 
 /** Live pool stats for /api/health and /api/settings. */
@@ -95,7 +96,7 @@ export function poolSnapshot(): PoolSnapshot {
     engines: p.engines,
     active: p.active,
     queued: p.queue.length,
-    jobs: [...p.jobs.values()].map((j) => ({ label: j.label, runningMs: now - j.startedAt })),
+    jobs: [...p.jobs.values()].map((j) => ({ label: j.label, owner: j.owner, runningMs: now - j.startedAt })),
   }
 }
 
@@ -140,7 +141,7 @@ export class CancelToken {
 
 // ---------- Slot acquisition ----------
 
-function acquire(token?: CancelToken): Promise<void> {
+function acquire(owner: string, token?: CancelToken): Promise<void> {
   const p = pool()
   if (token?.cancelled) return Promise.reject(new FfmpegCancelled())
   if (p.active < p.engines) {
@@ -150,11 +151,11 @@ function acquire(token?: CancelToken): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     const entry = {
       token,
+      owner,
       start: () => {
         if (token?.cancelled) {
           reject(new FfmpegCancelled())
-          // give the slot to the next waiter
-          release()
+          release(owner)
           return
         }
         resolve()
@@ -164,9 +165,13 @@ function acquire(token?: CancelToken): Promise<void> {
   })
 }
 
-function release() {
+function release(completedOwner: string) {
   const p = pool()
-  const next = p.queue.shift()
+  // If another scan/task is waiting, hand the next free engine to it before
+  // continuing the completed owner's backlog. This keeps all scans moving.
+  const otherOwnerIndex = p.queue.findIndex((entry) => entry.owner !== completedOwner)
+  const nextIndex = otherOwnerIndex >= 0 ? otherOwnerIndex : 0
+  const [next] = p.queue.splice(nextIndex, 1)
   if (next) {
     // hand the slot straight over (active count unchanged)
     next.start()
@@ -180,6 +185,8 @@ function release() {
 export interface RunOptions {
   /** Shown in /api/health and logs. */
   label?: string
+  /** Scan id or stable task id used to rotate engines fairly across callers. */
+  owner?: string
   token?: CancelToken
   /** Raw stderr chunks (progress lines). */
   onStderr?: (chunk: string) => void
@@ -200,10 +207,11 @@ function withSingleThread(args: string[]): string[] {
  */
 export async function runFfmpeg(args: string[], opts: RunOptions = {}): Promise<void> {
   const bin = await getFfmpegPath()
-  await acquire(opts.token)
+  const owner = opts.owner || 'shared'
+  await acquire(owner, opts.token)
   const p = pool()
   const id = p.nextId++
-  const info: JobInfo = { id, label: opts.label || 'ffmpeg', startedAt: Date.now() }
+  const info: JobInfo = { id, label: opts.label || 'ffmpeg', owner, startedAt: Date.now() }
   p.jobs.set(id, info)
   try {
     await new Promise<void>((resolve, reject) => {
@@ -225,7 +233,7 @@ export async function runFfmpeg(args: string[], opts: RunOptions = {}): Promise<
     })
   } finally {
     p.jobs.delete(id)
-    release()
+    release(owner)
   }
 }
 
