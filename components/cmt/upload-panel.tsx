@@ -27,6 +27,8 @@ interface LocalPick {
 }
 
 interface Job {
+  key: string
+  scanId: string | null
   kind: Kind
   progress: UploadProgress
 }
@@ -68,18 +70,19 @@ function readLocalDuration(file: File): Promise<number | null> {
 // the instant the last byte lands; the S3 backup happens in the background.
 
 export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Props) {
-  const [job, setJob] = useState<Job | null>(null)
+  const [jobs, setJobs] = useState<Job[]>([])
   const [error, setError] = useState<string | null>(null)
-  const [local, setLocal] = useState<Partial<Record<Kind, LocalPick>>>({})
-  /** Per card: the last pick was linked from an earlier scan (no upload). */
-  const [reused, setReused] = useState<Partial<Record<Kind, boolean>>>({})
-  const abortRef = useRef<AbortController | null>(null)
+  const [local, setLocal] = useState<Record<string, LocalPick>>({})
+  const [reused, setReused] = useState<Record<string, boolean>>({})
+  const controllers = useRef(new Map<string, AbortController>())
   const scanIdRef = useRef<string | null>(selectedScanId)
+  const creatingScanRef = useRef<Promise<string> | null>(null)
 
-  // Closing / reloading the tab mid-upload kills the stream. The upload would
-  // resume from the server's last byte if the same file is picked again, but
-  // warn first so it does not happen by accident.
-  const uploading = job !== null
+  useEffect(() => {
+    scanIdRef.current = selectedScanId
+  }, [selectedScanId])
+
+  const uploading = jobs.length > 0
   useEffect(() => {
     if (!uploading) return
     const warn = (e: BeforeUnloadEvent) => {
@@ -89,38 +92,22 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
     window.addEventListener('beforeunload', warn)
     return () => window.removeEventListener('beforeunload', warn)
   }, [uploading])
-  // Follow the dashboard's selection: when the user picks "New scan" (null) or
-  // another history entry, drop any stale id so uploads never land in an old scan.
-  const prevSelectedRef = useRef<string | null>(selectedScanId)
-  if (prevSelectedRef.current !== selectedScanId) {
-    prevSelectedRef.current = selectedScanId
-    // When the dashboard switches to a scan OTHER than the one we are
-    // uploading into (e.g. user clicked history / "New scan"), the local picks
-    // belong to the old scan — clear them. A switch to our own freshly created
-    // scan id (from ensureScan → onScanCreated) keeps them.
-    if (selectedScanId !== scanIdRef.current) {
-      scanIdRef.current = selectedScanId
-      if (Object.keys(local).length) setLocal({})
-      if (Object.keys(reused).length) setReused({})
-    }
-  }
 
   async function ensureScan(): Promise<string> {
     if (scanIdRef.current) return scanIdRef.current
-    const res = await fetch('/api/scans', { method: 'POST' })
-    if (res.status === 401) throw new UploadError('Session expired — please log in again', true)
-    let j: { id?: unknown; error?: string } = {}
-    try {
-      j = (await res.json()) as { id?: unknown; error?: string }
-    } catch {
-      // handled below
-    }
-    if (!res.ok || typeof j.id !== 'string' || j.id.length === 0) {
-      throw new UploadError(j.error || `Could not create a scan (HTTP ${res.status}). Please try again.`, true)
-    }
-    scanIdRef.current = j.id
-    onScanCreated(j.id)
-    return j.id
+    if (creatingScanRef.current) return creatingScanRef.current
+    creatingScanRef.current = (async () => {
+      const res = await fetch('/api/scans', { method: 'POST' })
+      if (res.status === 401) throw new UploadError('Session expired — please log in again', true)
+      const j = (await res.json().catch(() => ({}))) as { id?: unknown; error?: string }
+      if (!res.ok || typeof j.id !== 'string' || j.id.length === 0) throw new UploadError(j.error || `Could not create a scan (HTTP ${res.status}). Please try again.`, true)
+      scanIdRef.current = j.id
+      onScanCreated(j.id)
+      return j.id
+    })().finally(() => {
+      creatingScanRef.current = null
+    })
+    return creatingScanRef.current
   }
 
   function uploadFile(kind: Kind, file: File) {
@@ -128,73 +115,66 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
       setError('Only MP4, MOV, MKV or WebM video files are supported')
       return
     }
-    setError(null)
+    const initialScanId = scanIdRef.current
+    const tempKey = `${initialScanId ?? 'new'}/${kind}`
     const controller = new AbortController()
-    abortRef.current = controller
-    setJob({
-      kind,
-      progress: {
-        phase: 'probing',
-        sent: 0,
-        total: file.size,
-        bytesPerSec: null,
-        peakBytesPerSec: 0,
-        avgBytesPerSec: null,
-        etaSec: null,
-        reconnects: 0,
-        resumedFrom: 0,
-        offline: false,
-      },
-    })
+    controllers.current.set(tempKey, controller)
+    setError(null)
+    const initialProgress: UploadProgress = { phase: 'probing', sent: 0, total: file.size, bytesPerSec: null, peakBytesPerSec: 0, avgBytesPerSec: null, etaSec: null, reconnects: 0, resumedFrom: 0, offline: false }
+    setJobs((previous) => [...previous.filter((item) => item.key !== tempKey), { key: tempKey, scanId: initialScanId, kind, progress: initialProgress }])
+    setReused((previous) => ({ ...previous, [tempKey]: false }))
+    setLocal((previous) => ({ ...previous, [tempKey]: { name: file.name, size: file.size, duration: null } }))
+    void readLocalDuration(file).then((duration) => setLocal((previous) => previous[tempKey]?.name === file.name ? { ...previous, [tempKey]: { ...previous[tempKey], duration } } : previous))
 
-    // 1) INSTANT: show the file in the card right away from local metadata.
-    setReused((prev) => ({ ...prev, [kind]: false }))
-    setLocal((prev) => ({ ...prev, [kind]: { name: file.name, size: file.size, duration: null } }))
-    void readLocalDuration(file).then((d) => {
-      setLocal((prev) => (prev[kind]?.name === file.name ? { ...prev, [kind]: { ...prev[kind]!, duration: d } } : prev))
-    })
-
-    // 2) BACKGROUND upload — one stream, auto-resume.
     void (async () => {
+      let key = tempKey
       try {
         const id = await ensureScan()
+        key = `${id}/${kind}`
+        if (key !== tempKey) {
+          controllers.current.delete(tempKey)
+          controllers.current.set(key, controller)
+          setJobs((previous) => previous.map((item) => item.key === tempKey ? { ...item, key, scanId: id } : item))
+          setLocal((previous) => ({ ...previous, [key]: previous[tempKey] }))
+          setReused((previous) => ({ ...previous, [key]: previous[tempKey] || false }))
+        }
         const result = await uploadVideoStream({
           scanId: id,
           kind,
           file,
           signal: controller.signal,
-          onProgress: (progress) => setJob((j) => (j && j.kind === kind ? { kind, progress } : j)),
+          onProgress: (progress) => setJobs((previous) => previous.map((item) => item.key === key ? { ...item, progress } : item)),
         })
-        setJob(null)
-        setError(null)
-        setReused((prev) => ({ ...prev, [kind]: result.reused }))
+        setJobs((previous) => previous.filter((item) => item.key !== key))
+        setReused((previous) => ({ ...previous, [key]: result.reused }))
         refresh()
       } catch (err) {
-        setJob(null)
-        setLocal((prev) => {
-          const copy = { ...prev }
-          delete copy[kind]
-          return copy
-        })
-        if (!controller.signal.aborted) {
-          setError(err instanceof Error ? err.message : 'Upload failed. Please try again.')
-        }
+        setJobs((previous) => previous.filter((item) => item.key !== key && item.key !== tempKey))
+        if (!controller.signal.aborted) setError(err instanceof Error ? err.message : 'Upload failed. Please try again.')
         refresh()
       } finally {
-        if (abortRef.current === controller) abortRef.current = null
+        controllers.current.delete(key)
+        controllers.current.delete(tempKey)
       }
     })()
   }
 
-  function cancelUpload() {
-    abortRef.current?.abort()
+  function cancelUpload(kind: Kind) {
+    const visible = jobs.find((item) => item.scanId === selectedScanId && item.kind === kind)
+    if (visible) controllers.current.get(visible.key)?.abort()
   }
 
   const chunking = scan?.status === 'chunking'
 
-  // Prefer the server's confirmed data; fall back to the instant local pick.
-  const shortLocal = local.short
-  const movieLocal = local.movie
+  // Every card reads only its selected scan + media-kind job. Uploads for other
+  // history entries keep running in the same component without leaking progress.
+  const scope = selectedScanId ?? 'new'
+  const shortKey = `${scope}/short`
+  const movieKey = `${scope}/movie`
+  const shortLocal = local[shortKey]
+  const movieLocal = local[movieKey]
+  const shortJob = jobs.find((item) => item.key === shortKey) ?? null
+  const movieJob = jobs.find((item) => item.key === movieKey) ?? null
   const shortServer = Boolean(scan?.shortName && scan?.shortDuration)
   const movieServer = Boolean(scan?.movieName && scan?.movieDuration)
 
@@ -210,12 +190,12 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
           name={shortServer ? scan?.shortName : shortLocal?.name}
           duration={shortServer ? scan?.shortDuration : shortLocal?.duration}
           size={shortServer ? scan?.shortSize : shortLocal?.size}
-          progress={job?.kind === 'short' ? job.progress : null}
-          disabled={job !== null}
+          progress={shortJob?.progress ?? null}
+          disabled={shortJob !== null || shortServer}
           onFile={(f) => uploadFile('short', f)}
-          onCancel={cancelUpload}
+          onCancel={() => cancelUpload('short')}
           extraInfo={[
-            reused.short ? 'Already on server — linked instantly, nothing uploaded' : null,
+            reused[shortKey] ? 'Already on server — linked instantly, nothing uploaded' : null,
             scan?.shortSegments && scan.shortSegments.length > 1 ? `${scan.shortSegments.length} minutes — scanned minute-by-minute` : null,
           ]
             .filter(Boolean)
@@ -229,11 +209,11 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
           name={movieServer ? scan?.movieName : movieLocal?.name}
           duration={movieServer ? scan?.movieDuration : movieLocal?.duration}
           size={movieServer ? scan?.movieSize : movieLocal?.size}
-          progress={job?.kind === 'movie' ? job.progress : null}
-          disabled={job !== null}
+          progress={movieJob?.progress ?? null}
+          disabled={movieJob !== null || movieServer}
           onFile={(f) => uploadFile('movie', f)}
-          onCancel={cancelUpload}
-          extraInfo={reused.movie ? 'Already on server — linked instantly, nothing uploaded' : undefined}
+          onCancel={() => cancelUpload('movie')}
+          extraInfo={reused[movieKey] ? 'Already on server — linked instantly, nothing uploaded' : undefined}
         />
       </div>
       {chunking && (

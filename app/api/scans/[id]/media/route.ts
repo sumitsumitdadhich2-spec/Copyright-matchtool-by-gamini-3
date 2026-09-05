@@ -2,17 +2,19 @@ import fs from 'node:fs'
 import { getScan, SCANS_DIR } from '@/lib/store'
 import { restoreScans } from '@/lib/scan-store'
 import { ensureLocalMedia } from '@/lib/media'
+import { getSession } from '@/lib/users'
 
 export const runtime = 'nodejs'
 
 /** Serve uploaded videos with HTTP Range support so previews are seekable.
  *  If the local file is missing it is pulled back from S3 first. */
 export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }) {
+  const session = await getSession()
+  if (!session) return new Response('Unauthorized', { status: 401 })
   const { id } = await ctx.params
-  if (!getScan(id)) {
-    await restoreScans(SCANS_DIR)
-    if (!getScan(id)) return new Response('Not found', { status: 404 })
-  }
+  if (!getScan(id)) await restoreScans(SCANS_DIR)
+  const scan = getScan(id)
+  if (!scan || (session.role !== 'admin' && scan.ownerUsername !== session.username)) return new Response('Not found', { status: 404 })
 
   const url = new URL(req.url)
   const kind = url.searchParams.get('kind') === 'short' ? 'short' : 'movie'

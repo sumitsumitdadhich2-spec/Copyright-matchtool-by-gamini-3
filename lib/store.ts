@@ -84,12 +84,24 @@ export function apiKeyHash(apiKey: string): string {
 }
 
 // ---------- Per-model daily request counters ----------
-// Keyed by model + UTC date + API key hash. Persist across restarts/reloads.
+// Gemini daily quotas reset at midnight Pacific Time. Intl handles PST/PDT,
+// including both daylight-saving boundaries, without relying on server locale.
 
 const COUNTERS_FILE = path.join(DATA_DIR, 'counters.json')
 
+export function geminiUsageDay(now: Date = new Date()): string {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Los_Angeles',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(now)
+  const value = (type: Intl.DateTimeFormatPartTypes) => parts.find((part) => part.type === type)?.value ?? ''
+  return `${value('year')}-${value('month')}-${value('day')}`
+}
+
 function todayKey(): string {
-  return new Date().toISOString().slice(0, 10)
+  return geminiUsageDay()
 }
 
 function counterKey(model: string, apiKey: string): string {

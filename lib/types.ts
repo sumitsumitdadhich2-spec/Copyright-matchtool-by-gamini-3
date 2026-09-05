@@ -462,83 +462,88 @@ export interface ShortCoverage {
 
 export type GapBackupStatus =
   | 'idle'
-  | 'skipped' // coverage already 100 % (or gaps too small)
-  | 'cutting' // ffmpeg: concatenated gap clip from the short
-  | 'uploading' // gap clip → Gemini Files API, once per key
-  | 'searching' // every 20-min movie window in flight
-  | 'chunking' // found minutes → chunk-mapping restricted to the gap range
-  | 'verifying' // gap candidate groups in the normal verifier (+ rescan)
+  | 'skipped'
+  | 'cutting'
+  | 'uploading'
+  | 'searching'
+  | 'awaiting_review'
   | 'done'
+  | 'stopped'
   | 'error'
 
-/** One PART of the gap clip = one true gap of the short (already padded ±2 s). */
+/** One exact uncovered range. Finder results remain pending until the user reviews them. */
 export interface GapBackupPart {
-  /** 1-based PART number as written in the prompt's PART MAP */
   index: number
-  /** ABSOLUTE seconds within the short video (padded) */
+  minuteIndex: number
   shortStart: number
   shortEnd: number
-  /** the UNPADDED gap this part was built for */
   gapStart: number
   gapEnd: number
-  /** seconds within the CONCATENATED gap clip */
   clipStart: number
   clipEnd: number
-  /** best FOUND result across every window (movie seconds, ORIGINAL clock) */
-  found?: { movieStart: number; movieEnd: number; windowIndex: number; confidence: number; reason: string }
-  /** final verdict after chunk scan + verifier */
-  result?: 'pending' | 'confirmed' | 'rejected_kept' | 'unverified' | 'unresolved'
+  result?: 'pending' | 'found' | 'accepted' | 'rejected' | 'unresolved'
 }
 
-/** Candidate produced by the gap-backup finder before chunk scan + verification. */
 export interface GapBackupCandidate {
+  id: string
   part: number
   shortStart: number
   shortEnd: number
-  /** ABSOLUTE original-movie seconds */
   movieStart: number
   movieEnd: number
   source: 'gap-backup'
-  windowIndex: number
+  chunkIndex: number
+  model: string
   confidence: number
   reason: string
+  review: 'pending' | 'accepted' | 'rejected'
+  createdAt: number
 }
 
-/**
- * GAP BACKUP PASS state (mirrors GeminiBackupState). Runs automatically at the
- * end of a scan when coverage < 100 %, or manually from the scan page.
- * Persisted on every state change so Resume continues where it stopped.
- */
+export interface GapBackupRequest {
+  id: string
+  minuteIndex: number
+  batch: number
+  chunkIndex: number
+  chunkStart: number
+  chunkEnd: number
+  lane: string
+  model: string
+  status: 'queued' | 'uploading' | 'running' | 'done' | 'failed' | 'cancelled'
+  raw?: string
+  tokens?: number
+  matches?: number
+  error?: string
+  startedAt?: number
+  finishedAt?: number
+}
+
+export interface GapBackupMinute {
+  index: number
+  start: number
+  end: number
+  status: 'queued' | 'preparing' | 'uploading' | 'searching' | 'awaiting_review' | 'done' | 'failed'
+  partIds: number[]
+  candidateChunks: number[]
+  completedChunks: number[]
+  currentBatch?: number[]
+  clip?: { path: string; durationSec: number; sizeBytes: number; fps: 24 }
+  error?: string
+}
+
+/** Durable, manual-only missing-scene finder state. */
 export interface GapBackupState {
   status: GapBackupStatus
   progress?: string
-  skipReason?: string
-  /** how many times the pass ran (auto + manual) */
   runs?: number
   parts: GapBackupPart[]
-  clip?: {
-    path: string
-    durationSec: number
-    sizeBytes: number
-    /** fps = clamp(floor(900 / clipSeconds), 5, 24) — same formula as the minute finder backup */
-    fps: number
-    /** JSON of the gap list the clip was built from — a different gap set invalidates the clip */
-    signature: string
-  }
-  /** keyed by apiKeyHash — gap clip upload per key */
-  uploads: Record<string, { uri: string; name: string; uploadedAt: number }>
-  /** keyed by apiKeyHash — movie copy upload per key (reuses the minute finder's when ACTIVE) */
-  movieUploads: Record<string, { uri: string; name: string; uploadedAt: number }>
-  /** 20-minute windows of the movie copy (same slicing as the minute finder) */
-  windows: GeminiPrescanWindow[]
-  /** hint text given to the model ({{CONTEXT}}) */
-  context?: string
-  /** candidates parsed from FOUND lines (best per part, every window) */
+  minutes: GapBackupMinute[]
+  requests: GapBackupRequest[]
   candidates: GapBackupCandidate[]
-  /** matches this pass ADDED to scan.matches (after chunk scan + verification) */
   addedMatches: ChunkMatch[]
-  /** seconds of the short recovered by this pass (coverage delta) */
-  recoveredSec?: number
+  requestCount?: number
+  tokenCount?: number
+  activeBatch?: number[]
   error?: string | null
   startedAt?: number | null
   finishedAt?: number | null

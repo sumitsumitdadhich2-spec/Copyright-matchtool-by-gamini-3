@@ -684,6 +684,88 @@ export async function mapChunkRequest(
   }
 }
 
+// ---------- Manual missing-scene finder ----------
+
+export interface GapFinderPartSpec {
+  id: number
+  shortStart: number
+  shortEnd: number
+  clipStart: number
+  clipEnd: number
+}
+
+function gapFinderPrompt(parts: GapFinderPartSpec[], chunkStart: number, chunkEnd: number): string {
+  const partMap = parts.map((part) =>
+    `P${part.id}: clip ${formatPromptTs(part.clipStart)}-${formatPromptTs(part.clipEnd)} | short ${formatPromptTs(part.shortStart)}-${formatPromptTs(part.shortEnd)}`,
+  ).join('\n')
+  return `You are a strict forensic video matcher. Video 1 is a 24-fps clip containing ONLY unresolved ranges from one short-video minute. Video 2 is one 24-fps chunk from the original movie (${formatPromptTs(chunkStart)}-${formatPromptTs(chunkEnd)} on the original movie clock).
+
+PART MAP:\n${partMap}
+
+For EACH part, inspect dialogue, action order, camera shot, costume, props and background. Similar actors or location are NOT enough. A MATCH requires the same recording and same moment with concrete dialogue/action/frame evidence. Never calculate timestamps from an offset; read them from Video 2. If evidence is vague, partial, coincidental, or the exact footage is absent, return NOT_FOUND.
+
+Output exactly one final result line per part after your analysis:
+MATCH P<id> | SHORT mm:ss.mmm-mm:ss.mmm | MOVIE mm:ss.mmm-mm:ss.mmm | EVIDENCE: <exact dialogue/action/frame evidence>
+or
+NOT_FOUND P<id> | REASON: <concrete reason>
+Movie timestamps MUST use the ORIGINAL movie clock inside ${formatPromptTs(chunkStart)}-${formatPromptTs(chunkEnd)}. Do not omit any part.`
+}
+
+function formatPromptTs(sec: number): string {
+  const value = Math.max(0, sec)
+  const minutes = Math.floor(value / 60)
+  const rest = value - minutes * 60
+  return `${String(minutes).padStart(2, '0')}:${rest.toFixed(3).padStart(6, '0')}`
+}
+
+export async function runGapFinderChunk(
+  ai: GoogleGenAI,
+  model: string,
+  shortClipUri: string,
+  movieChunkUri: string,
+  parts: GapFinderPartSpec[],
+  chunkStart: number,
+  chunkEnd: number,
+): Promise<{ text: string; tokens: number | null }> {
+  try {
+    const resp = await ai.models.generateContent({
+      model,
+      contents: [{
+        role: 'user',
+        parts: [
+          { fileData: { fileUri: shortClipUri, mimeType: 'video/mp4' }, videoMetadata: { fps: SCAN_FPS } },
+          { fileData: { fileUri: movieChunkUri, mimeType: 'video/mp4' }, videoMetadata: { fps: SCAN_FPS } },
+          { text: gapFinderPrompt(parts, chunkStart, chunkEnd) },
+        ] as never,
+      }],
+      config: GEN_CONFIG,
+    })
+    const text = resp.text
+    if (!text) throw new Error('Empty missing-scene finder response')
+    return { text, tokens: resp.usageMetadata?.totalTokenCount ?? null }
+  } catch (err) {
+    throw classifyError(err)
+  }
+}
+
+export function parseGapFinderOutput(raw: string, validParts: Set<number>, chunkStart: number, chunkEnd: number) {
+  const hits: Array<{ part: number; shortStart: number; shortEnd: number; movieStart: number; movieEnd: number; evidence: string }> = []
+  const pattern = /MATCH\s+P(\d+)\s*\|\s*SHORT\s+([\d:.]+)\s*-\s*([\d:.]+)\s*\|\s*MOVIE\s+([\d:.]+)\s*-\s*([\d:.]+)\s*\|\s*EVIDENCE:\s*(.+)/gi
+  for (const match of raw.matchAll(pattern)) {
+    const part = Number(match[1])
+    const shortStart = parseTs(match[2])
+    const shortEnd = parseTs(match[3])
+    const movieStart = parseTs(match[4])
+    const movieEnd = parseTs(match[5])
+    const evidence = match[6].trim().slice(0, 600)
+    if (!validParts.has(part) || shortStart === null || shortEnd === null || movieStart === null || movieEnd === null) continue
+    if (shortEnd <= shortStart || movieEnd <= movieStart || movieStart < chunkStart - 0.5 || movieEnd > chunkEnd + 0.5) continue
+    if (evidence.length < 12 || /vague|similar scene|maybe|possibly/i.test(evidence)) continue
+    hits.push({ part, shortStart, shortEnd, movieStart, movieEnd, evidence })
+  }
+  return hits
+}
+
 // ---------- Verifier (candidate confirmation) ----------
 
 /** Special prompt for the VERIFIER: two tiny clips, decide SAME vs DIFFERENT.
