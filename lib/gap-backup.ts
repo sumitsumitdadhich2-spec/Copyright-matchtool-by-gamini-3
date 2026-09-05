@@ -2,24 +2,20 @@ import 'server-only'
 
 import fs from 'node:fs'
 import path from 'node:path'
-import type { GoogleGenAI } from '@google/genai'
-import { getScan, saveScan, addLog, apiKeyHash, scanMediaDir } from './store'
+import { getScan, saveScan, addLog, apiKeyHash, scanMediaDir, getModelUsage, incrementModelUsage } from './store'
 import { ensureLocalMedia, localMediaPath } from './media'
-import { buildBackupClip, preparePrescanMovieCopy } from './ffmpeg'
+import { buildBackupClip, chunkPath, extractClipPrecise } from './ffmpeg'
 import { CHUNK_MODEL_POOL } from './models'
-import { getClient, uploadVideo, runBackupMinuteFinderWindow, parseBackupMinuteFinderOutput, backupClipFps, type BackupPartSpec } from './gemini'
-import { computeShortCoverage, missingRanges } from './short-coverage'
+import { deleteFileQuiet, getClient, parseGapFinderOutput, runGapFinderChunk, uploadVideo, type GapFinderPartSpec } from './gemini'
+import { coverageFromRanges, gapsOf, mergeRanges, shortTotalOf } from './short-coverage'
 import { scheduler } from './scheduler'
-import type { GapBackupCandidate, GapBackupPart, GapBackupState, GeminiPrescanWindow, Scan } from './types'
+import type { ChunkMatch, GapBackupCandidate, GapBackupMinute, GapBackupPart, GapBackupRequest, GapBackupState, Scan, ShortRange } from './types'
 
-const WINDOW_SEC = 1200
-const PAD_SEC = 2
-const MIN_GAP_SEC = 4
-const TTL_MS = 47 * 60 * 60 * 1000
-const active = new Set<string>()
+const BATCH_SIZE = 4
+const active = new Map<string, { stopping: boolean }>()
 
 function emptyState(): GapBackupState {
-  return { status: 'idle', parts: [], uploads: {}, movieUploads: {}, windows: [], candidates: [], addedMatches: [] }
+  return { status: 'idle', parts: [], minutes: [], requests: [], candidates: [], addedMatches: [], requestCount: 0, tokenCount: 0 }
 }
 
 function persist(scan: Scan, state: GapBackupState) {
@@ -32,123 +28,332 @@ function log(scan: Scan, level: 'info' | 'warn' | 'error' | 'success', msg: stri
   saveScan(scan)
 }
 
-function activeFile(ai: GoogleGenAI, name?: string) {
-  return name ? ai.files.get({ name }).then((f) => f.state === 'ACTIVE').catch(() => false) : Promise.resolve(false)
+function effectiveMatches(scan: Scan) {
+  return (scan.matches || []).filter((match) => !match.rejected)
 }
 
-async function uploadCached(ai: GoogleGenAI, file: string, cached?: { uri: string; name: string; uploadedAt: number }) {
-  if (cached && Date.now() - cached.uploadedAt < TTL_MS && await activeFile(ai, cached.name)) return cached
-  const uploaded = await uploadVideo(ai, file)
-  return { uri: uploaded.uri, name: uploaded.name, uploadedAt: Date.now() }
+function uncovered(scan: Scan): ShortRange[] {
+  const total = shortTotalOf(scan)
+  return gapsOf(mergeRanges(effectiveMatches(scan).map((match) => ({ start: match.shortStart, end: match.shortEnd }))), total)
+    .filter((gap) => gap.end - gap.start >= 0.15)
 }
 
-function windowList(duration: number): GeminiPrescanWindow[] {
-  const out: GeminiPrescanWindow[] = []
-  for (let start = 0, index = 0; start < duration - 0.5; start += WINDOW_SEC, index++) {
-    out.push({ index, startOffset: start, endOffset: Math.min(duration, start + WINDOW_SEC), status: 'pending' })
+function buildParts(gaps: ShortRange[]): GapBackupPart[] {
+  const parts: GapBackupPart[] = []
+  for (const gap of gaps) {
+    let cursor = gap.start
+    while (cursor < gap.end - 0.001) {
+      const minuteIndex = Math.floor(cursor / 60)
+      const end = Math.min(gap.end, (minuteIndex + 1) * 60)
+      parts.push({
+        index: parts.length + 1,
+        minuteIndex,
+        shortStart: cursor,
+        shortEnd: end,
+        gapStart: cursor,
+        gapEnd: end,
+        clipStart: 0,
+        clipEnd: 0,
+        result: 'pending',
+      })
+      cursor = end
+    }
   }
-  return out
+  return parts
 }
 
-function addCandidate(scan: Scan, candidate: GapBackupCandidate) {
-  const exists = scan.matches.some((m) => Math.abs(m.shortStart - candidate.shortStart) < 0.5 && Math.abs(m.movieStart - candidate.movieStart) < 0.5)
-  if (exists) return
+function orderedCandidateChunks(scan: Scan, minuteIndex: number): number[] {
+  const segment = scan.shortSegments?.find((item) => item.index === minuteIndex)
   const trimStart = scan.movieTrimStart ?? 0
-  const chunkIndex = Math.max(0, Math.floor((candidate.movieStart - trimStart) / 60))
-  scan.matches.push({ shortStart: candidate.shortStart, shortEnd: candidate.shortEnd, movieStart: candidate.movieStart, movieEnd: candidate.movieEnd, chunkIndex, model: 'gap-backup', origin: 'gap-backup', originWindow: candidate.windowIndex })
+  const maxChunk = Math.max(0, scan.chunkCount - 1)
+  const suggested = [...new Set((segment?.movieMinutes || []).map((minute) => Math.floor((minute * 60 - trimStart) / 60)))]
+    .filter((index) => index >= 0 && index <= maxChunk)
+  const minuteStart = minuteIndex * 60
+  const minuteEnd = minuteStart + 60
+  const accepted = effectiveMatches(scan)
+  const before = accepted.filter((match) => match.shortEnd <= minuteStart).sort((a, b) => b.shortEnd - a.shortEnd)[0]
+  const after = accepted.filter((match) => match.shortStart >= minuteEnd).sort((a, b) => a.shortStart - b.shortStart)[0]
+  const anchors = [before?.chunkIndex, after?.chunkIndex].filter((value): value is number => typeof value === 'number')
+  const allowed = [...new Set([...anchors.filter((index) => suggested.includes(index)), ...suggested])]
+  return allowed.sort((a, b) => {
+    const da = anchors.length ? Math.min(...anchors.map((anchor) => Math.abs(anchor - a))) : suggested.indexOf(a)
+    const db = anchors.length ? Math.min(...anchors.map((anchor) => Math.abs(anchor - b))) : suggested.indexOf(b)
+    return da - db || suggested.indexOf(a) - suggested.indexOf(b)
+  })
 }
 
-export function gapBackupRunning(id: string) { return active.has(id) }
+function scanCoverage(scan: Scan) {
+  return coverageFromRanges(effectiveMatches(scan).map((match) => ({ start: match.shortStart, end: match.shortEnd })), shortTotalOf(scan))
+}
+
+export function gapBackupRunning(id: string) {
+  return active.has(id)
+}
+
+export function stopGapBackup(id: string) {
+  const control = active.get(id)
+  if (!control) return false
+  control.stopping = true
+  return true
+}
 
 export function gapBackupPreview(scan: Scan) {
-  const coverage = computeShortCoverage(scan)
-  return { coverage, gaps: missingRanges((scan.matches || []).map((m) => ({ start: m.shortStart, end: m.shortEnd })), coverage.totalSec, { padSec: PAD_SEC, minGapSec: MIN_GAP_SEC }), state: scan.gapBackup ?? emptyState() }
+  const saved = scan.gapBackup
+  const state = saved && Array.isArray(saved.minutes) && Array.isArray(saved.requests) ? saved : emptyState()
+  return { coverage: scanCoverage(scan), gaps: uncovered(scan), state }
 }
 
 export function startGapBackup(id: string, apiKeys: string[]) {
-  if (active.has(id)) return { ok: false, error: 'Gap backup already running' }
+  if (active.has(id)) return { ok: false, error: 'Missing-scene finder already running' }
   const scan = getScan(id)
   if (!scan) return { ok: false, error: 'Scan not found' }
   if (scheduler.isRunning(id)) return { ok: false, error: 'Scan is still running — wait for verification to finish' }
   if (!scan.shortDuration || !scan.movieDuration || scan.awaitingTrim) return { ok: false, error: 'Upload both videos and confirm the movie trim first' }
   if (!apiKeys.length) return { ok: false, error: 'Add a Gemini API key in Settings first' }
-  const preview = gapBackupPreview(scan)
-  if (!preview.gaps.length) return { ok: false, error: 'No true uncovered gaps remain' }
-  active.add(id)
-  void runGapBackup(scan, apiKeys, preview.gaps).finally(() => active.delete(id))
+  const gaps = uncovered(scan)
+  if (!gaps.length) return { ok: false, error: 'No true uncovered ranges remain' }
+  const control = { stopping: false }
+  active.set(id, control)
+  void runGapBackup(scan, apiKeys, gaps, control).finally(() => active.delete(id))
   return { ok: true }
 }
 
-async function runGapBackup(scan: Scan, apiKeys: string[], gaps: Array<{ start: number; end: number }>) {
-  const mediaDir = scanMediaDir(scan.id)
-  const state: GapBackupState = { ...emptyState(), ...(scan.gapBackup || {}), status: 'cutting', runs: (scan.gapBackup?.runs || 0) + 1, error: null, startedAt: Date.now(), finishedAt: null }
+function clipSpecs(parts: GapBackupPart[]): GapFinderPartSpec[] {
+  return parts.map((part) => ({ id: part.index, shortStart: part.shortStart, shortEnd: part.shortEnd, clipStart: part.clipStart, clipEnd: part.clipEnd }))
+}
+
+async function ensureChunk(scan: Scan, movieFile: string, index: number) {
+  const chunksDir = path.join(scanMediaDir(scan.id), 'chunks')
+  const file = chunkPath(chunksDir, index)
+  if (fs.existsSync(file)) return file
+  fs.mkdirSync(chunksDir, { recursive: true })
+  const start = (scan.movieTrimStart ?? 0) + index * 60
+  const end = Math.min(scan.movieTrimEnd ?? scan.movieDuration ?? start + 60, start + 60)
+  await extractClipPrecise(movieFile, start, end, file)
+  return file
+}
+
+async function runGapBackup(scan: Scan, apiKeys: string[], gaps: ShortRange[], control: { stopping: boolean }) {
+  const previous = scan.gapBackup
+  const parts = buildParts(gaps)
+  const minuteIndexes = [...new Set(parts.map((part) => part.minuteIndex))]
+  const minutes: GapBackupMinute[] = minuteIndexes.map((index) => ({
+    index,
+    start: index * 60,
+    end: Math.min(scan.shortDuration!, (index + 1) * 60),
+    status: 'queued',
+    partIds: parts.filter((part) => part.minuteIndex === index).map((part) => part.index),
+    candidateChunks: orderedCandidateChunks(scan, index),
+    completedChunks: [],
+  }))
+  const state: GapBackupState = {
+    ...emptyState(),
+    status: 'cutting',
+    progress: 'Missing short ranges ko minute-wise 24 fps clips me prepare kar rahe hain',
+    runs: (previous?.runs || 0) + 1,
+    parts,
+    minutes,
+    candidates: (previous?.candidates || []).filter((candidate) => candidate.review === 'accepted' && Boolean(candidate.id)),
+    addedMatches: (scan.matches || []).filter((match) => match.origin === 'gap-backup'),
+    startedAt: Date.now(),
+  }
   persist(scan, state)
-  log(scan, 'info', `Gap backup started manually: ${gaps.length} true uncovered gap(s)`)
+  log(scan, 'info', `Manual missing-scene finder started: ${parts.length} unresolved part(s) across ${minutes.length} short minute(s)`)
+
   try {
     const shortFile = (await ensureLocalMedia(scan.id, 'short')) || localMediaPath(scan.id, 'short')
     const movieFile = (await ensureLocalMedia(scan.id, 'movie')) || localMediaPath(scan.id, 'movie')
-    const clipPath = path.join(mediaDir, 'gap-backup-clip.mp4')
-    const built = await buildBackupClip(shortFile, gaps, clipPath)
-    const signature = JSON.stringify(gaps.map((g) => [Math.round(g.start * 10) / 10, Math.round(g.end * 10) / 10]))
-    state.clip = { path: clipPath, durationSec: built.durationSec, sizeBytes: built.sizeBytes, fps: backupClipFps(built.durationSec), signature }
-    state.parts = gaps.map((g, i): GapBackupPart => ({ index: i + 1, shortStart: g.start + PAD_SEC > scan.shortDuration! ? g.start : g.start, shortEnd: g.end, gapStart: g.start, gapEnd: g.end, clipStart: built.parts[i].clipStart, clipEnd: built.parts[i].clipEnd, result: 'pending' }))
-    persist(scan, state)
+    const mediaDir = scanMediaDir(scan.id)
 
-    state.status = 'uploading'
-    const trimStart = scan.movieTrimStart ?? 0
-    const trimEnd = scan.movieTrimEnd ?? scan.movieDuration!
-    const movieCopyPath = path.join(mediaDir, 'gap-backup-movie.mp4')
-    if (!fs.existsSync(movieCopyPath)) await preparePrescanMovieCopy(movieFile, movieCopyPath, scan.movieDuration!, trimStart, trimEnd, () => {}, { scanId: scan.id })
-    state.status = 'searching'
-    state.windows = windowList(trimEnd - trimStart).map((w) => ({ ...w, startOffset: w.startOffset + trimStart, endOffset: w.endOffset + trimStart }))
-    state.context = 'Search every ordered 20-minute movie window. Unresolved parts must remain unresolved.'
-    const parts: BackupPartSpec[] = state.parts.map((p) => ({ index: p.index, clipStart: p.clipStart, clipEnd: p.clipEnd, shortStart: p.shortStart, shortEnd: p.shortEnd }))
-    const lanes = apiKeys.flatMap((key, keyIndex) => CHUNK_MODEL_POOL.map((model) => ({ key, keyIndex, model, ai: getClient(key) })))
-    const uploaded = new Map<string, { uri: string; name: string; uploadedAt: number }>()
-    for (const lane of lanes) {
-      const keyId = apiKeyHash(lane.key)
-      if (!uploaded.has(keyId)) uploaded.set(keyId, await uploadCached(lane.ai, clipPath, state.uploads[keyId]))
-      const movieUpload = await uploadCached(lane.ai, movieCopyPath, state.movieUploads[keyId])
-      state.uploads[keyId] = uploaded.get(keyId)!
-      state.movieUploads[keyId] = movieUpload
+    for (const minute of minutes) {
+      if (control.stopping) break
+      minute.status = 'preparing'
+      state.progress = `Short minute ${minute.index + 1}: 24 fps clip prepare ho raha hai`
+      persist(scan, state)
+      const minuteParts = parts.filter((part) => minute.partIds.includes(part.index))
+      const clipFile = path.join(mediaDir, 'gap-backup', `short-minute-${String(minute.index).padStart(3, '0')}.mp4`)
+      const built = await buildBackupClip(shortFile, minuteParts.map((part) => ({ start: part.shortStart, end: part.shortEnd })), clipFile)
+      minute.clip = { path: clipFile, durationSec: built.durationSec, sizeBytes: built.sizeBytes, fps: 24 }
+      minuteParts.forEach((part, index) => {
+        part.clipStart = built.parts[index].clipStart
+        part.clipEnd = built.parts[index].clipEnd
+      })
+      if (!minute.candidateChunks.length) {
+        minute.status = 'failed'
+        minute.error = 'Original minute finder ne is short minute ke liye koi movie-minute suggestion nahi diya'
+      }
       persist(scan, state)
     }
-    for (const w of state.windows) {
-      if (w.status === 'done') continue
-      let completed = false
-      for (const lane of lanes) {
-        const keyId = apiKeyHash(lane.key)
-        try {
-          const response = await runBackupMinuteFinderWindow(lane.ai, lane.model.id, state.uploads[keyId].uri, state.movieUploads[keyId].uri, w.startOffset, w.endOffset, state.clip.fps, parts, state.context)
-          const parsed = parseBackupMinuteFinderOutput(response.text, w.startOffset, w.endOffset, true, parts)
-          w.raw = response.text; w.tokens = response.tokens ?? undefined; w.matches = parsed.hits.length; w.status = 'done'; w.lane = `key ${lane.keyIndex + 1} · ${lane.model.id}`
-          for (const hit of parsed.hits) {
-            const candidate: GapBackupCandidate = { part: hit.part || 0, shortStart: hit.shortStart ?? 0, shortEnd: hit.shortEnd ?? 0, movieStart: hit.fileStart, movieEnd: hit.fileEnd, source: 'gap-backup', windowIndex: w.index, confidence: hit.kind === 'match' ? 1 : 0.5, reason: hit.evidence }
-            if (candidate.part > 0 && candidate.shortEnd > candidate.shortStart) {
-              state.candidates.push(candidate)
-              const p = state.parts[candidate.part - 1]
-              if (p && (!p.found || candidate.confidence > p.found.confidence)) p.found = { movieStart: candidate.movieStart, movieEnd: candidate.movieEnd, windowIndex: candidate.windowIndex, confidence: candidate.confidence, reason: candidate.reason }
-              addCandidate(scan, candidate)
-            }
+
+    const lanes = apiKeys.flatMap((key, keyIndex) => CHUNK_MODEL_POOL
+      .filter((model) => getModelUsage(model.id, key) < model.rpd)
+      .map((model) => ({ key, keyIndex, model, ai: getClient(key), keyId: apiKeyHash(key) })))
+    if (!lanes.length) throw new Error('Saari Gemini chunk-model lanes ki daily quota exhausted hai')
+
+    for (const minute of minutes) {
+      if (control.stopping) break
+      if (minute.status === 'failed' || !minute.clip) continue
+      minute.status = 'uploading'
+      state.status = 'uploading'
+      state.progress = `Short minute ${minute.index + 1} upload ho raha hai`
+      persist(scan, state)
+      const shortUploads = new Map<string, { uri: string; name: string }>()
+      await Promise.all([...new Set(lanes.map((lane) => lane.keyId))].map(async (keyId) => {
+        const lane = lanes.find((item) => item.keyId === keyId)!
+        shortUploads.set(keyId, await uploadVideo(lane.ai, minute.clip!.path))
+      }))
+
+      minute.status = 'searching'
+      state.status = 'searching'
+      const unresolved = () => minute.partIds.filter((partId) => !state.candidates.some((candidate) => candidate.part === partId && candidate.review !== 'rejected'))
+      const batchSize = Math.min(BATCH_SIZE, lanes.length)
+      for (let offset = 0, batchNumber = 1; offset < minute.candidateChunks.length && unresolved().length; offset += batchSize, batchNumber++) {
+        if (control.stopping) break
+        const batch = minute.candidateChunks.slice(offset, offset + batchSize)
+        minute.currentBatch = batch
+        state.activeBatch = batch
+        state.progress = `Short minute ${minute.index + 1}: batch ${batchNumber}, chunks ${batch.map((value) => value + 1).join(', ')} Gemini par chal rahe hain`
+        persist(scan, state)
+
+        await Promise.all(batch.map(async (chunkIndex, slot) => {
+          const lane = lanes[(offset + slot) % lanes.length]
+          const chunkStart = (scan.movieTrimStart ?? 0) + chunkIndex * 60
+          const chunkEnd = Math.min(scan.movieTrimEnd ?? scan.movieDuration!, chunkStart + 60)
+          const request: GapBackupRequest = {
+            id: `${minute.index}-${chunkIndex}-${Date.now()}-${slot}`,
+            minuteIndex: minute.index,
+            batch: batchNumber,
+            chunkIndex,
+            chunkStart,
+            chunkEnd,
+            lane: `key ${lane.keyIndex + 1} · ${lane.model.id}`,
+            model: lane.model.id,
+            status: 'uploading',
+            startedAt: Date.now(),
           }
-          completed = true; persist(scan, state); break
-        } catch (err) { w.error = err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200) }
+          state.requests.push(request)
+          persist(scan, state)
+          let uploadedName: string | null = null
+          try {
+            const chunkFile = await ensureChunk(scan, movieFile, chunkIndex)
+            const uploaded = await uploadVideo(lane.ai, chunkFile)
+            uploadedName = uploaded.name
+            if (control.stopping) {
+              request.status = 'cancelled'
+              return
+            }
+            request.status = 'running'
+            persist(scan, state)
+            incrementModelUsage(lane.model.id, lane.key)
+            const partList = parts.filter((part) => unresolved().includes(part.index))
+            const response = await runGapFinderChunk(lane.ai, lane.model.id, shortUploads.get(lane.keyId)!.uri, uploaded.uri, clipSpecs(partList), chunkStart, chunkEnd)
+            const hits = parseGapFinderOutput(response.text, new Set(partList.map((part) => part.index)), chunkStart, chunkEnd)
+            request.raw = response.text
+            request.tokens = response.tokens ?? undefined
+            request.matches = hits.length
+            request.status = 'done'
+            state.requestCount = (state.requestCount || 0) + 1
+            state.tokenCount = (state.tokenCount || 0) + (response.tokens || 0)
+            for (const hit of hits) {
+              if (state.candidates.some((candidate) => candidate.part === hit.part && Math.abs(candidate.movieStart - hit.movieStart) < 0.5 && candidate.review !== 'rejected')) continue
+              const targetPart = parts.find((part) => part.index === hit.part)
+              if (!targetPart) continue
+              const candidate: GapBackupCandidate = {
+                id: `${hit.part}-${chunkIndex}-${Math.round(hit.movieStart * 1000)}`,
+                part: hit.part,
+                shortStart: targetPart.gapStart,
+                shortEnd: targetPart.gapEnd,
+                movieStart: hit.movieStart,
+                movieEnd: hit.movieEnd,
+                source: 'gap-backup',
+                chunkIndex,
+                model: lane.model.id,
+                confidence: 1,
+                reason: hit.evidence,
+                review: 'pending',
+                createdAt: Date.now(),
+              }
+              state.candidates.push(candidate)
+              const part = parts.find((item) => item.index === hit.part)
+              if (part) part.result = 'found'
+            }
+          } catch (error) {
+            request.status = 'failed'
+            request.error = error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500)
+          } finally {
+            request.finishedAt = Date.now()
+            minute.completedChunks.push(chunkIndex)
+            if (uploadedName) void deleteFileQuiet(lane.ai, uploadedName)
+            persist(scan, state)
+          }
+        }))
       }
-      if (!completed) { w.status = 'failed'; persist(scan, state) }
+      for (const [keyId, upload] of shortUploads) {
+        const lane = lanes.find((item) => item.keyId === keyId)
+        if (lane) void deleteFileQuiet(lane.ai, upload.name)
+      }
+      minute.currentBatch = undefined
+      minute.status = state.candidates.some((candidate) => minute.partIds.includes(candidate.part) && candidate.review === 'pending') ? 'awaiting_review' : 'done'
+      persist(scan, state)
     }
-    state.status = state.candidates.length ? 'verifying' : 'done'
-    state.addedMatches = scan.matches.filter((m) => m.origin === 'gap-backup')
-    state.recoveredSec = computeShortCoverage(scan).coveredSec
+
+    state.activeBatch = undefined
+    if (control.stopping) {
+      state.status = 'stopped'
+      state.progress = 'User ne finder stop kiya; completed replies save hain aur Retry se unresolved work continue hoga'
+    } else if (state.candidates.some((candidate) => candidate.review === 'pending')) {
+      state.status = 'awaiting_review'
+      state.progress = 'Gemini search complete — candidates ko side-by-side review karke Accept ya Reject karein'
+    } else {
+      state.status = 'done'
+      state.progress = 'Search complete — koi strict pending candidate nahi mila'
+    }
+    state.finishedAt = Date.now()
     persist(scan, state)
-    if (state.candidates.length) {
-      scan.status = 'stopped'
-      const result = await scheduler.start(scan.id, false, apiKeys, null)
-      if (!result.ok) log(scan, 'warn', `Gap candidates saved but verifier could not start: ${result.error}`)
-      else log(scan, 'info', 'Gap-backup candidates added to the normal 24fps verifier')
-    }
-    state.status = 'done'; state.finishedAt = Date.now(); persist(scan, state)
-    log(scan, 'success', `Gap backup finished: ${state.candidates.length} candidate(s) found`)
-  } catch (err) {
-    state.status = 'error'; state.error = err instanceof Error ? err.message : String(err); state.finishedAt = Date.now(); persist(scan, state); log(scan, 'error', `Gap backup failed: ${state.error}`)
+    log(scan, 'success', `Missing-scene finder finished: ${state.candidates.filter((candidate) => candidate.review === 'pending').length} candidate(s) awaiting review`)
+  } catch (error) {
+    state.status = 'error'
+    state.error = error instanceof Error ? error.message : String(error)
+    state.progress = 'Finder error par ruk gaya; details niche request logs me hain'
+    state.finishedAt = Date.now()
+    persist(scan, state)
+    log(scan, 'error', `Missing-scene finder failed: ${state.error}`)
   }
+}
+
+export function reviewGapCandidate(scan: Scan, candidateId: string, decision: 'accept' | 'reject') {
+  const state = scan.gapBackup
+  const candidate = state?.candidates.find((item) => item.id === candidateId)
+  if (!state || !candidate) return { ok: false, error: 'Candidate not found' }
+  if (decision === 'accept') {
+    for (const item of state.candidates) if (item.part === candidate.part && item.id !== candidate.id && item.review === 'pending') item.review = 'rejected'
+    candidate.review = 'accepted'
+    const match: ChunkMatch = {
+      shortStart: candidate.shortStart,
+      shortEnd: candidate.shortEnd,
+      movieStart: candidate.movieStart,
+      movieEnd: candidate.movieEnd,
+      chunkIndex: candidate.chunkIndex,
+      model: candidate.model,
+      verified: true,
+      userPick: true,
+      origin: 'gap-backup',
+    }
+    scan.matches = scan.matches.filter((item) => !(item.origin === 'gap-backup' && Math.abs(item.shortStart - candidate.shortStart) < 0.1))
+    scan.matches.push(match)
+    scan.matches.sort((a, b) => a.shortStart - b.shortStart)
+    state.addedMatches = scan.matches.filter((item) => item.origin === 'gap-backup')
+    const part = state.parts.find((item) => item.index === candidate.part)
+    if (part) part.result = 'accepted'
+  } else {
+    candidate.review = 'rejected'
+    const part = state.parts.find((item) => item.index === candidate.part)
+    if (part && !state.candidates.some((item) => item.part === candidate.part && item.review === 'pending')) part.result = 'rejected'
+  }
+  if (!state.candidates.some((item) => item.review === 'pending')) {
+    state.status = 'done'
+    state.progress = 'Sab Gemini candidates review ho gaye'
+  }
+  persist(scan, state)
+  return { ok: true }
 }

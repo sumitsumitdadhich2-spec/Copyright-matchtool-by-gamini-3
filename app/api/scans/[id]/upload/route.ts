@@ -145,6 +145,10 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
   const { id } = await ctx.params
   const scan = await loadScan(id)
   if (!scan) return NextResponse.json({ error: 'Scan not found' }, { status: 404 })
+  const sessionUser = await getSession()
+  if (!sessionUser || (sessionUser.role !== 'admin' && scan.ownerUsername !== sessionUser.username)) {
+    return NextResponse.json({ error: 'Scan not found' }, { status: 404 })
+  }
 
   const url = new URL(req.url)
   const kind = parseKind(url.searchParams.get('kind'))
@@ -169,10 +173,10 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
         return NextResponse.json({ received: 0, reuse: { scanId: reuse.scanId, source: reuse.source } })
       }
     }
-    return NextResponse.json({ received: 0 })
+    return NextResponse.json({ received: 0, uploadKey: `${id}/${kind}`, scanId: id, kind })
   }
   // Never promise more than what is physically on disk.
-  return NextResponse.json({ received: Math.min(meta.received, fileSize(part), total) })
+  return NextResponse.json({ received: Math.min(meta.received, fileSize(part), total), uploadKey: `${id}/${kind}`, scanId: id, kind })
 }
 
 /** POST ?reuse=<scanId> — link/fetch an already-uploaded video into this scan. */
@@ -223,10 +227,13 @@ async function afterMediaReady(id: string, kind: MediaKind) {
 }
 
 export async function POST(req: Request, ctx: { params: Promise<{ id: string }> }) {
-  if (!(await getSession())) return unauthorized()
+  const sessionUser = await getSession()
+  if (!sessionUser) return unauthorized()
   const { id } = await ctx.params
   const scan = await loadScan(id)
-  if (!scan) return NextResponse.json({ error: 'Scan not found' }, { status: 404 })
+  if (!scan || (sessionUser.role !== 'admin' && scan.ownerUsername !== sessionUser.username)) {
+    return NextResponse.json({ error: 'Scan not found' }, { status: 404 })
+  }
 
   // Old cached bundle (chunked uploader) → tell the user to reload instead of
   // accepting 16 MB slices that this handler can no longer make sense of.
@@ -448,7 +455,7 @@ async function streamToDisk(req: Request, p: StreamParams): Promise<NextResponse
     } else if (cutShort) {
       console.warn(`[upload] ${kind} of ${id}: stream ended at ${received}/${total} bytes (${cutShort}) — browser will resume`)
     }
-    return NextResponse.json({ ok: true, received, truncated })
+    return NextResponse.json({ ok: true, received, truncated, uploadKey: `${id}/${kind}`, scanId: id, kind })
   }
 
   // ---- Every byte is on disk: verify, move into place, probe.
@@ -474,5 +481,5 @@ async function streamToDisk(req: Request, p: StreamParams): Promise<NextResponse
   void mirrorMediaToStorage(id, kind, req.headers.get('x-video-type') || 'video/mp4')
   await afterMediaReady(id, kind)
 
-  return NextResponse.json({ ok: true, done: true, duration: result.duration, size: result.size })
+  return NextResponse.json({ ok: true, done: true, duration: result.duration, size: result.size, uploadKey: `${id}/${kind}`, scanId: id, kind })
 }
