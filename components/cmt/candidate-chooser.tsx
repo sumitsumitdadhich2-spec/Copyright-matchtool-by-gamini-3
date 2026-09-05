@@ -42,6 +42,13 @@ export function CandidateChooser({
   const [error, setError] = useState<string | null>(null)
 
   const scanRunning = scan.status === 'scanning' || scan.status === 'verifying'
+  const renderRunning = scan.renderJob?.status === 'rendering'
+  const choiceLocked = scanRunning || renderRunning
+  const choiceLockedReason = scanRunning
+    ? 'Scan chal raha hai — pehle Stop karo'
+    : renderRunning
+      ? 'Render chal raha hai — finish ya cancel hone ke baad main clip badlo'
+      : null
   const viewing = viewIdx === null ? null : options[Math.min(viewIdx, options.length - 1)]
   const mainOpt = options.find((o) => o.isMain)
   // Position of the currently shown window inside the list (main counts as one step).
@@ -154,8 +161,8 @@ export function CandidateChooser({
         <button
           type="button"
           onClick={makeMain}
-          disabled={!viewing || viewing.isMain || busy || scanRunning}
-          title={scanRunning ? 'Scan chal raha hai — pehle Stop karo' : 'Is candidate ko main clip banao (preview + export me)'}
+          disabled={!viewing || viewing.isMain || busy || choiceLocked}
+          title={choiceLockedReason ?? 'Is candidate ko main clip banao (preview + export me)'}
           className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground disabled:opacity-40"
         >
           {busy ? <Loader2 className="size-3.5 animate-spin" aria-hidden /> : <Check className="size-3.5" aria-hidden />}
@@ -165,16 +172,18 @@ export function CandidateChooser({
           <button
             type="button"
             onClick={resetToAi}
-            disabled={busy || scanRunning}
+            disabled={busy || choiceLocked}
             className="flex items-center gap-1 rounded-md border border-input px-2.5 py-1.5 text-xs font-medium hover:bg-secondary disabled:opacity-40"
-            title="User choice hatao — AI verdict wapas"
+            title={choiceLockedReason ?? 'User choice hatao — AI verdict wapas'}
           >
             <Undo2 className="size-3.5" aria-hidden /> Reset to AI
           </button>
         )}
       </div>
-      {scanRunning && (
-        <p className="mt-1.5 text-[10px] text-muted-foreground">Candidate dekh sakte ho; main banane ke liye scan Stop karo.</p>
+      {choiceLockedReason && (
+        <p className="mt-1.5 text-[10px] text-muted-foreground">
+          Candidate dekh sakte ho; {choiceLockedReason}.
+        </p>
       )}
       {error && (
         <p role="alert" className="mt-1.5 text-xs text-destructive">

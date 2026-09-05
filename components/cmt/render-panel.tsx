@@ -478,13 +478,23 @@ function StitchedPreview({
   const activeStart = viewing ? viewing.movieStart : current?.movieStart ?? 0
   const activeEnd = viewing ? viewing.movieEnd : current?.movieEnd ?? 0
 
-  // Reset when the segment list changes (new matches between refreshes).
+  // Reset when the segment count changes (new matches between refreshes).
   useEffect(() => {
     setSegIdx(0)
     setPlaying(false)
     setStitchedPos(0)
     setCandIdx(null)
   }, [segments.length])
+
+  // A user pick can replace the current scene with a same-length movie window.
+  // Seek immediately so the paused frame agrees with the refreshed MAIN label.
+  useEffect(() => {
+    const v = videoRef.current
+    if (!v || !current || candIdx !== null) return
+    v.currentTime = current.movieStart
+    setStitchedPos(offsets[segIdx] ?? 0)
+    if (playing) void v.play()
+  }, [current?.movieStart, current?.movieEnd, segIdx, candIdx]) // eslint-disable-line react-hooks/exhaustive-deps
 
   function seekToSegment(i: number, autoplay: boolean) {
     const v = videoRef.current

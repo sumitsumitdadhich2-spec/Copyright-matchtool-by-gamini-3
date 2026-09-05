@@ -77,6 +77,35 @@ export function renderOutputPath(scanId: string): string {
   return path.join(scanMediaDir(scanId), 'render.mp4')
 }
 
+/** Remove an export that was built from an older match list.
+ *  The caller must reject active/persisted renders before invoking this. */
+export function invalidateRenderedOutput(scan: Scan): boolean {
+  if (isRenderActive(scan.id) || scan.renderJob?.status === 'rendering') return false
+
+  const output = renderOutputPath(scan.id)
+  const hadFile = fs.existsSync(output)
+  const hadCompletedJob = scan.renderJob?.status === 'done'
+  if (!hadFile && !hadCompletedJob) return false
+
+  fs.rmSync(output, { force: true })
+  if (scan.renderJob) {
+    const settings = scan.renderJob.settings
+    scan.renderJob = {
+      status: 'idle',
+      settings,
+      pct: 0,
+      etaSeconds: null,
+      totalOutputSeconds: 0,
+      segmentCount: 0,
+      error: null,
+      startedAt: null,
+      finishedAt: null,
+      fileSize: null,
+    }
+  }
+  return true
+}
+
 const RENDER_STAGE = 'render-parts'
 
 /** HH:MM:SS.mmm on the ORIGINAL movie clock (scene logs). */
@@ -122,6 +151,7 @@ export async function startRender(scanId: string, settings: RenderSettings): Pro
     // stale flag from a crashed process — recover instead of blocking forever
     scan.renderJob.status = 'error'
     scan.renderJob.error = 'Previous render was interrupted'
+    saveScan(scan, { immediate: true })
   }
 
   // FRAME GRID: scenes are snapped to the output fps before anything is
@@ -132,11 +162,23 @@ export async function startRender(scanId: string, settings: RenderSettings): Pro
   const mediaDir = scanMediaDir(scanId)
   const movieFile = path.join(mediaDir, 'movie.mp4')
   if (!fs.existsSync(movieFile)) return 'Original movie file not found'
-  // A new attempt must never leave an older or failed export downloadable.
-  fs.rmSync(renderOutputPath(scanId), { force: true })
+
+  // Claim the scan before the first await. Without this lock, a candidate pick
+  // could change scan.matches while audio probing was still using old segments.
+  const token = new CancelToken()
+  activeRenders.set(scanId, token)
 
   // Silent movie: audio stream refs would make ffmpeg fail — synthesize silence instead.
-  const hasAudio = await probeHasAudio(movieFile)
+  let hasAudio: boolean
+  try {
+    hasAudio = await probeHasAudio(movieFile)
+  } catch (error) {
+    activeRenders.delete(scanId)
+    return `Could not inspect movie audio: ${error instanceof Error ? error.message : String(error)}`
+  }
+
+  // Audio probing succeeded, so this attempt can now replace any older export.
+  fs.rmSync(renderOutputPath(scanId), { force: true })
 
   const totalOut = totalSnappedSeconds(segments, settings.fps)
   scan.renderJob = freshJob(settings, totalOut, segments.length)
@@ -171,9 +213,6 @@ export async function startRender(scanId: string, settings: RenderSettings): Pro
     scan.renderJob.shortSeconds = shortTotal
   }
   saveScan(scan)
-
-  const token = new CancelToken()
-  activeRenders.set(scanId, token)
 
   // Fire and forget — progress lands in scan.renderJob.
   void runRenderPipeline(scanId, settings, segments, movieFile, hasAudio, totalOut, token)
