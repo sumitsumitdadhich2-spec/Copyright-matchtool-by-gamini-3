@@ -3,6 +3,8 @@ import { getScan, saveScan, addLog } from '@/lib/store'
 import { scheduler } from '@/lib/scheduler'
 import { applyGroupMatches } from '@/lib/candidate-pick'
 import { fmtTime } from '@/lib/format'
+import { getSession } from '@/lib/users'
+import { invalidateRenderedOutput, isRenderActive } from '@/lib/render'
 
 export const runtime = 'nodejs'
 
@@ -16,13 +18,21 @@ export const runtime = 'nodejs'
  *  together. Works for confirmed, unverified, rejected AND not-yet-checked
  *  groups — the choice is the user's. */
 export async function POST(req: Request, ctx: { params: Promise<{ id: string }> }) {
+  const session = await getSession()
+  if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+
   const { id } = await ctx.params
   const scan = getScan(id)
-  if (!scan) return NextResponse.json({ error: 'Scan not found' }, { status: 404 })
+  if (!scan || (session.role !== 'admin' && scan.ownerUsername !== session.username)) {
+    return NextResponse.json({ error: 'Not found' }, { status: 404 })
+  }
   // The running scheduler owns the in-memory scan and would overwrite a file
   // edit on its next save — ask for Stop first.
   if (scheduler.isRunning(id) || scan.status === 'scanning' || scan.status === 'verifying') {
     return NextResponse.json({ error: 'Scan chal raha hai — candidate choose karne se pehle Stop karo' }, { status: 409 })
+  }
+  if (isRenderActive(id) || scan.renderJob?.status === 'rendering') {
+    return NextResponse.json({ error: 'Render chal raha hai — finish ya cancel hone ke baad main clip badlo' }, { status: 409 })
   }
 
   const body = (await req.json().catch(() => ({}))) as {
@@ -54,8 +64,14 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     addLog(
       scan,
       'success',
-      `USER CHOICE: short ${fmtTime(g.shortStart)}–${fmtTime(g.shortEnd)} → movie ${fmtTime(ms)}–${fmtTime(me)} (candidate #${idx + 1}${viaRescan ? ', rescan window' : ''}, chunk ${c.chunkIndex}) set as MAIN clip — AI verdict was ${g.status}. Preview + export updated.`,
+      `USER CHOICE: short ${fmtTime(g.shortStart)}–${fmtTime(g.shortEnd)} → movie ${fmtTime(ms)}–${fmtTime(me)} (candidate #${idx + 1}${viaRescan ? ', rescan window' : ''}, chunk ${c.chunkIndex}) set as MAIN clip — AI verdict was ${g.status}. Preview + export input updated.`,
     )
+  }
+
+  // A completed MP4 contains the old match list; never leave it playable or
+  // downloadable beside a preview that already shows the new main clip.
+  if (invalidateRenderedOutput(scan)) {
+    addLog(scan, 'warn', 'Previous export cleared because the main clip changed — render again to export the updated merge')
   }
 
   // Keep the frozen report in sync so the report tab matches preview/export.

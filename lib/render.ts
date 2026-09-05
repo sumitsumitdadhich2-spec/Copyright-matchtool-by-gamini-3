@@ -4,7 +4,7 @@ import { IN_FLAGS, PART_AUDIO, PART_EXT, joinParts, probeDuration, probeHasAudio
 import { CancelToken, FfmpegCancelled, engineCount, parallelMap, runFfmpeg, sliceProgress } from './ffmpeg-pool'
 import { estimateBitrateBytes, placeWork, removeStageWork } from './work-dir'
 import { getScan, saveScan, scanMediaDir, addLog } from './store'
-import type { RenderJob, RenderResolution, RenderSettings, Scan } from './types'
+import { RENDER_FPS_OPTIONS, isRenderFps, type RenderJob, type RenderResolution, type RenderSettings, type Scan } from './types'
 import { buildRenderSegments, snapSegments, totalSnappedSeconds, type SnappedSegment } from './render-segments'
 import { coverageFromRanges, coverageLine, fmtShortTs, shortTotalOf } from './short-coverage'
 import { originLabel } from './candidate-pick'
@@ -45,10 +45,9 @@ export function validateRenderSettings(input: unknown): { ok: true; settings: Re
     return { ok: false, error: 'Invalid resolution (480p, 720p, 1080p, 2k, 4k)' }
   }
   const fps = Number(s.fps)
-  if (!Number.isFinite(fps) || fps < 1 || fps > 120) {
-    return { ok: false, error: 'FPS must be a number between 1 and 120 (fractional rates are supported)' }
+  if (!isRenderFps(fps)) {
+    return { ok: false, error: `Invalid FPS. Choose one of: ${RENDER_FPS_OPTIONS.join(', ')}` }
   }
-  const normalizedFps = Number(fps.toFixed(3))
   const vb = Number(s.videoBitrateKbps)
   if (!Number.isFinite(vb) || vb < 250 || vb > 100000) {
     return { ok: false, error: 'Video bitrate must be between 250 and 100000 kbps' }
@@ -59,7 +58,7 @@ export function validateRenderSettings(input: unknown): { ok: true; settings: Re
   }
   return {
     ok: true,
-    settings: { resolution: s.resolution, fps: normalizedFps, videoBitrateKbps: Math.round(vb), audioBitrateKbps: Math.round(ab) },
+    settings: { resolution: s.resolution, fps, videoBitrateKbps: Math.round(vb), audioBitrateKbps: Math.round(ab) },
   }
 }
 
@@ -76,6 +75,35 @@ export function isRenderActive(scanId: string): boolean {
 
 export function renderOutputPath(scanId: string): string {
   return path.join(scanMediaDir(scanId), 'render.mp4')
+}
+
+/** Remove an export that was built from an older match list.
+ *  The caller must reject active/persisted renders before invoking this. */
+export function invalidateRenderedOutput(scan: Scan): boolean {
+  if (isRenderActive(scan.id) || scan.renderJob?.status === 'rendering') return false
+
+  const output = renderOutputPath(scan.id)
+  const hadFile = fs.existsSync(output)
+  const hadCompletedJob = scan.renderJob?.status === 'done'
+  if (!hadFile && !hadCompletedJob) return false
+
+  fs.rmSync(output, { force: true })
+  if (scan.renderJob) {
+    const settings = scan.renderJob.settings
+    scan.renderJob = {
+      status: 'idle',
+      settings,
+      pct: 0,
+      etaSeconds: null,
+      totalOutputSeconds: 0,
+      segmentCount: 0,
+      error: null,
+      startedAt: null,
+      finishedAt: null,
+      fileSize: null,
+    }
+  }
+  return true
 }
 
 const RENDER_STAGE = 'render-parts'
@@ -123,6 +151,7 @@ export async function startRender(scanId: string, settings: RenderSettings): Pro
     // stale flag from a crashed process — recover instead of blocking forever
     scan.renderJob.status = 'error'
     scan.renderJob.error = 'Previous render was interrupted'
+    saveScan(scan, { immediate: true })
   }
 
   // FRAME GRID: scenes are snapped to the output fps before anything is
@@ -133,11 +162,23 @@ export async function startRender(scanId: string, settings: RenderSettings): Pro
   const mediaDir = scanMediaDir(scanId)
   const movieFile = path.join(mediaDir, 'movie.mp4')
   if (!fs.existsSync(movieFile)) return 'Original movie file not found'
-  // A new attempt must never leave an older or failed export downloadable.
-  fs.rmSync(renderOutputPath(scanId), { force: true })
+
+  // Claim the scan before the first await. Without this lock, a candidate pick
+  // could change scan.matches while audio probing was still using old segments.
+  const token = new CancelToken()
+  activeRenders.set(scanId, token)
 
   // Silent movie: audio stream refs would make ffmpeg fail — synthesize silence instead.
-  const hasAudio = await probeHasAudio(movieFile)
+  let hasAudio: boolean
+  try {
+    hasAudio = await probeHasAudio(movieFile)
+  } catch (error) {
+    activeRenders.delete(scanId)
+    return `Could not inspect movie audio: ${error instanceof Error ? error.message : String(error)}`
+  }
+
+  // Audio probing succeeded, so this attempt can now replace any older export.
+  fs.rmSync(renderOutputPath(scanId), { force: true })
 
   const totalOut = totalSnappedSeconds(segments, settings.fps)
   scan.renderJob = freshJob(settings, totalOut, segments.length)
@@ -173,9 +214,6 @@ export async function startRender(scanId: string, settings: RenderSettings): Pro
   }
   saveScan(scan)
 
-  const token = new CancelToken()
-  activeRenders.set(scanId, token)
-
   // Fire and forget — progress lands in scan.renderJob.
   void runRenderPipeline(scanId, settings, segments, movieFile, hasAudio, totalOut, token)
 
@@ -198,9 +236,9 @@ function partArgs(movieFile: string, hasAudio: boolean, seg: SnappedSegment, w: 
   if (!hasAudio) args.push('-f', 'lavfi', '-t', readDur.toFixed(6), '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000')
   args.push(
     '-filter_complex',
-    `[0:v]${scalePadFilter(w, h, fps)},trim=end_frame=${seg.frames},setpts=PTS-STARTPTS[v];${hasAudio ? '[0:a]' : '[1:a]'}aresample=48000:async=0:first_pts=0,aformat=channel_layouts=stereo,atrim=end_sample=${Math.round(snapDur * 48000)},asetpts=N/SR/TB[a]`,
+    `[0:v]${scalePadFilter(w, h, fps)},trim=end_frame=${seg.frames},setpts=PTS-STARTPTS[v];${hasAudio ? '[0:a]' : '[1:a]'}aresample=48000:async=0:first_pts=0,aformat=channel_layouts=stereo,apad=whole_len=${Math.round(snapDur * 48000)},atrim=end_sample=${Math.round(snapDur * 48000)},asetpts=N/SR/TB[a]`,
     '-map', '[v]', '-map', '[a]',
-    '-frames:v', String(seg.frames),
+    '-frames:v', String(seg.frames), '-r', String(fps),
     '-c:v', 'libx264', '-preset', 'medium', '-crf', '18', '-bf', '0',
     // Lossless PCM audio in parts: AAC priming/padding per part stacked up to
     // +2.3 s over 48 scenes (audio ran long, seams shifted, A/V drifted).
