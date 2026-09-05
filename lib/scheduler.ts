@@ -230,6 +230,7 @@ class Scheduler {
     // still have pending verifier/rescan work (or matches were never verified).
     const hasVerifyWork =
       (scan.candidateGroups || []).some((g) => g.status === 'pending' || g.status === 'verifying' || g.status === 'rescanning') ||
+      (scan.matches || []).some((m) => m.verified === undefined) ||
       (!scan.candidateGroups?.length && (scan.matches || []).length > 0 && allSettled)
 
     if (pendingChunks === 0 && !hasVerifyWork) return { ok: false, error: 'No pending chunks to scan.' }

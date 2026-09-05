@@ -4,6 +4,7 @@ import { FileCheck2 } from 'lucide-react'
 import type { Scan } from '@/lib/types'
 import { fmtTime, fmtDuration } from '@/lib/format'
 import { displayModelName } from '@/lib/models'
+import { originLabel, isRejectedKept } from '@/lib/candidate-pick'
 
 export function ReportPanel({ scan }: { scan: Scan }) {
   const report = scan.report
@@ -60,6 +61,21 @@ export function ReportPanel({ scan }: { scan: Scan }) {
         </div>
       )}
 
+      {report.coverage && (
+        <div className="mt-2 rounded-md border border-border bg-background p-2 text-xs">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="font-semibold">Short coverage: {report.coverage.pct}%</span>
+            <span className="text-muted-foreground">{report.coverage.coveredSec.toFixed(1)}s / {report.coverage.totalSec.toFixed(1)}s</span>
+            {report.coverage.missingSec > 0 && <span className="text-warning">MISSING {report.coverage.missingSec.toFixed(1)}s</span>}
+          </div>
+          {report.coverage.gaps.length > 0 && <p className="mt-1 font-mono text-warning">{report.coverage.gaps.map((g) => `${fmtTime(g.start)}–${fmtTime(g.end)}`).join(', ')}</p>}
+          <div className="mt-2 flex flex-wrap gap-2 text-muted-foreground">
+            <span>Rejected kept: {report.matchesRejectedKept ?? matches.filter(isRejectedKept).length}</span>
+            {Object.entries(report.originCounts || {}).map(([origin, count]) => <span key={origin}>{originLabel(origin as never)}: {count}</span>)}
+          </div>
+        </div>
+      )}
+
       {matches.length === 0 ? (
         <p className="mt-3 text-sm text-muted-foreground">No matches found — the short video does not appear in this movie.</p>
       ) : (
@@ -75,6 +91,7 @@ export function ReportPanel({ scan }: { scan: Scan }) {
                   <th className="py-1 pr-2 font-medium">Duration</th>
                   <th className="py-1 pr-2 font-medium">Chunk</th>
                   <th className="py-1 pr-2 font-medium">Model</th>
+                  <th className="py-1 pr-2 font-medium">Origin</th>
                   <th className="py-1 font-medium">Verified</th>
                 </tr>
               </thead>
@@ -91,6 +108,9 @@ export function ReportPanel({ scan }: { scan: Scan }) {
                     <td className="py-1 pr-2">{(m.movieEnd - m.movieStart).toFixed(3)}s</td>
                     <td className="py-1 pr-2 text-muted-foreground">{m.chunkIndex}</td>
                     <td className="py-1 pr-2 text-muted-foreground">{displayModelName(m.model)}</td>
+                    <td className="py-1 pr-2">
+                      <span className={isRejectedKept(m) ? 'text-destructive' : 'text-muted-foreground'}>{isRejectedKept(m) ? 'rejected kept' : originLabel(m.origin, m.originWindow)}</span>
+                    </td>
                     <td className="py-1">
                       {m.verified ? (
                         <span className="text-success">{m.viaRescan ? 'yes (rescan)' : 'yes'}</span>

@@ -5,6 +5,7 @@ import { Target, Play, ShieldCheck, ShieldX, ShieldQuestion, RefreshCw, Loader2 
 import type { Scan, CandidateGroup, CandidateEntry } from '@/lib/types'
 import { fmtTime } from '@/lib/format'
 import { displayModelName } from '@/lib/models'
+import { originLabel } from '@/lib/candidate-pick'
 
 const GROUP_BADGE: Record<CandidateGroup['status'], { label: string; cls: string }> = {
   pending: { label: 'Pending verify', cls: 'bg-muted text-muted-foreground' },
@@ -58,6 +59,7 @@ function GroupCard({ scan, g }: { scan: Scan; g: CandidateGroup }) {
           {busy && <Loader2 className="size-3 animate-spin" aria-hidden />}
           {badge.label}
         </span>
+        <span className="rounded-full bg-secondary px-2 py-0.5 font-mono text-xs text-muted-foreground">{originLabel(g.origin, g.originWindow)}</span>
       </div>
       <div className="mt-2 grid gap-2">
         {g.candidates.map((c, i) => (
@@ -128,7 +130,10 @@ function CandidateRow({ scan, g, c, index }: { scan: Scan; g: CandidateGroup; c:
           #{index + 1} Movie {fmtTime(c.movieStart)} – {fmtTime(c.movieEnd)}
         </span>
         <span className="font-mono text-xs text-muted-foreground">chunk {c.chunkIndex}</span>
-        <span className="ml-auto">{verdictBadge(c, g, index)}</span>
+        <span className="ml-auto flex items-center gap-1">
+          {g.status === 'rejected' && !g.superseded && index === 0 && <span className="rounded-full bg-destructive/15 px-2 py-0.5 font-mono text-xs text-destructive">rejected kept</span>}
+          {verdictBadge(c, g, index)}
+        </span>
       </div>
       <div className="mt-1 grid gap-0.5 text-xs text-muted-foreground">
         <span>

@@ -8,6 +8,7 @@
 // A single-stream video upload of a few GB routinely takes longer than that,
 // so lift the limit for this process. Header timeouts stay in place (slowloris
 // protection) and Caddy in front still owns the public-facing timeouts.
+// eslint-disable-next-line @typescript-eslint/no-require-imports
 const http = require('node:http')
 
 const createServer = http.createServer
