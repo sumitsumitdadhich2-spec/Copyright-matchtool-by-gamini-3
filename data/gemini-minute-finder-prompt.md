@@ -6,7 +6,7 @@ Output ke minutes agle step me 24fps chunk-time scan ko diye jayenge, isliye yah
 thoda extra minute bhej dena theek hai — chunk phase use verify karke reject kar dega).
 
 ## Test setup (AI Studio / Gemini app)
-- Model: `gemini-3.7-flash` (ya jo 3.x model available ho)
+- Model: `gemini-3.8-flash` (ya `gemini-3.7-flash` / jo 3.x model available ho)
 - Video 1 = short video (poora, uncut), video settings me **fps = 5**
 - Video 2 = poori movie file, clip range set karo (e.g. `0s → 20m`), fps default (1fps) hi rakho
 - Neeche prompt me `{{WINDOW_START}}` / `{{WINDOW_END}}` ko us window ke mm:ss se replace karo (e.g. `20:00` / `40:00`).

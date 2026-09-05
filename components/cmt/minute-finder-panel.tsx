@@ -162,7 +162,7 @@ export function MinuteFinderPanel({ scan, mode, onModeChanged }: { scan: Scan; m
 
       {mode === 'off' && (
         <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
-          Minute finder OFF hai — upload + trim ke baad kuch auto nahi chalega. Header me <span className="font-medium text-foreground">Start scan</span>{' '}
+          Minute finder OFF hai �� upload + trim ke baad kuch auto nahi chalega. Header me <span className="font-medium text-foreground">Start scan</span>{' '}
           dabao to normal FULL scan hoga (saare chunks, 24 fps).
         </p>
       )}
@@ -222,7 +222,7 @@ export function MinuteFinderPanel({ scan, mode, onModeChanged }: { scan: Scan; m
               </button>
             )}
             <span className="text-[11px] text-muted-foreground">
-              {keyCount} key(s) × {data?.models?.length ?? 2} models = {keyCount * (data?.models?.length ?? 2)} lanes · 1 req/min/lane
+              {keyCount} key(s) × {data?.models?.length ?? 3} models = {keyCount * (data?.models?.length ?? 3)} lanes · 1 req/min/lane
             </span>
           </div>
 
@@ -368,7 +368,7 @@ export function MinuteFinderPanel({ scan, mode, onModeChanged }: { scan: Scan; m
 
           <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
             Auto flow: trim confirm hote hi trimmed movie ki ek upload-copy banti hai (≤1.9 GB), short + copy har API key par Files API me upload hote hain,
-            phir movie 20-minute windows me {data?.models?.map(displayModelName).join(' + ') || 'gemini-3.6-flash + gemini-3.7-flash'} par scan hoti hai (short 5 fps, window 1 fps).
+            phir movie 20-minute windows me {data?.models?.map(displayModelName).join(' + ') || 'gemini-3.6-flash + gemini-3.7-flash + gemini-3.8-flash'} par scan hoti hai (short 5 fps, window 1 fps).
             Short ke jo hisse (≥4 s) kisi window me nahi mile, unhe cut karke high-fps (5–24) backup clip banti hai aur har window me dobara dhundha jata hai — ek hi baar.
             Jo minutes milte hain unpar 24 fps chunk-time scan apne aap start ho jata hai — koi approval nahi.
           </p>

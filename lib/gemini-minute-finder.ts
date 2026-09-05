@@ -41,9 +41,10 @@ import type {
 //
 //   [1] preparing  — ffmpeg upload-copy of the TRIMMED movie (≤ 1.9 GB)
 //   [2] uploading  — short + movie copy → Gemini Files API, ONCE PER API KEY
-//   [3] scanning   — fixed 20-minute windows; lanes = every key × the two
-//                    chunk models (gemini-3.6-flash / gemini-3.7-flash);
-//                    1 request / minute / lane (TPM 250K); shared window queue
+//   [3] scanning   — fixed 20-minute windows; lanes = every key × the three
+//                    chunk models (gemini-3.6-flash / gemini-3.7-flash /
+//                    gemini-3.8-flash); 1 request / minute / lane (TPM 250K);
+//                    shared window queue
 //   [3b] backup    — SECOND PASS: short parts that NO window matched (neither
 //                    MATCH nor POSSIBLE) are cut, concatenated (1 s black between
 //                    parts), uploaded per key and searched again in EVERY window

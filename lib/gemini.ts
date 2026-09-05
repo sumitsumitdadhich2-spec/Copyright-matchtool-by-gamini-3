@@ -128,7 +128,7 @@ Poore answer me sirf HISSA 1 aur HISSA 2 do, aur kuch nahi.`
 
 // ---------- Gemini Minute Finder (20-minute window pre-scan) ----------
 
-/** Model ids allowed for the minute finder — exactly the two chunk-map models. */
+/** Model ids allowed for the minute finder — exactly the three chunk-map models. */
 export const MINUTE_FINDER_SHORT_FPS = 5
 
 /** Window version of the chunk-map prompt. `{{WINDOW_START}}` / `{{WINDOW_END}}`

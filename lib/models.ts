@@ -9,13 +9,14 @@ export interface ModelSpec {
   rpd: number
 }
 
-/** CHUNK-MAP models (locked): ONLY gemini-3.6-flash and gemini-3.7-flash are
- * allowed to run chunk-time mapping requests. Every other model gives wrong
- * chunk-map results, so they are BANNED from this phase. All API keys run
- * BOTH models in parallel on the shared chunk queue. */
+/** CHUNK-MAP models (locked): gemini-3.6-flash, gemini-3.7-flash, and
+ * gemini-3.8-flash are allowed to run chunk-time mapping requests. Every other
+ * model is BANNED from this phase. All API keys run all three models in
+ * parallel on the shared chunk queue. */
 export const CHUNK_MODEL_POOL: ModelSpec[] = [
   { id: 'gemini-3.6-flash', rpm: 5, rpd: 20 },
   { id: 'gemini-3.7-flash', rpm: 5, rpd: 20 },
+  { id: 'gemini-3.8-flash', rpm: 5, rpd: 20 },
 ]
 
 /** VERIFY models (locked): gemini-3.5-flash-lite + gemini-3.1-flash-lite ONLY.
@@ -79,7 +80,7 @@ export const MODEL_POOL: ModelSpec[] = [
   ...PADDED_VERIFY_MODEL_POOL,
 ].filter((m, i, arr) => arr.findIndex((x) => x.id === m.id) === i)
 
-/** Is this model one of the two locked chunk-map models? */
+/** Is this model one of the three locked chunk-map models? */
 export function isChunkModel(id: string): boolean {
   return CHUNK_MODEL_POOL.some((m) => m.id === id)
 }
