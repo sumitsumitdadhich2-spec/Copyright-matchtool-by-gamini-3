@@ -107,10 +107,17 @@ export interface ShortSegmentState {
 
 export type RenderResolution = '480p' | '720p' | '1080p' | '2k' | '4k'
 
+export const RENDER_FPS_OPTIONS = [24, 30, 40, 50, 60] as const
+export type RenderFps = (typeof RENDER_FPS_OPTIONS)[number]
+
+export function isRenderFps(value: unknown): value is RenderFps {
+  return typeof value === 'number' && (RENDER_FPS_OPTIONS as readonly number[]).includes(value)
+}
+
 export interface RenderSettings {
   resolution: RenderResolution
-  /** output frames per second, 1-120; standard fractional rates are supported */
-  fps: number
+  /** supported output frame rate; kept fixed so scene and concat frame grids match */
+  fps: RenderFps
   /** video bitrate in kbps */
   videoBitrateKbps: number
   /** audio bitrate in kbps */
