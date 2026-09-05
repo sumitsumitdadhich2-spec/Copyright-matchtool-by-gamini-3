@@ -44,6 +44,15 @@ const SCAN_FPS_STR = String(SCAN_FPS)
 const IN_FLAGS = ['-fflags', '+genpts']
 /** Output-side flags shared by every encode. */
 const OUT_FLAGS = ['-avoid_negative_ts', 'make_zero', '-fps_mode', 'cfr', '-pix_fmt', 'yuv420p', '-threads', '1']
+/**
+ * Same flags for the FINAL JOIN, but multi-threaded (`-threads 0` = all cores).
+ *
+ * The join is ONE process that runs after every part is finished, so the other
+ * engine slots are idle: pinning it to a single core made a 2-minute render's
+ * join take ~8 minutes while 7 cores sat unused. `-threads` is already present
+ * here, so the pool's single-thread injection leaves these args alone.
+ */
+const JOIN_OUT_FLAGS = ['-avoid_negative_ts', 'make_zero', '-fps_mode', 'cfr', '-pix_fmt', 'yuv420p', '-threads', '0']
 /** Lossless audio for intermediate parts (no priming/padding — see header). */
 const PART_AUDIO = ['-c:a', 'pcm_s16le', '-ar', '48000']
 /** Container for intermediate parts: QuickTime carries PCM without `-strict` flags. */
@@ -488,7 +497,10 @@ export function joinArgs(listFile: string, spec: Pick<SliceEncodeSpec, 'width' |
     '-vf', extraVf ? `${extraVf},fps=${spec.fps},setsar=1` : `fps=${spec.fps},setsar=1`,
     ...vcodec,
     '-c:a', 'aac', '-b:a', `${spec.final.audioKbps}k`, '-ar', '48000', '-ac', String(spec.channels),
-    ...OUT_FLAGS,
+    // Multi-threaded: parts are all done by now, so the join owns every core.
+    // (Stream copy is NOT an option: parts are CRF 18 + PCM audio in .mov —
+    // the join is what applies the user's target bitrate and AAC.)
+    ...JOIN_OUT_FLAGS,
     '-movflags', '+faststart',
     outFile,
   ]
@@ -715,4 +727,4 @@ function even(n: number): number {
 }
 
 // Shared encode building blocks (used by lib/render.ts and lib/merge.ts).
-export { IN_FLAGS, OUT_FLAGS, PART_AUDIO, PART_EXT, SCAN_FPS, scalePadFilter }
+export { IN_FLAGS, JOIN_OUT_FLAGS, OUT_FLAGS, PART_AUDIO, PART_EXT, SCAN_FPS, scalePadFilter }
