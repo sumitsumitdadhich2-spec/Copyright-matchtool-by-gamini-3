@@ -118,6 +118,44 @@ export async function probeResolution(file: string): Promise<{ width: number; he
   }
 }
 
+interface PrescanMediaProfile {
+  format: string
+  videoCodec: string
+  audioCodec?: string
+  width: number
+  height: number
+  fps: number
+  pixelFormat?: string
+}
+
+/** Read the small set of properties needed to decide whether direct upload is safe. */
+async function probePrescanMedia(file: string): Promise<PrescanMediaProfile | null> {
+  try {
+    const out = await runFfprobe([
+      '-v', 'error', '-show_entries', 'format=format_name:stream=index,codec_type,codec_name,width,height,pix_fmt,avg_frame_rate',
+      '-of', 'json', file,
+    ])
+    const parsed = JSON.parse(out) as { format?: { format_name?: string }; streams?: Array<Record<string, unknown>> }
+    const video = parsed.streams?.find((stream) => stream.codec_type === 'video')
+    if (!video || typeof video.codec_name !== 'string' || typeof video.width !== 'number' || typeof video.height !== 'number') return null
+    const audio = parsed.streams?.find((stream) => stream.codec_type === 'audio')
+    const rate = String(video.avg_frame_rate || '')
+    const [n, d] = rate.split('/').map(Number)
+    const fps = d ? n / d : n
+    return {
+      format: String(parsed.format?.format_name || '').split(',')[0],
+      videoCodec: video.codec_name,
+      audioCodec: typeof audio?.codec_name === 'string' ? audio.codec_name : undefined,
+      width: video.width,
+      height: video.height,
+      fps: Number.isFinite(fps) && fps > 0 ? fps : 0,
+      pixelFormat: typeof video.pix_fmt === 'string' ? video.pix_fmt : undefined,
+    }
+  } catch {
+    return null
+  }
+}
+
 /** Probe the average frame rate of the first video stream (null when unknown). */
 export async function probeFps(file: string): Promise<number | null> {
   try {
@@ -653,10 +691,11 @@ export async function normalizeForTwelveLabs(sourceFile: string, scanId = 'tl', 
 export const PRESCAN_MAX_BYTES = 1.9 * 1024 * 1024 * 1024
 
 /**
- * Build the UPLOAD COPY of the movie for the Gemini Minute Finder: the trim
- * range cut precisely (no stream copy) and encoded at 480p / 24 fps / CRF 30
- * (parts in parallel, CRF 18 intermediates). If the result is still > 1.9 GB
- * the SAME parts are re-joined at 360p / CRF 32 — no second cut.
+ * Build the UPLOAD COPY of the movie for the Gemini Minute Finder. A full-range
+ * MP4/MOV that is already in a Gemini-friendly codec and under 1.9 GB is copied
+ * directly; partial trims and incompatible/oversized sources use a precise 480p
+ * / 24 fps / CRF 30 encode. If that result is still > 1.9 GB, the SAME parts
+ * are re-joined at 360p / CRF 32 — no second cut.
  */
 export async function preparePrescanMovieCopy(
   movieFile: string,
@@ -671,6 +710,24 @@ export async function preparePrescanMovieCopy(
   const rangeDur = Math.max(1, rangeEnd - trimStart)
   const scanId = opts.scanId || path.basename(path.dirname(outFile))
   const stage = 'prescan-copy'
+  const sourceSize = fs.statSync(movieFile).size
+  const sourceProfile = await probePrescanMedia(movieFile)
+  const fullRange = trimStart <= 0.05 && Math.abs(rangeEnd - movieDuration) <= 0.05
+  const directUploadSafe = sourceSize <= PRESCAN_MAX_BYTES && fullRange && sourceProfile &&
+    ['mp4', 'mov'].includes(sourceProfile.format) &&
+    ['h264', 'hevc', 'vp9', 'av1'].includes(sourceProfile.videoCodec) &&
+    (!sourceProfile.audioCodec || ['aac', 'mp3', 'opus', 'vorbis', 'ac3', 'eac3'].includes(sourceProfile.audioCodec)) &&
+    sourceProfile.fps > 0 && sourceProfile.fps <= 60
+
+  if (sourceProfile && directUploadSafe) {
+    fs.mkdirSync(path.dirname(outFile), { recursive: true })
+    onProgress(0, 'Source already Gemini-compatible — skipping re-encode')
+    fs.copyFileSync(movieFile, outFile)
+    opts.onLog?.(`ffmpeg: prescan source compatible (${sourceProfile.videoCodec}/${sourceProfile.audioCodec || 'no audio'}, ${sourceProfile.width}x${sourceProfile.height}, ${sourceProfile.fps.toFixed(2)} fps) — direct copy`)
+    onProgress(100, 'Movie copy ready (direct copy)')
+    return { durationSec: await probeDuration(outFile), sizeBytes: sourceSize, reencoded: false }
+  }
+
   const src = await probeResolution(movieFile)
   const ar = src ? src.width / src.height : 16 / 9
   const w480 = even(Math.round(480 * ar))

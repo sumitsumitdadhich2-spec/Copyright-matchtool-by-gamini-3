@@ -376,7 +376,7 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
     log(
       id,
       'info',
-      `Preparing movie upload copy: ${fmtDur(trimStart)} → ${fmtDur(trimEnd)} (${fmtDur(trimEnd - trimStart)}) — stream copy agar ≤1.9 GB, warna 480p re-encode`,
+      `Preparing movie upload copy: ${fmtDur(trimStart)} → ${fmtDur(trimEnd)} (${fmtDur(trimEnd - trimStart)}) — compatible full source ho to direct copy, warna precise 480p re-encode`,
     )
     let lastPct = -1
     const info = await preparePrescanMovieCopy(movieFile, copyPath, movieDuration, trimStart, trimEnd, (pct, note) => {
