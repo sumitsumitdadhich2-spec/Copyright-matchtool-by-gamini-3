@@ -169,12 +169,13 @@ export function deleteScan(id: string) {
   void deleteScanRemote(id)
 }
 
-export function newScan(): Scan {
+export function newScan(ownerUsername?: string): Scan {
   ensureDirs()
   const id = crypto.randomBytes(8).toString('hex')
   const scan: Scan = {
     id,
     createdAt: Date.now(),
+    ownerUsername,
     status: 'created',
     shortName: null,
     movieName: null,
@@ -275,6 +276,8 @@ export function listScans(): ScanSummary[] {
     out.push({
       id: s.id,
       createdAt: s.createdAt,
+      ownerUsername: s.ownerUsername,
+      background: s.background,
       status: s.status,
       movieName: s.movieName,
       shortName: s.shortName,

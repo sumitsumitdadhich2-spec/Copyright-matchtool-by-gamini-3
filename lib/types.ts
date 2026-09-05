@@ -586,6 +586,17 @@ export interface ScanReport {
 export interface Scan {
   id: string
   createdAt: number
+  /** Account that owns this scan and its background worker quota. */
+  ownerUsername?: string
+  /** Durable queue state; persisted so queued work can recover after restart. */
+  background?: {
+    state: 'queued' | 'running' | 'done' | 'stopped' | 'error'
+    enqueuedAt: number
+    startedAt?: number
+    position?: number
+    resume?: boolean
+    error?: string | null
+  }
   /** Last save timestamp — used to pick the freshest copy across serverless instances. */
   updatedAt?: number
   status: ScanStatus
@@ -639,6 +650,8 @@ export interface Scan {
 export interface ScanSummary {
   id: string
   createdAt: number
+  ownerUsername?: string
+  background?: Scan['background']
   status: ScanStatus
   movieName: string | null
   shortName: string | null

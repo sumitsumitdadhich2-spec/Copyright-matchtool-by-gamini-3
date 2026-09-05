@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server'
-import { scheduler } from '@/lib/scheduler'
 import { getSession } from '@/lib/users'
-import { getAllUserApiKeys, getUserTwelveLabsKey } from '@/lib/user-keys'
+import { enqueueBackgroundScan } from '@/lib/background-queue'
+import { getAllUserApiKeys } from '@/lib/user-keys'
 import { deductTokens, refundTokens, SCAN_TOKEN_COST } from '@/lib/tokens'
 import { isMinuteFinderRunning, stopAndWaitMinuteFinder } from '@/lib/gemini-minute-finder'
 
@@ -44,10 +44,6 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     charged = true
   }
 
-  // OPTIONAL Twelve Labs pre-filter key: passing it enables the embedding
-  // pre-filter at scan time. Missing key = normal full scan (feature off).
-  const tlApiKey = await getUserTwelveLabsKey(session.username)
-
   // Manual Start = the user's decision. A Gemini Minute Finder still running
   // for this scan is stopped first so it cannot fire its own scheduler.start
   // (or keep burning quota) underneath the manual scan.
@@ -62,11 +58,11 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     }
   }
 
-  const result = await scheduler.start(id, resume, userApiKeys, tlApiKey)
+  const result = await enqueueBackgroundScan(id, session.username, resume)
   if (!result.ok) {
-    // Scan didn't start — give the tokens back.
+    // Scan didn't enter the queue — give the tokens back.
     if (charged) await refundTokens(session.username, SCAN_TOKEN_COST)
     return NextResponse.json({ error: result.error }, { status: 400 })
   }
-  return NextResponse.json({ ok: true })
+  return NextResponse.json({ ok: true, queued: true })
 }
