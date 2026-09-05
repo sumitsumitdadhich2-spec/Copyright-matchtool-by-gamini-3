@@ -197,6 +197,70 @@ export async function verifyDuration(file: string, expected: number, fps: number
   return { ok, actual, expected, diff, tolerance }
 }
 
+interface ExportStreamProfile {
+  duration: number
+  start: number
+  fps: number | null
+  frames: number | null
+}
+
+export interface ExportSyncCheck {
+  ok: boolean
+  video: ExportStreamProfile
+  audio: ExportStreamProfile
+  expectedDuration: number
+  expectedFrames: number
+  issues: string[]
+}
+
+function rationalNumber(value: unknown): number | null {
+  const text = String(value ?? '')
+  const [numerator, denominator] = text.split('/').map(Number)
+  const parsed = denominator ? numerator / denominator : numerator
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+/** Probe streams independently; format duration can hide video/audio drift. */
+export async function verifyExportSync(file: string, expectedDuration: number, expectedFps: number, log?: FfmpegLog): Promise<ExportSyncCheck> {
+  const output = await runFfprobe([
+    '-v', 'error', '-show_entries',
+    'stream=codec_type,start_time,duration,duration_ts,time_base,avg_frame_rate,nb_frames',
+    '-of', 'json', file,
+  ])
+  const parsed = JSON.parse(output) as { streams?: Array<Record<string, unknown>> }
+  const readStream = (kind: 'video' | 'audio'): ExportStreamProfile => {
+    const stream = parsed.streams?.find((item) => item.codec_type === kind)
+    if (!stream) throw new Error(`Final export has no ${kind} stream`)
+    const timeBase = rationalNumber(stream.time_base)
+    const durationTs = Number(stream.duration_ts)
+    const duration = Number(stream.duration)
+    const frames = Number(stream.nb_frames)
+    return {
+      duration: Number.isFinite(duration) ? duration : Number.isFinite(durationTs) && timeBase ? durationTs * timeBase : 0,
+      start: Number.isFinite(Number(stream.start_time)) ? Number(stream.start_time) : 0,
+      fps: kind === 'video' ? rationalNumber(stream.avg_frame_rate) : null,
+      frames: kind === 'video' && Number.isFinite(frames) ? frames : null,
+    }
+  }
+  const video = readStream('video')
+  const audio = readStream('audio')
+  const expectedFrames = Math.round(expectedDuration * expectedFps)
+  const frameTolerance = 1 / expectedFps + 0.01
+  const audioTolerance = Math.max(frameTolerance, 1024 / 48000 + 0.01)
+  const issues: string[] = []
+  if (Math.abs(video.duration - expectedDuration) > frameTolerance) issues.push(`video duration ${(video.duration - expectedDuration) * 1000 >= 0 ? '+' : ''}${((video.duration - expectedDuration) * 1000).toFixed(0)}ms`)
+  if (Math.abs(audio.duration - expectedDuration) > audioTolerance) issues.push(`audio duration ${(audio.duration - expectedDuration) * 1000 >= 0 ? '+' : ''}${((audio.duration - expectedDuration) * 1000).toFixed(0)}ms`)
+  if (Math.abs((video.start + video.duration) - (audio.start + audio.duration)) > audioTolerance) issues.push(`A/V end skew ${(Math.abs((video.start + video.duration) - (audio.start + audio.duration)) * 1000).toFixed(0)}ms`)
+  if (Math.abs(video.start - audio.start) > frameTolerance) issues.push(`A/V start skew ${(Math.abs(video.start - audio.start) * 1000).toFixed(0)}ms`)
+  if (video.frames !== null && video.frames !== expectedFrames) issues.push(`frame count ${video.frames}, expected ${expectedFrames}`)
+  if (video.fps === null || Math.abs(video.fps - expectedFps) > Math.max(0.01, expectedFps * 0.001)) issues.push(`FPS ${video.fps?.toFixed(3) ?? 'unknown'}, expected ${expectedFps}`)
+  const summary = `Verify A/V: video ${video.duration.toFixed(3)}s/${video.frames ?? '?'}f @ ${video.fps?.toFixed(3) ?? '?'}fps; audio ${audio.duration.toFixed(3)}s; expected ${expectedDuration.toFixed(3)}s/${expectedFrames}f — ${issues.length ? `FAILED (${issues.join('; ')})` : 'OK'}`
+  log?.(summary)
+  if (issues.length) console.warn(`[verify] ${summary}`)
+  else console.log(`[verify] ${summary}`)
+  return { ok: issues.length === 0, video, audio, expectedDuration, expectedFrames, issues }
+}
+
 // ---------- Movie chunking (chunk-XXXX.mp4) ----------
 
 export interface ChunkOptions {
@@ -507,9 +571,9 @@ function partArgs(
   if (!hasAudio) args.push('-f', 'lavfi', '-t', dur.toFixed(3), '-i', `anullsrc=channel_layout=${spec.channels === 1 ? 'mono' : 'stereo'}:sample_rate=48000`)
   args.push(
     '-filter_complex',
-    `[0:v]${scalePadFilter(spec.width, spec.height, spec.fps)}[v];${hasAudio ? '[0:a]' : '[1:a]'}aresample=48000:async=1,aformat=channel_layouts=${spec.channels === 1 ? 'mono' : 'stereo'}[a]`,
+    `[0:v]${scalePadFilter(spec.width, spec.height, spec.fps)},setpts=PTS-STARTPTS[v];${hasAudio ? '[0:a]' : '[1:a]'}aresample=48000:async=0:first_pts=0,aformat=channel_layouts=${spec.channels === 1 ? 'mono' : 'stereo'},asetpts=N/SR/TB[a]`,
     '-map', '[v]', '-map', '[a]',
-    '-c:v', 'libx264', '-preset', spec.preset, '-crf', '18',
+    '-c:v', 'libx264', '-preset', spec.preset, '-crf', '18', '-bf', '0',
     '-force_key_frames', `expr:gte(t,n_forced*${CHUNK_SECONDS})`,
     ...PART_AUDIO, '-ac', String(spec.channels),
     ...OUT_FLAGS,
@@ -518,8 +582,14 @@ function partArgs(
   return args
 }
 
-/** Final join: concat demuxer → full re-encode at the target quality. */
-export function joinArgs(listFile: string, spec: Pick<SliceEncodeSpec, 'width' | 'height' | 'fps' | 'channels' | 'preset' | 'final'>, outFile: string, extraVf?: string): string[] {
+/** Final join: concat demuxer → one timeline-normalized target encode. */
+export function joinArgs(
+  listFile: string,
+  spec: Pick<SliceEncodeSpec, 'width' | 'height' | 'fps' | 'channels' | 'preset' | 'final'>,
+  outFile: string,
+  expectedDuration: number,
+  extraVf?: string,
+): string[] {
   const vcodec =
     'crf' in spec.final
       ? ['-c:v', 'libx264', '-preset', spec.preset, '-crf', String(spec.final.crf)]
@@ -529,21 +599,34 @@ export function joinArgs(listFile: string, spec: Pick<SliceEncodeSpec, 'width' |
           '-maxrate', `${Math.round(spec.final.videoKbps * 1.5)}k`,
           '-bufsize', `${spec.final.videoKbps * 2}k`,
         ]
+  const expectedFrames = Math.max(1, Math.round(expectedDuration * spec.fps))
+  const expectedSamples = Math.max(1, Math.round(expectedDuration * 48000))
+  const videoFilter = `${extraVf ? `${extraVf},` : ''}fps=${spec.fps},setsar=1,trim=end_frame=${expectedFrames},setpts=PTS-STARTPTS`
+  const audioFilter = `aresample=48000:async=0:first_pts=0,asetpts=N/SR/TB,apad=whole_len=${expectedSamples},atrim=end_sample=${expectedSamples},asetpts=N/SR/TB`
   return [
     '-y', ...IN_FLAGS, '-f', 'concat', '-safe', '0', '-i', listFile,
-    '-vf', extraVf ? `${extraVf},fps=${spec.fps},setsar=1` : `fps=${spec.fps},setsar=1`,
+    '-vf', videoFilter,
+    '-af', audioFilter,
+    '-frames:v', String(expectedFrames),
+    '-r', String(spec.fps),
     ...vcodec,
     '-c:a', 'aac', '-b:a', `${spec.final.audioKbps}k`, '-ar', '48000', '-ac', String(spec.channels),
     // Stream copy is not an option: parts are CRF 18 + PCM audio in .mov;
-    // this precise join applies the target bitrate and AAC inside one pool slot.
+    // timestamps and final stream lengths are normalized exactly once here.
     ...JOIN_OUT_FLAGS,
     '-movflags', '+faststart',
     outFile,
   ]
 }
 
-export function writeConcatList(listFile: string, files: string[]) {
-  fs.writeFileSync(listFile, files.map((f) => `file '${f.replace(/'/g, "'\\''")}'`).join('\n') + '\n')
+export function writeConcatList(listFile: string, files: string[], durations?: number[]) {
+  const lines = ['ffconcat version 1.0']
+  files.forEach((file, index) => {
+    lines.push(`file '${file.replace(/'/g, "'\\''")}'`)
+    const duration = durations?.[index]
+    if (duration && Number.isFinite(duration)) lines.push(`duration ${duration.toFixed(9)}`)
+  })
+  fs.writeFileSync(listFile, `${lines.join('\n')}\n`)
 }
 
 /**
@@ -596,19 +679,30 @@ export async function encodeParts(
   return { parts, workDir: placement.dir }
 }
 
-/** Join already-encoded parts into outFile (re-encode) and verify the duration. */
+export interface JoinOptions {
+  /** Planned duration for each input part; overrides padded container metadata. */
+  partDurations?: number[]
+  /** Reject and delete the output when duration/FPS/A-V checks fail. */
+  strict?: boolean
+}
+
+/** Join already-encoded parts into outFile and verify its independent streams. */
 export async function joinParts(
   parts: string[],
   spec: Pick<SliceEncodeSpec, 'width' | 'height' | 'fps' | 'channels' | 'preset' | 'final' | 'onProgress' | 'onLog' | 'token' | 'label'> & { scanId?: string },
   outFile: string,
   expectedDur: number,
   extraVf?: string,
+  options: JoinOptions = {},
 ): Promise<void> {
+  if (options.partDurations && options.partDurations.length !== parts.length) {
+    throw new Error('Part duration count does not match part file count')
+  }
   const listFile = `${outFile}.concat.txt`
-  writeConcatList(listFile, parts)
+  writeConcatList(listFile, parts, options.partDurations)
   const tmp = `${outFile}.tmp.mp4`
   try {
-    await runFfmpeg(joinArgs(listFile, spec, tmp, extraVf), {
+    await runFfmpeg(joinArgs(listFile, spec, tmp, expectedDur, extraVf), {
       label: `${spec.label || 'join'} join`,
       owner: spec.scanId,
       token: spec.token,
@@ -623,7 +717,14 @@ export async function joinParts(
     fs.rmSync(listFile, { force: true })
     fs.rmSync(tmp, { force: true })
   }
-  await verifyDuration(outFile, expectedDur, spec.fps, spec.onLog, path.basename(outFile))
+  const durationCheck = await verifyDuration(outFile, expectedDur, spec.fps, spec.onLog, path.basename(outFile))
+  if (options.strict) {
+    const syncCheck = await verifyExportSync(outFile, expectedDur, spec.fps, spec.onLog)
+    if (!durationCheck.ok || !syncCheck.ok) {
+      fs.rmSync(outFile, { force: true })
+      throw new Error(`Export verification failed: ${syncCheck.issues.join('; ') || `duration ${durationCheck.actual.toFixed(3)}s, expected ${expectedDur.toFixed(3)}s`}`)
+    }
+  }
 }
 
 // ---------- Twelve Labs normalize ----------

@@ -109,7 +109,7 @@ export type RenderResolution = '480p' | '720p' | '1080p' | '2k' | '4k'
 
 export interface RenderSettings {
   resolution: RenderResolution
-  /** output frames per second, 1-120 */
+  /** output frames per second, 1-120; standard fractional rates are supported */
   fps: number
   /** video bitrate in kbps */
   videoBitrateKbps: number

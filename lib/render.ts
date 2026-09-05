@@ -1,6 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import { IN_FLAGS, OUT_FLAGS, PART_AUDIO, PART_EXT, joinParts, probeDuration, probeHasAudio, scalePadFilter, verifyDuration } from './ffmpeg'
+import { IN_FLAGS, PART_AUDIO, PART_EXT, joinParts, probeDuration, probeHasAudio, scalePadFilter, verifyExportSync } from './ffmpeg'
 import { CancelToken, FfmpegCancelled, engineCount, parallelMap, runFfmpeg, sliceProgress } from './ffmpeg-pool'
 import { estimateBitrateBytes, placeWork, removeStageWork } from './work-dir'
 import { getScan, saveScan, scanMediaDir, addLog } from './store'
@@ -45,9 +45,10 @@ export function validateRenderSettings(input: unknown): { ok: true; settings: Re
     return { ok: false, error: 'Invalid resolution (480p, 720p, 1080p, 2k, 4k)' }
   }
   const fps = Number(s.fps)
-  if (!Number.isInteger(fps) || fps < 1 || fps > 120) {
-    return { ok: false, error: 'FPS must be an integer between 1 and 120' }
+  if (!Number.isFinite(fps) || fps < 1 || fps > 120) {
+    return { ok: false, error: 'FPS must be a number between 1 and 120 (fractional rates are supported)' }
   }
+  const normalizedFps = Number(fps.toFixed(3))
   const vb = Number(s.videoBitrateKbps)
   if (!Number.isFinite(vb) || vb < 250 || vb > 100000) {
     return { ok: false, error: 'Video bitrate must be between 250 and 100000 kbps' }
@@ -58,7 +59,7 @@ export function validateRenderSettings(input: unknown): { ok: true; settings: Re
   }
   return {
     ok: true,
-    settings: { resolution: s.resolution, fps, videoBitrateKbps: Math.round(vb), audioBitrateKbps: Math.round(ab) },
+    settings: { resolution: s.resolution, fps: normalizedFps, videoBitrateKbps: Math.round(vb), audioBitrateKbps: Math.round(ab) },
   }
 }
 
@@ -132,6 +133,8 @@ export async function startRender(scanId: string, settings: RenderSettings): Pro
   const mediaDir = scanMediaDir(scanId)
   const movieFile = path.join(mediaDir, 'movie.mp4')
   if (!fs.existsSync(movieFile)) return 'Original movie file not found'
+  // A new attempt must never leave an older or failed export downloadable.
+  fs.rmSync(renderOutputPath(scanId), { force: true })
 
   // Silent movie: audio stream refs would make ffmpeg fail — synthesize silence instead.
   const hasAudio = await probeHasAudio(movieFile)
@@ -195,14 +198,16 @@ function partArgs(movieFile: string, hasAudio: boolean, seg: SnappedSegment, w: 
   if (!hasAudio) args.push('-f', 'lavfi', '-t', readDur.toFixed(6), '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000')
   args.push(
     '-filter_complex',
-    `[0:v]${scalePadFilter(w, h, fps)}[v];${hasAudio ? '[0:a]' : '[1:a]'}aresample=48000:async=1,aformat=channel_layouts=stereo,atrim=0:${snapDur.toFixed(6)},asetpts=N/SR/TB[a]`,
+    `[0:v]${scalePadFilter(w, h, fps)},trim=end_frame=${seg.frames},setpts=PTS-STARTPTS[v];${hasAudio ? '[0:a]' : '[1:a]'}aresample=48000:async=0:first_pts=0,aformat=channel_layouts=stereo,atrim=end_sample=${Math.round(snapDur * 48000)},asetpts=N/SR/TB[a]`,
     '-map', '[v]', '-map', '[a]',
     '-frames:v', String(seg.frames),
-    '-c:v', 'libx264', '-preset', 'medium', '-crf', '18',
+    '-c:v', 'libx264', '-preset', 'medium', '-crf', '18', '-bf', '0',
     // Lossless PCM audio in parts: AAC priming/padding per part stacked up to
     // +2.3 s over 48 scenes (audio ran long, seams shifted, A/V drifted).
     ...PART_AUDIO, '-ac', '2',
-    ...OUT_FLAGS,
+    // Do not shift timestamps on intermediates. With B-frames,
+    // `avoid_negative_ts=make_zero` added two frames to every MOV duration.
+    '-fps_mode', 'cfr', '-pix_fmt', 'yuv420p', '-threads', '1',
     partFile,
   )
   return args
@@ -272,16 +277,15 @@ async function runRenderPipeline(
       })
       progress.complete(i, dur)
       const secs = (Date.now() - t0) / 1000
-      const check = await verifyDuration(partFiles[i], dur, settings.fps)
-      // Off-by is reported in FRAMES now — a snapped part should be exactly 0.
-      const offFrames = Math.round(check.diff * settings.fps)
+      const check = await verifyExportSync(partFiles[i], dur, settings.fps)
       const flags = `${seg.rejected ? ' rejected-kept' : ''}${seg.unverified ? ' unverified' : ''}`
       // FORCED persist: the 800 ms throttle used to silently drop most of these
       // (only 10 of 77 scene lines survived a real render).
       log(
-        check.ok && offFrames === 0 ? 'info' : 'warn',
-        `Scene ${i + 1}/${segments.length}: movie ${movieClock(seg.movieStart)} → ${movieClock(seg.movieEnd)} (${dur.toFixed(3)}s, ${seg.frames}f) [short ${fmtShortTs(seg.shortStart)}] origin=${originLabel(seg.origin, seg.originWindow)}${flags} encoded in ${secs.toFixed(1)}s (${(dur / Math.max(0.1, secs)).toFixed(1)}x)${offFrames === 0 ? '' : ` — off by ${offFrames} frame(s) (${(check.diff * 1000).toFixed(0)} ms, actual ${check.actual.toFixed(3)}s)`}`,
+        check.ok ? 'info' : 'error',
+        `Scene ${i + 1}/${segments.length}: movie ${movieClock(seg.movieStart)} → ${movieClock(seg.movieEnd)} (${dur.toFixed(3)}s, ${seg.frames}f) [short ${fmtShortTs(seg.shortStart)}] origin=${originLabel(seg.origin, seg.originWindow)}${flags} encoded in ${secs.toFixed(1)}s (${(dur / Math.max(0.1, secs)).toFixed(1)}x) — video ${check.video.duration.toFixed(3)}s/${check.video.frames ?? '?'}f, audio ${check.audio.duration.toFixed(3)}s${check.ok ? '' : ` — INVALID: ${check.issues.join('; ')}`}`,
       )
+      if (!check.ok) throw new Error(`Scene ${i + 1} failed timeline verification: ${check.issues.join('; ')}`)
     })
     if (token.cancelled) throw new FfmpegCancelled()
     const partsWall = (Date.now() - startedAt) / 1000
@@ -311,6 +315,8 @@ async function runRenderPipeline(
       },
       outFile,
       totalOut,
+      undefined,
+      { partDurations: segments.map((segment) => segment.snapDur), strict: true },
     )
 
     activeRenders.delete(scanId)
