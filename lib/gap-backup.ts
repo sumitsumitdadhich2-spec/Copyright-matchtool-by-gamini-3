@@ -7,7 +7,7 @@ import { ensureLocalMedia, localMediaPath } from './media'
 import { buildBackupClip, chunkPath, extractClipPrecise } from './ffmpeg'
 import { CHUNK_MODEL_POOL } from './models'
 import { deleteFileQuiet, getClient, parseGapFinderOutput, runGapFinderChunk, uploadVideo, type GapFinderPartSpec } from './gemini'
-import { coverageFromRanges, gapsOf, mergeRanges, shortTotalOf } from './short-coverage'
+import { COVERAGE_MIN_GAP_SEC, coverageFromRanges, gapsOf, mergeRanges, shortTotalOf } from './short-coverage'
 import { scheduler } from './scheduler'
 import type { ChunkMatch, GapBackupCandidate, GapBackupMinute, GapBackupPart, GapBackupRequest, GapBackupState, Scan, ShortRange } from './types'
 
@@ -37,7 +37,7 @@ function coverageMatches(scan: Scan) {
 function uncovered(scan: Scan): ShortRange[] {
   const total = shortTotalOf(scan)
   return gapsOf(mergeRanges(coverageMatches(scan).map((match) => ({ start: match.shortStart, end: match.shortEnd }))), total)
-    .filter((gap) => gap.end - gap.start >= 0.15)
+    .filter((gap) => gap.end - gap.start >= COVERAGE_MIN_GAP_SEC)
 }
 
 function buildParts(gaps: ShortRange[]): GapBackupPart[] {
@@ -296,8 +296,9 @@ async function runGapBackup(scan: Scan, apiKeys: string[], gaps: ShortRange[], c
             persist(scan, state)
             incrementModelUsage(lane.model.id, lane.key)
             const partList = parts.filter((part) => unresolved().includes(part.index))
-            const response = await runGapFinderChunk(lane.ai, lane.model.id, shortUploads.get(lane.keyId)!.uri, uploaded.uri, clipSpecs(partList), request.chunkStart, request.chunkEnd)
-            const hits = parseGapFinderOutput(response.text, new Set(partList.map((part) => part.index)), request.chunkStart, request.chunkEnd)
+            const specs = clipSpecs(partList)
+            const response = await runGapFinderChunk(lane.ai, lane.model.id, shortUploads.get(lane.keyId)!.uri, uploaded.uri, specs, request.chunkStart, request.chunkEnd)
+            const hits = parseGapFinderOutput(response.text, specs, request.chunkStart, request.chunkEnd)
             request.raw = response.text
             request.tokens = response.tokens ?? undefined
             request.matches = hits.length
