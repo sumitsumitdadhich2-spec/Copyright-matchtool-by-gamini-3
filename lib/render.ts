@@ -266,6 +266,7 @@ async function runRenderPipeline(
       const t0 = Date.now()
       await runFfmpeg(partArgs(movieFile, hasAudio, seg, w, h, settings.fps, partFiles[i]), {
         label: `render ${scanId.slice(0, 6)} part ${i + 1}/${segments.length}`,
+        owner: scanId,
         token,
         onStderr: progress.forSlice(i, dur),
       })
@@ -291,6 +292,7 @@ async function runRenderPipeline(
     await joinParts(
       partFiles,
       {
+        scanId,
         width: w,
         height: h,
         fps: settings.fps,

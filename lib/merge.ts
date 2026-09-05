@@ -129,7 +129,7 @@ export async function mergeVideos(shortFile: string, movieFile: string, outFile:
   const expected = shortDur + movieDur
   const [shortAudio, movieAudio] = await Promise.all([probeHasAudio(shortFile), probeHasAudio(movieFile)])
   const stage = 'merge-parts'
-  const common = { width: target.width, height: target.height, fps: target.fps, channels: 2 as const, preset: 'medium' as const, onLog: opts.onLog, token: opts.token }
+  const common = { scanId: opts.scanId, width: target.width, height: target.height, fps: target.fps, channels: 2 as const, preset: 'medium' as const, onLog: opts.onLog, token: opts.token }
 
   opts.onLog?.(`ffmpeg: merge target — ${target.summary}; audio: short ${shortAudio ? 'yes' : 'no (silence)'}, movie ${movieAudio ? 'yes' : 'no (silence)'}; ${engineCount()} engines`)
   removeStageWork(opts.scanId, stage)

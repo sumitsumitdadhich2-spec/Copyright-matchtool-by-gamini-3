@@ -28,13 +28,15 @@ function log(scan: Scan, level: 'info' | 'warn' | 'error' | 'success', msg: stri
   saveScan(scan)
 }
 
-function effectiveMatches(scan: Scan) {
-  return (scan.matches || []).filter((match) => !match.rejected)
+function coverageMatches(scan: Scan) {
+  // Coverage Review intentionally keeps rejected ranges covered so the same
+  // short footage is not searched again by the manual recovery pass.
+  return scan.matches || []
 }
 
 function uncovered(scan: Scan): ShortRange[] {
   const total = shortTotalOf(scan)
-  return gapsOf(mergeRanges(effectiveMatches(scan).map((match) => ({ start: match.shortStart, end: match.shortEnd }))), total)
+  return gapsOf(mergeRanges(coverageMatches(scan).map((match) => ({ start: match.shortStart, end: match.shortEnd }))), total)
     .filter((gap) => gap.end - gap.start >= 0.15)
 }
 
@@ -70,7 +72,7 @@ function orderedCandidateChunks(scan: Scan, minuteIndex: number): number[] {
     .filter((index) => index >= 0 && index <= maxChunk)
   const minuteStart = minuteIndex * 60
   const minuteEnd = minuteStart + 60
-  const accepted = effectiveMatches(scan)
+  const accepted = coverageMatches(scan)
   const before = accepted.filter((match) => match.shortEnd <= minuteStart).sort((a, b) => b.shortEnd - a.shortEnd)[0]
   const after = accepted.filter((match) => match.shortStart >= minuteEnd).sort((a, b) => a.shortStart - b.shortStart)[0]
   const anchors = [before?.chunkIndex, after?.chunkIndex].filter((value): value is number => typeof value === 'number')
@@ -83,7 +85,7 @@ function orderedCandidateChunks(scan: Scan, minuteIndex: number): number[] {
 }
 
 function scanCoverage(scan: Scan) {
-  return coverageFromRanges(effectiveMatches(scan).map((match) => ({ start: match.shortStart, end: match.shortEnd })), shortTotalOf(scan))
+  return coverageFromRanges(coverageMatches(scan).map((match) => ({ start: match.shortStart, end: match.shortEnd })), shortTotalOf(scan))
 }
 
 export function gapBackupRunning(id: string) {
@@ -109,6 +111,7 @@ export function startGapBackup(id: string, apiKeys: string[]) {
   if (!scan) return { ok: false, error: 'Scan not found' }
   if (scheduler.isRunning(id)) return { ok: false, error: 'Scan is still running — wait for verification to finish' }
   if (!scan.shortDuration || !scan.movieDuration || scan.awaitingTrim) return { ok: false, error: 'Upload both videos and confirm the movie trim first' }
+  if (scan.gapBackup?.candidates.some((candidate) => candidate.review === 'pending')) return { ok: false, error: 'Review the pending Gemini candidates before retrying unresolved ranges' }
   if (!apiKeys.length) return { ok: false, error: 'Add a Gemini API key in Settings first' }
   const gaps = uncovered(scan)
   if (!gaps.length) return { ok: false, error: 'No true uncovered ranges remain' }
@@ -159,6 +162,7 @@ async function runGapBackup(scan: Scan, apiKeys: string[], gaps: ShortRange[], c
   }
   persist(scan, state)
   log(scan, 'info', `Manual missing-scene finder started: ${parts.length} unresolved part(s) across ${minutes.length} short minute(s)`)
+  const uploadedResources: Array<{ ai: ReturnType<typeof getClient>; name: string }> = []
 
   try {
     const shortFile = (await ensureLocalMedia(scan.id, 'short')) || localMediaPath(scan.id, 'short')
@@ -168,19 +172,26 @@ async function runGapBackup(scan: Scan, apiKeys: string[], gaps: ShortRange[], c
     for (const minute of minutes) {
       if (control.stopping) break
       minute.status = 'preparing'
+      minute.startedAt = Date.now()
       state.progress = `Short minute ${minute.index + 1}: 24 fps clip prepare ho raha hai`
       persist(scan, state)
+      log(scan, 'info', `Missing-scene minute ${minute.index + 1}: preparing ${minute.partIds.length} gap part(s) at 24 fps`)
       const minuteParts = parts.filter((part) => minute.partIds.includes(part.index))
       const clipFile = path.join(mediaDir, 'gap-backup', `short-minute-${String(minute.index).padStart(3, '0')}.mp4`)
       const built = await buildBackupClip(shortFile, minuteParts.map((part) => ({ start: part.shortStart, end: part.shortEnd })), clipFile)
       minute.clip = { path: clipFile, durationSec: built.durationSec, sizeBytes: built.sizeBytes, fps: 24 }
+      minute.preparedAt = Date.now()
       minuteParts.forEach((part, index) => {
         part.clipStart = built.parts[index].clipStart
         part.clipEnd = built.parts[index].clipEnd
       })
       if (!minute.candidateChunks.length) {
         minute.status = 'failed'
+        minute.finishedAt = Date.now()
         minute.error = 'Original minute finder ne is short minute ke liye koi movie-minute suggestion nahi diya'
+        log(scan, 'warn', `Missing-scene minute ${minute.index + 1}: no minute-finder movie suggestions; skipped`)
+      } else {
+        log(scan, 'info', `Missing-scene minute ${minute.index + 1}: clip ready (${built.durationSec.toFixed(2)}s); chunk order ${minute.candidateChunks.map((value) => value + 1).join(', ')}`)
       }
       persist(scan, state)
     }
@@ -190,21 +201,51 @@ async function runGapBackup(scan: Scan, apiKeys: string[], gaps: ShortRange[], c
       .map((model) => ({ key, keyIndex, model, ai: getClient(key), keyId: apiKeyHash(key) })))
     if (!lanes.length) throw new Error('Saari Gemini chunk-model lanes ki daily quota exhausted hai')
 
-    for (const minute of minutes) {
+    const uploadJobs = new Map<number, Promise<Map<string, { uri: string; name: string }>>>()
+    const beginMinuteUpload = (minute: GapBackupMinute, foreground: boolean) => {
+      const existing = uploadJobs.get(minute.index)
+      if (existing) return existing
+      minute.status = 'uploading'
+      if (foreground) {
+        state.status = 'uploading'
+        state.progress = `Short minute ${minute.index + 1} upload ho raha hai`
+      }
+      persist(scan, state)
+      log(scan, 'info', `Missing-scene minute ${minute.index + 1}: uploading prepared clip to ${new Set(lanes.map((lane) => lane.keyId)).size} Gemini key(s)`)
+      const job = (async () => {
+        const uploads = new Map<string, { uri: string; name: string }>()
+        await Promise.all([...new Set(lanes.map((lane) => lane.keyId))].map(async (keyId) => {
+          const lane = lanes.find((item) => item.keyId === keyId)!
+          const upload = await uploadVideo(lane.ai, minute.clip!.path)
+          uploads.set(keyId, upload)
+          uploadedResources.push({ ai: lane.ai, name: upload.name })
+        }))
+        minute.uploadedAt = Date.now()
+        persist(scan, state)
+        return uploads
+      })()
+      uploadJobs.set(minute.index, job)
+      return job
+    }
+
+    for (let minutePosition = 0; minutePosition < minutes.length; minutePosition++) {
+      const minute = minutes[minutePosition]
       if (control.stopping) break
       if (minute.status === 'failed' || !minute.clip) continue
-      minute.status = 'uploading'
-      state.status = 'uploading'
-      state.progress = `Short minute ${minute.index + 1} upload ho raha hai`
-      persist(scan, state)
-      const shortUploads = new Map<string, { uri: string; name: string }>()
-      await Promise.all([...new Set(lanes.map((lane) => lane.keyId))].map(async (keyId) => {
-        const lane = lanes.find((item) => item.keyId === keyId)!
-        shortUploads.set(keyId, await uploadVideo(lane.ai, minute.clip!.path))
-      }))
+      const shortUploads = await beginMinuteUpload(minute, true)
+      if (control.stopping) {
+        for (const [keyId, upload] of shortUploads) {
+          const lane = lanes.find((item) => item.keyId === keyId)
+          if (lane) void deleteFileQuiet(lane.ai, upload.name)
+        }
+        break
+      }
 
       minute.status = 'searching'
       state.status = 'searching'
+      const nextMinute = minutes.slice(minutePosition + 1).find((item) => item.status !== 'failed' && item.clip)
+      if (nextMinute) void beginMinuteUpload(nextMinute, false)
+      log(scan, 'info', `Missing-scene minute ${minute.index + 1}: upload ready; Gemini chunk search started`)
       const unresolved = () => minute.partIds.filter((partId) => !state.candidates.some((candidate) => candidate.part === partId && candidate.review !== 'rejected'))
       const batchSize = Math.min(BATCH_SIZE, lanes.length)
       for (let offset = 0, batchNumber = 1; offset < minute.candidateChunks.length && unresolved().length; offset += batchSize, batchNumber++) {
@@ -213,9 +254,7 @@ async function runGapBackup(scan: Scan, apiKeys: string[], gaps: ShortRange[], c
         minute.currentBatch = batch
         state.activeBatch = batch
         state.progress = `Short minute ${minute.index + 1}: batch ${batchNumber}, chunks ${batch.map((value) => value + 1).join(', ')} Gemini par chal rahe hain`
-        persist(scan, state)
-
-        await Promise.all(batch.map(async (chunkIndex, slot) => {
+        const batchRequests = batch.map((chunkIndex, slot) => {
           const lane = lanes[(offset + slot) % lanes.length]
           const chunkStart = (scan.movieTrimStart ?? 0) + chunkIndex * 60
           const chunkEnd = Math.min(scan.movieTrimEnd ?? scan.movieDuration!, chunkStart + 60)
@@ -228,31 +267,41 @@ async function runGapBackup(scan: Scan, apiKeys: string[], gaps: ShortRange[], c
             chunkEnd,
             lane: `key ${lane.keyIndex + 1} · ${lane.model.id}`,
             model: lane.model.id,
-            status: 'uploading',
-            startedAt: Date.now(),
+            status: 'queued',
+            queuedAt: Date.now(),
           }
           state.requests.push(request)
+          return { chunkIndex, lane, request }
+        })
+        persist(scan, state)
+        log(scan, 'info', `Missing-scene minute ${minute.index + 1}: batch ${batchNumber} dispatched (${batch.length}/4 requests; chunks ${batch.map((value) => value + 1).join(', ')})`)
+
+        await Promise.all(batchRequests.map(async ({ chunkIndex, lane, request }) => {
+          request.status = 'uploading'
+          request.startedAt = Date.now()
           persist(scan, state)
           let uploadedName: string | null = null
           try {
             const chunkFile = await ensureChunk(scan, movieFile, chunkIndex)
             const uploaded = await uploadVideo(lane.ai, chunkFile)
             uploadedName = uploaded.name
+            uploadedResources.push({ ai: lane.ai, name: uploaded.name })
+            request.uploadedAt = Date.now()
             if (control.stopping) {
               request.status = 'cancelled'
               return
             }
             request.status = 'running'
+            state.requestCount = (state.requestCount || 0) + 1
             persist(scan, state)
             incrementModelUsage(lane.model.id, lane.key)
             const partList = parts.filter((part) => unresolved().includes(part.index))
-            const response = await runGapFinderChunk(lane.ai, lane.model.id, shortUploads.get(lane.keyId)!.uri, uploaded.uri, clipSpecs(partList), chunkStart, chunkEnd)
-            const hits = parseGapFinderOutput(response.text, new Set(partList.map((part) => part.index)), chunkStart, chunkEnd)
+            const response = await runGapFinderChunk(lane.ai, lane.model.id, shortUploads.get(lane.keyId)!.uri, uploaded.uri, clipSpecs(partList), request.chunkStart, request.chunkEnd)
+            const hits = parseGapFinderOutput(response.text, new Set(partList.map((part) => part.index)), request.chunkStart, request.chunkEnd)
             request.raw = response.text
             request.tokens = response.tokens ?? undefined
             request.matches = hits.length
             request.status = 'done'
-            state.requestCount = (state.requestCount || 0) + 1
             state.tokenCount = (state.tokenCount || 0) + (response.tokens || 0)
             for (const hit of hits) {
               if (state.candidates.some((candidate) => candidate.part === hit.part && Math.abs(candidate.movieStart - hit.movieStart) < 0.5 && candidate.review !== 'rejected')) continue
@@ -285,18 +334,31 @@ async function runGapBackup(scan: Scan, apiKeys: string[], gaps: ShortRange[], c
             minute.completedChunks.push(chunkIndex)
             if (uploadedName) void deleteFileQuiet(lane.ai, uploadedName)
             persist(scan, state)
+            const outcome = request.status === 'done'
+              ? `${request.matches || 0} strict match(es), ${(request.tokens || 0).toLocaleString()} tokens`
+              : request.error || request.status
+            log(scan, request.status === 'failed' ? 'error' : 'info', `Missing-scene minute ${minute.index + 1}, batch ${batchNumber}, chunk ${chunkIndex + 1}: ${outcome}`)
           }
         }))
+        const remaining = unresolved().length
+        log(scan, 'info', `Missing-scene minute ${minute.index + 1}: batch ${batchNumber} complete; ${remaining} part(s) still unresolved`)
       }
       for (const [keyId, upload] of shortUploads) {
         const lane = lanes.find((item) => item.keyId === keyId)
         if (lane) void deleteFileQuiet(lane.ai, upload.name)
       }
       minute.currentBatch = undefined
+      for (const partId of unresolved()) {
+        const part = parts.find((item) => item.index === partId)
+        if (part?.result === 'pending') part.result = 'unresolved'
+      }
       minute.status = state.candidates.some((candidate) => minute.partIds.includes(candidate.part) && candidate.review === 'pending') ? 'awaiting_review' : 'done'
+      minute.finishedAt = Date.now()
       persist(scan, state)
     }
 
+    await Promise.allSettled(uploadJobs.values())
+    await Promise.allSettled(uploadedResources.map(({ ai, name }) => deleteFileQuiet(ai, name)))
     state.activeBatch = undefined
     if (control.stopping) {
       state.status = 'stopped'
@@ -312,6 +374,7 @@ async function runGapBackup(scan: Scan, apiKeys: string[], gaps: ShortRange[], c
     persist(scan, state)
     log(scan, 'success', `Missing-scene finder finished: ${state.candidates.filter((candidate) => candidate.review === 'pending').length} candidate(s) awaiting review`)
   } catch (error) {
+    await Promise.allSettled(uploadedResources.map(({ ai, name }) => deleteFileQuiet(ai, name)))
     state.status = 'error'
     state.error = error instanceof Error ? error.message : String(error)
     state.progress = 'Finder error par ruk gaya; details niche request logs me hain'

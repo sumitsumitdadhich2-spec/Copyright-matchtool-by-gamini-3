@@ -514,7 +514,9 @@ export interface GapBackupRequest {
   tokens?: number
   matches?: number
   error?: string
+  queuedAt?: number
   startedAt?: number
+  uploadedAt?: number
   finishedAt?: number
 }
 
@@ -528,6 +530,10 @@ export interface GapBackupMinute {
   completedChunks: number[]
   currentBatch?: number[]
   clip?: { path: string; durationSec: number; sizeBytes: number; fps: 24 }
+  preparedAt?: number
+  uploadedAt?: number
+  startedAt?: number
+  finishedAt?: number
   error?: string
 }
 

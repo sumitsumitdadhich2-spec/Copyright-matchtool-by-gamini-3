@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import useSWR from 'swr'
 import { AlertTriangle, Check, ChevronDown, ChevronRight, Circle, Loader2, Play, RotateCcw, Search, Square, X } from 'lucide-react'
 import type { GapBackupCandidate, GapBackupRequest, GapBackupState, Scan, ShortCoverage, ShortRange } from '@/lib/types'
@@ -66,7 +66,12 @@ function ReviewCandidate({ scanId, candidate, onReview }: { scanId: string; cand
 }
 
 function RequestRow({ request }: { request: GapBackupRequest }) {
-  const [open, setOpen] = useState(false)
+  const shouldAutoOpen = request.status === 'uploading' || request.status === 'running' || request.status === 'failed'
+  const [open, setOpen] = useState(shouldAutoOpen)
+  useEffect(() => {
+    if (shouldAutoOpen) setOpen(true)
+    else if (request.status === 'done') setOpen(false)
+  }, [request.status, shouldAutoOpen])
   const elapsed = request.finishedAt && request.startedAt ? fmtDuration(request.finishedAt - request.startedAt) : null
   return (
     <div className="rounded-md border border-border bg-background/60">
@@ -170,7 +175,11 @@ export function GapBackupPanel({ scan }: { scan: Scan }) {
           </div>
           <p className="mt-3 text-xs text-foreground">{state.progress || state.status}</p>
           <div className="mt-2 flex flex-wrap gap-2 font-mono text-[10px] text-muted-foreground">
-            <span>{state.requestCount || 0} Gemini requests</span><span>·</span><span>{(state.tokenCount || 0).toLocaleString()} tokens</span><span>·</span><span>{state.minutes.length} short minute(s)</span><span>·</span><span>{pending.length} review pending</span>
+            <span>{state.requests.filter((request) => request.status === 'queued').length} queued</span><span>·</span>
+            <span>{state.requests.filter((request) => request.status === 'uploading' || request.status === 'running').length} active</span><span>·</span>
+            <span>{state.requests.filter((request) => request.status === 'done').length} completed</span><span>·</span>
+            <span>{state.requests.filter((request) => request.status === 'failed').length} failed</span><span>·</span>
+            <span>{state.requestCount || 0} Gemini attempts</span><span>·</span><span>{(state.tokenCount || 0).toLocaleString()} tokens</span><span>·</span><span>{pending.length} review pending</span>
           </div>
           {state.error && <p role="alert" className="mt-2 text-xs text-destructive">{state.error}</p>}
         </div>
@@ -185,9 +194,17 @@ export function GapBackupPanel({ scan }: { scan: Scan }) {
             {groupedRequests.map(({ minute, requests }) => (
               <article key={minute.index} className="rounded-lg border border-border p-3">
                 <div className="flex flex-wrap items-center gap-2"><Play className="size-3.5 text-primary" aria-hidden /><h4 className="text-xs font-semibold">Short minute {minute.index + 1}</h4><span className="font-mono text-[10px] text-muted-foreground">{fmtTime(minute.start)}–{fmtTime(minute.end)}</span><span className={`ml-auto rounded-full px-2 py-0.5 text-[10px] ${minute.status === 'failed' ? 'bg-destructive/15 text-destructive' : minute.status === 'awaiting_review' ? 'bg-warning/15 text-warning' : 'bg-primary/15 text-primary'}`}>{minute.status.replace('_', ' ')}</span></div>
-                <p className="mt-2 text-[10px] text-muted-foreground">Suggested chunks: {minute.candidateChunks.length ? minute.candidateChunks.map((chunk) => chunk + 1).join(', ') : 'none'}{minute.currentBatch?.length ? ` · running now: ${minute.currentBatch.map((chunk) => chunk + 1).join(', ')}` : ''}</p>
-                {minute.error && <p className="mt-2 text-xs text-destructive">{minute.error}</p>}
-                <div className="mt-2 flex flex-col gap-2">{requests.length ? requests.map((request) => <RequestRow key={request.id} request={request} />) : <p className="rounded-md border border-dashed border-border p-3 text-xs text-muted-foreground">Queue prepare ho rahi hai; request start hote hi lane, model aur raw reply yahan dikhega.</p>}</div>
+                <div className="mt-2 flex flex-wrap gap-2 font-mono text-[10px] text-muted-foreground">
+                  <span>{minute.partIds.length} gap part(s)</span><span>·</span>
+                  <span>{requests.filter((request) => request.status === 'queued').length} queued</span><span>·</span>
+                  <span>{requests.filter((request) => request.status === 'uploading' || request.status === 'running').length} active</span><span>·</span>
+                  <span>{minute.completedChunks.length}/{minute.candidateChunks.length} chunks checked</span>
+                  {minute.clip && <><span>·</span><span>{minute.clip.durationSec.toFixed(2)}s clip · {(minute.clip.sizeBytes / 1024 / 1024).toFixed(1)} MB · 24 fps</span></>}
+                </div>
+                <p className="mt-2 text-[10px] leading-relaxed text-muted-foreground">Search order: {minute.candidateChunks.length ? minute.candidateChunks.map((chunk) => `chunk ${chunk + 1}`).join(' → ') : 'No minute-finder suggestion'}{minute.currentBatch?.length ? ` · Current batch: ${minute.currentBatch.map((chunk) => chunk + 1).join(', ')}` : ''}</p>
+                <div className="mt-2 flex flex-wrap gap-1.5">{minute.partIds.map((partId) => { const part = state.parts.find((item) => item.index === partId); return <span key={partId} className="rounded bg-muted px-2 py-1 font-mono text-[10px] text-muted-foreground">P{partId} · {part?.result || 'pending'}</span> })}</div>
+                {minute.error && <p role="alert" className="mt-2 text-xs text-destructive">{minute.error}</p>}
+                <div className="mt-2 flex flex-col gap-2">{requests.length ? requests.map((request) => <RequestRow key={request.id} request={request} />) : <p className="rounded-md border border-dashed border-border p-3 text-xs leading-relaxed text-muted-foreground">{minute.status === 'failed' ? 'Is minute ke liye Gemini request nahi bheji gayi. Upar failure reason diya hai.' : minute.status === 'uploading' ? '24 fps clip Gemini Files par upload ho rahi hai. Upload complete hote hi request cards yahan aayenge.' : 'Clip aur request queue prepare ho rahi hai. Lane, model, timing aur raw reply request start hote hi yahan dikhenge.'}</p>}</div>
               </article>
             ))}
           </div>

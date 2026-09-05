@@ -1,6 +1,7 @@
 'use client'
 
 import { useEffect, useRef, useState, type DragEvent } from 'react'
+import { useSWRConfig } from 'swr'
 import { Film, Clapperboard, Loader2, CheckCircle2, X, RefreshCw, WifiOff } from 'lucide-react'
 import type { Scan } from '@/lib/types'
 import { fmtTime, fmtBytes } from '@/lib/format'
@@ -70,8 +71,9 @@ function readLocalDuration(file: File): Promise<number | null> {
 // the instant the last byte lands; the S3 backup happens in the background.
 
 export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Props) {
+  const { mutate: mutateCache } = useSWRConfig()
   const [jobs, setJobs] = useState<Job[]>([])
-  const [error, setError] = useState<string | null>(null)
+  const [errors, setErrors] = useState<Record<string, string>>({})
   const [local, setLocal] = useState<Record<string, LocalPick>>({})
   const [reused, setReused] = useState<Record<string, boolean>>({})
   const controllers = useRef(new Map<string, AbortController>())
@@ -111,15 +113,15 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
   }
 
   function uploadFile(kind: Kind, file: File) {
-    if (!isAllowedVideo(file)) {
-      setError('Only MP4, MOV, MKV or WebM video files are supported')
-      return
-    }
     const initialScanId = scanIdRef.current
     const tempKey = `${initialScanId ?? 'new'}/${kind}`
+    if (!isAllowedVideo(file)) {
+      setErrors((previous) => ({ ...previous, [tempKey]: 'Only MP4, MOV, MKV or WebM video files are supported' }))
+      return
+    }
     const controller = new AbortController()
     controllers.current.set(tempKey, controller)
-    setError(null)
+    setErrors((previous) => { const next = { ...previous }; delete next[tempKey]; return next })
     const initialProgress: UploadProgress = { phase: 'probing', sent: 0, total: file.size, bytesPerSec: null, peakBytesPerSec: 0, avgBytesPerSec: null, etaSec: null, reconnects: 0, resumedFrom: 0, offline: false }
     setJobs((previous) => [...previous.filter((item) => item.key !== tempKey), { key: tempKey, scanId: initialScanId, kind, progress: initialProgress }])
     setReused((previous) => ({ ...previous, [tempKey]: false }))
@@ -135,8 +137,22 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
           controllers.current.delete(tempKey)
           controllers.current.set(key, controller)
           setJobs((previous) => previous.map((item) => item.key === tempKey ? { ...item, key, scanId: id } : item))
-          setLocal((previous) => ({ ...previous, [key]: previous[tempKey] }))
-          setReused((previous) => ({ ...previous, [key]: previous[tempKey] || false }))
+          setLocal((previous) => {
+            const next = { ...previous, [key]: previous[tempKey] }
+            delete next[tempKey]
+            return next
+          })
+          setReused((previous) => {
+            const next = { ...previous, [key]: previous[tempKey] || false }
+            delete next[tempKey]
+            return next
+          })
+          setErrors((previous) => {
+            if (!previous[tempKey]) return previous
+            const next = { ...previous, [key]: previous[tempKey] }
+            delete next[tempKey]
+            return next
+          })
         }
         const result = await uploadVideoStream({
           scanId: id,
@@ -147,11 +163,20 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
         })
         setJobs((previous) => previous.filter((item) => item.key !== key))
         setReused((previous) => ({ ...previous, [key]: result.reused }))
-        refresh()
+        setErrors((previous) => { const next = { ...previous }; delete next[key]; delete next[tempKey]; return next })
+        await Promise.all([mutateCache(`/api/scans/${id}`), mutateCache('/api/scans')])
+        if (scanIdRef.current === id) refresh()
       } catch (err) {
         setJobs((previous) => previous.filter((item) => item.key !== key && item.key !== tempKey))
-        if (!controller.signal.aborted) setError(err instanceof Error ? err.message : 'Upload failed. Please try again.')
-        refresh()
+        if (!controller.signal.aborted) {
+          const message = err instanceof Error ? err.message : 'Upload failed. Please try again.'
+          setErrors((previous) => ({ ...previous, [key]: message }))
+        }
+        const failedScanId = key.split('/')[0]
+        if (failedScanId && failedScanId !== 'new') {
+          await Promise.all([mutateCache(`/api/scans/${failedScanId}`), mutateCache('/api/scans')])
+          if (scanIdRef.current === failedScanId) refresh()
+        }
       } finally {
         controllers.current.delete(key)
         controllers.current.delete(tempKey)
@@ -177,6 +202,7 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
   const movieJob = jobs.find((item) => item.key === movieKey) ?? null
   const shortServer = Boolean(scan?.shortName && scan?.shortDuration)
   const movieServer = Boolean(scan?.movieName && scan?.movieDuration)
+  const visibleErrors = [errors[shortKey], errors[movieKey]].filter((message): message is string => Boolean(message))
 
   return (
     <section aria-label="Upload videos" className="panel">
@@ -244,7 +270,7 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
           </div>
         </div>
       )}
-      {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
+      {visibleErrors.map((message) => <p key={message} role="alert" className="mt-2 text-xs text-destructive">{message}</p>)}
     </section>
   )
 }

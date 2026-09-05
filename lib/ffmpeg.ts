@@ -44,15 +44,10 @@ const SCAN_FPS_STR = String(SCAN_FPS)
 const IN_FLAGS = ['-fflags', '+genpts']
 /** Output-side flags shared by every encode. */
 const OUT_FLAGS = ['-avoid_negative_ts', 'make_zero', '-fps_mode', 'cfr', '-pix_fmt', 'yuv420p', '-threads', '1']
-/**
- * Same flags for the FINAL JOIN, but multi-threaded (`-threads 0` = all cores).
- *
- * The join is ONE process that runs after every part is finished, so the other
- * engine slots are idle: pinning it to a single core made a 2-minute render's
- * join take ~8 minutes while 7 cores sat unused. `-threads` is already present
- * here, so the pool's single-thread injection leaves these args alone.
- */
-const JOIN_OUT_FLAGS = ['-avoid_negative_ts', 'make_zero', '-fps_mode', 'cfr', '-pix_fmt', 'yuv420p', '-threads', '0']
+/** Final joins obey the same one-thread-per-engine contract as every other
+ * pooled process. This prevents one scan's join from silently consuming all
+ * cores while chunking or rendering for other scans is also active. */
+const JOIN_OUT_FLAGS = ['-avoid_negative_ts', 'make_zero', '-fps_mode', 'cfr', '-pix_fmt', 'yuv420p', '-threads', '1']
 /** Lossless audio for intermediate parts (no priming/padding — see header). */
 const PART_AUDIO = ['-c:a', 'pcm_s16le', '-ar', '48000']
 /** Container for intermediate parts: QuickTime carries PCM without `-strict` flags. */
@@ -207,6 +202,8 @@ export async function verifyDuration(file: string, expected: number, fps: number
 export interface ChunkOptions {
   onLog?: FfmpegLog
   token?: CancelToken
+  /** Scan/task owner used by the global pool for cross-scan fairness. */
+  owner?: string
 }
 
 /**
@@ -303,7 +300,7 @@ async function chunkRange(
       path.join(stagingFor(s), `${prefix}-%04d.mp4`),
     )
     const t0 = Date.now()
-    await runFfmpeg(args, { label: `${prefix}-slice-${s.index}`, token: opts.token, onStderr: progress.forSlice(s.index, sliceDur) })
+    await runFfmpeg(args, { label: `${prefix}-slice-${s.index}`, owner: opts.owner, token: opts.token, onStderr: progress.forSlice(s.index, sliceDur) })
     progress.complete(s.index, sliceDur)
     const secs = (Date.now() - t0) / 1000
     opts.onLog?.(`ffmpeg: slice ${s.index + 1}/${slices.length} done (${sliceDur.toFixed(0)}s of video in ${secs.toFixed(1)}s, ${(sliceDur / Math.max(0.1, secs)).toFixed(1)}x)`)
@@ -537,9 +534,8 @@ export function joinArgs(listFile: string, spec: Pick<SliceEncodeSpec, 'width' |
     '-vf', extraVf ? `${extraVf},fps=${spec.fps},setsar=1` : `fps=${spec.fps},setsar=1`,
     ...vcodec,
     '-c:a', 'aac', '-b:a', `${spec.final.audioKbps}k`, '-ar', '48000', '-ac', String(spec.channels),
-    // Multi-threaded: parts are all done by now, so the join owns every core.
-    // (Stream copy is NOT an option: parts are CRF 18 + PCM audio in .mov —
-    // the join is what applies the user's target bitrate and AAC.)
+    // Stream copy is not an option: parts are CRF 18 + PCM audio in .mov;
+    // this precise join applies the target bitrate and AAC inside one pool slot.
     ...JOIN_OUT_FLAGS,
     '-movflags', '+faststart',
     outFile,
@@ -591,7 +587,7 @@ export async function encodeParts(
   await parallelMap(slices, async (s) => {
     const dur = s.end - s.start
     const ts = Date.now()
-    await runFfmpeg(partArgs(spec, hasAudio, s, parts[s.index]), { label: `${label} part ${s.index}`, token: spec.token, onStderr: progress.forSlice(s.index, dur) })
+    await runFfmpeg(partArgs(spec, hasAudio, s, parts[s.index]), { label: `${label} part ${s.index}`, owner: spec.scanId, token: spec.token, onStderr: progress.forSlice(s.index, dur) })
     progress.complete(s.index, dur)
     const secs = (Date.now() - ts) / 1000
     spec.onLog?.(`ffmpeg: ${label} slice ${s.index + 1}/${slices.length}: ${dur.toFixed(1)}s in ${secs.toFixed(1)}s (${(dur / Math.max(0.1, secs)).toFixed(1)}x)`)
@@ -603,7 +599,7 @@ export async function encodeParts(
 /** Join already-encoded parts into outFile (re-encode) and verify the duration. */
 export async function joinParts(
   parts: string[],
-  spec: Pick<SliceEncodeSpec, 'width' | 'height' | 'fps' | 'channels' | 'preset' | 'final' | 'onProgress' | 'onLog' | 'token' | 'label'>,
+  spec: Pick<SliceEncodeSpec, 'width' | 'height' | 'fps' | 'channels' | 'preset' | 'final' | 'onProgress' | 'onLog' | 'token' | 'label'> & { scanId?: string },
   outFile: string,
   expectedDur: number,
   extraVf?: string,
@@ -614,6 +610,7 @@ export async function joinParts(
   try {
     await runFfmpeg(joinArgs(listFile, spec, tmp, extraVf), {
       label: `${spec.label || 'join'} join`,
+      owner: spec.scanId,
       token: spec.token,
       onStderr: (line) => {
         const { time, speed } = parseProgressLine(line)
@@ -769,7 +766,7 @@ export async function preparePrescanMovieCopy(
       fs.rmSync(outFile, { force: true })
       await joinParts(
         parts,
-        { width: w360, height: 360, fps: SCAN_FPS, channels: 1, preset: 'veryfast', final: { crf: 32, audioKbps: 48 }, onProgress, onLog: opts.onLog, token: opts.token, label: 'Minute Finder 360p' },
+        { scanId, width: w360, height: 360, fps: SCAN_FPS, channels: 1, preset: 'veryfast', final: { crf: 32, audioKbps: 48 }, onProgress, onLog: opts.onLog, token: opts.token, label: 'Minute Finder 360p' },
         outFile,
         rangeDur,
         `scale=${w360}:360`,
