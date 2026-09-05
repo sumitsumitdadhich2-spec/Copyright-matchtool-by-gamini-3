@@ -12,8 +12,8 @@ import type { ChunkMatch, Scan, ShortCoverage, ShortRange } from './types'
 // minute finder's backup pass imports them from here now.
 // ---------------------------------------------------------------------------
 
-/** Gaps shorter than this are rounding noise between adjacent matches — ignored. */
-export const COVERAGE_MIN_GAP_SEC = 0.15
+/** Missing intervals strictly shorter than 0.500 seconds are ignored. */
+export const COVERAGE_MIN_GAP_SEC = 0.5
 
 /** Union of ranges: sorted, overlapping/touching (≤ `touch` s apart) ranges merged. */
 export function mergeRanges(rs: ShortRange[], touch = 0.01): ShortRange[] {
@@ -42,8 +42,8 @@ export function gapsOf(covered: ShortRange[], total: number): ShortRange[] {
 /**
  * Gaps = short minus coverage, each padded ±`padSec` (clamped to the short),
  * merged, and anything shorter than `minGapSec` dropped.
- * The minute finder's backup pass uses pad 2 / min 4; the gap-backup pass uses
- * the same padding with a much smaller minimum (its movie side is verified at 24 fps).
+ * The minute finder's backup pass uses pad 2 / min 4; manual gap recovery uses
+ * the shared 0.500-second coverage threshold and verifies its movie side at 24 fps.
  */
 export function missingRanges(
   covered: ShortRange[],

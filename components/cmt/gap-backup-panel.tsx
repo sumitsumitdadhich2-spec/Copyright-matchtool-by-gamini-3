@@ -1,8 +1,8 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import useSWR from 'swr'
-import { AlertTriangle, Check, ChevronDown, ChevronRight, Circle, Loader2, Play, RotateCcw, Search, Square, X } from 'lucide-react'
+import { AlertTriangle, Check, ChevronDown, ChevronRight, Circle, Loader2, Pause, Play, RotateCcw, Search, Square, X } from 'lucide-react'
 import type { GapBackupCandidate, GapBackupRequest, GapBackupState, Scan, ShortCoverage, ShortRange } from '@/lib/types'
 import { fetcher, fmtDuration, fmtTime } from '@/lib/format'
 import { displayModelName } from '@/lib/models'
@@ -31,10 +31,87 @@ function requestTone(status: GapBackupRequest['status']) {
 
 function ReviewCandidate({ scanId, candidate, onReview }: { scanId: string; candidate: GapBackupCandidate; onReview: (id: string, action: 'accept' | 'reject') => void }) {
   const [busy, setBusy] = useState(false)
-  const shortSrc = `/api/scans/${scanId}/media?kind=short#t=${candidate.shortStart},${candidate.shortEnd}`
-  const movieSrc = `/api/scans/${scanId}/media?kind=movie#t=${candidate.movieStart},${candidate.movieEnd}`
+  const [playing, setPlaying] = useState(false)
+  const shortRef = useRef<HTMLVideoElement>(null)
+  const movieRef = useRef<HTMLVideoElement>(null)
+  const shortSrc = `/api/scans/${scanId}/media?kind=short`
+  const movieSrc = `/api/scans/${scanId}/media?kind=movie`
+  const shortDuration = candidate.shortEnd - candidate.shortStart
+
+  function pauseBoth(reset = false) {
+    const shortVideo = shortRef.current
+    const movieVideo = movieRef.current
+    shortVideo?.pause()
+    movieVideo?.pause()
+    if (reset) {
+      if (shortVideo) shortVideo.currentTime = candidate.shortStart
+      if (movieVideo) movieVideo.currentTime = candidate.movieStart
+    }
+    setPlaying(false)
+  }
+
+  useEffect(() => {
+    pauseBoth(true)
+  }, [candidate.id]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  function relativeTime(video: HTMLVideoElement, start: number) {
+    return Math.max(0, video.currentTime - start)
+  }
+
+  function seekToSharedPosition() {
+    const shortVideo = shortRef.current
+    const movieVideo = movieRef.current
+    if (!shortVideo || !movieVideo) return
+    const shortPosition = relativeTime(shortVideo, candidate.shortStart)
+    const moviePosition = relativeTime(movieVideo, candidate.movieStart)
+    const shortInRange = shortVideo.currentTime >= candidate.shortStart - 0.05 && shortVideo.currentTime < candidate.shortEnd - 0.05
+    const movieInRange = movieVideo.currentTime >= candidate.movieStart - 0.05 && movieVideo.currentTime < candidate.movieEnd - 0.05
+    const sharedPosition = shortInRange && movieInRange ? Math.min(shortPosition, moviePosition, shortDuration) : 0
+    shortVideo.currentTime = candidate.shortStart + sharedPosition
+    movieVideo.currentTime = candidate.movieStart + sharedPosition
+  }
+
+  async function togglePlay() {
+    const shortVideo = shortRef.current
+    const movieVideo = movieRef.current
+    if (!shortVideo || !movieVideo) return
+    if (playing) {
+      pauseBoth()
+      return
+    }
+    seekToSharedPosition()
+    try {
+      await Promise.all([shortVideo.play(), movieVideo.play()])
+      setPlaying(true)
+    } catch {
+      pauseBoth()
+    }
+  }
+
+  function synchronizeFromShort() {
+    const shortVideo = shortRef.current
+    const movieVideo = movieRef.current
+    if (!shortVideo || !movieVideo) return
+    const position = relativeTime(shortVideo, candidate.shortStart)
+    if (shortVideo.currentTime >= candidate.shortEnd - 0.02 || position >= shortDuration - 0.02) {
+      pauseBoth(true)
+      return
+    }
+    const movieTarget = candidate.movieStart + position
+    if (Math.abs(movieVideo.currentTime - movieTarget) > 0.12) movieVideo.currentTime = movieTarget
+  }
+
+  function handleNativePause() {
+    if (!playing) return
+    const shortVideo = shortRef.current
+    const movieVideo = movieRef.current
+    if (shortVideo && !shortVideo.paused) shortVideo.pause()
+    if (movieVideo && !movieVideo.paused) movieVideo.pause()
+    setPlaying(false)
+  }
 
   async function review(action: 'accept' | 'reject') {
+    pauseBoth()
     setBusy(true)
     await onReview(candidate.id, action)
     setBusy(false)
@@ -49,12 +126,20 @@ function ReviewCandidate({ scanId, candidate, onReview }: { scanId: string; cand
       <div className="mt-3 grid gap-3 md:grid-cols-2">
         <div>
           <div className="mb-1 flex items-center justify-between gap-2 text-xs font-medium"><span>Short missing range</span><span className="font-mono text-muted-foreground">{fmtTime(candidate.shortStart)}–{fmtTime(candidate.shortEnd)}</span></div>
-          <video controls preload="metadata" src={shortSrc} className="aspect-video w-full rounded-md bg-foreground/10 object-contain" aria-label="Short video missing range preview" />
+          <video ref={shortRef} preload="metadata" src={shortSrc} muted playsInline onLoadedMetadata={() => { if (shortRef.current) shortRef.current.currentTime = candidate.shortStart }} onTimeUpdate={synchronizeFromShort} onPause={handleNativePause} className="aspect-video w-full rounded-md bg-foreground/10 object-contain" aria-label="Short video missing range preview" />
         </div>
         <div>
           <div className="mb-1 flex items-center justify-between gap-2 text-xs font-medium"><span>Gemini movie candidate</span><span className="font-mono text-muted-foreground">{fmtTime(candidate.movieStart)}–{fmtTime(candidate.movieEnd)}</span></div>
-          <video controls preload="metadata" src={movieSrc} className="aspect-video w-full rounded-md bg-foreground/10 object-contain" aria-label="Movie candidate preview" />
+          <video ref={movieRef} preload="metadata" src={movieSrc} muted playsInline onLoadedMetadata={() => { if (movieRef.current) movieRef.current.currentTime = candidate.movieStart }} onTimeUpdate={() => { if (movieRef.current && movieRef.current.currentTime >= candidate.movieEnd - 0.02) pauseBoth(true) }} onPause={handleNativePause} className="aspect-video w-full rounded-md bg-foreground/10 object-contain" aria-label="Movie candidate preview" />
         </div>
+      </div>
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        <button type="button" onClick={() => void togglePlay()} className="flex items-center gap-1.5 rounded-md bg-primary px-4 py-2 text-xs font-medium text-primary-foreground">
+          {playing ? <Pause className="size-3.5" aria-hidden /> : <Play className="size-3.5" aria-hidden />}
+          {playing ? 'Pause both' : 'Play both'}
+        </button>
+        <button type="button" onClick={() => pauseBoth(true)} className="flex items-center gap-1.5 rounded-md border border-input px-3 py-2 text-xs font-medium hover:bg-secondary"><RotateCcw className="size-3.5" aria-hidden /> Restart</button>
+        <span className="text-xs text-muted-foreground">Synchronized from each range start</span>
       </div>
       <p className="mt-3 text-xs leading-relaxed text-muted-foreground"><span className="font-semibold text-foreground">Gemini evidence:</span> {candidate.reason}</p>
       <div className="mt-3 flex flex-wrap gap-2">

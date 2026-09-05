@@ -461,7 +461,7 @@ export interface ShortCoverage {
   totalSec: number
   /** 0-100, rounded to 1 decimal */
   pct: number
-  /** short ranges with NO match at all (gaps < 0.15 s ignored) */
+  /** short ranges with NO match at all (gaps < 0.500 s ignored) */
   gaps: ShortRange[]
   missingSec: number
   at: number

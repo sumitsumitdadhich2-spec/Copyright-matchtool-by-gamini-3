@@ -6,7 +6,7 @@ import { estimateBitrateBytes, placeWork, removeStageWork } from './work-dir'
 import { getScan, saveScan, scanMediaDir, addLog } from './store'
 import { RENDER_FPS_OPTIONS, isRenderFps, type RenderJob, type RenderResolution, type RenderSettings, type Scan } from './types'
 import { buildRenderSegments, snapSegments, totalSnappedSeconds, type SnappedSegment } from './render-segments'
-import { coverageFromRanges, coverageLine, fmtShortTs, shortTotalOf } from './short-coverage'
+import { COVERAGE_MIN_GAP_SEC, coverageFromRanges, coverageLine, fmtShortTs, shortTotalOf } from './short-coverage'
 import { originLabel } from './candidate-pick'
 
 export { buildRenderSegments } from './render-segments'
@@ -199,7 +199,7 @@ export async function startRender(scanId: string, settings: RenderSettings): Pro
     )
     const line = coverageLine(cov, '(render input)')
     addLog(scan, line.level, line.msg)
-    if (cov.missingSec >= 0.15) {
+    if (cov.missingSec >= COVERAGE_MIN_GAP_SEC) {
       addLog(
         scan,
         'warn',

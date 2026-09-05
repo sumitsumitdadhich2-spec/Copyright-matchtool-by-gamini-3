@@ -696,19 +696,57 @@ export interface GapFinderPartSpec {
 
 function gapFinderPrompt(parts: GapFinderPartSpec[], chunkStart: number, chunkEnd: number): string {
   const partMap = parts.map((part) =>
-    `P${part.id}: clip ${formatPromptTs(part.clipStart)}-${formatPromptTs(part.clipEnd)} | short ${formatPromptTs(part.shortStart)}-${formatPromptTs(part.shortEnd)}`,
+    `P${part.id}: Video 1 clip ${formatPromptTs(part.clipStart)}-${formatPromptTs(part.clipEnd)} = short ${formatPromptTs(part.shortStart)}-${formatPromptTs(part.shortEnd)} = exact duration ${(part.shortEnd - part.shortStart).toFixed(3)}s`,
   ).join('\n')
-  return `You are a strict forensic video matcher. Video 1 is a 24-fps clip containing ONLY unresolved ranges from one short-video minute. Video 2 is one 24-fps chunk from the original movie (${formatPromptTs(chunkStart)}-${formatPromptTs(chunkEnd)} on the original movie clock).
+  const chunkDuration = chunkEnd - chunkStart
+  return `Tum ek strict forensic video matcher ho. Dono videos exact 24 fps par diye gaye hain. Tumhara kaam Video 1 ke HAR listed unresolved part ko Video 2 me independently aur exhaustively dhundhna hai.
 
-PART MAP:\n${partMap}
+VIDEO STRUCTURE
+- Video 1 ek concatenated clip hai: short video ke sirf unresolved parts original order me jode gaye hain.
+- Parts ke beech black/silent separator ho sakta hai. Separator footage ka hissa NAHI hai.
+- Video 2 original movie ka ek cut chunk hai. Is uploaded file ki local clock 00:00.000 se ${formatPromptTs(chunkDuration)} tak hai.
+- Original movie me is chunk ki location ${formatPromptTs(chunkStart)}-${formatPromptTs(chunkEnd)} hai, lekin output me MOVIE column ke liye SIRF uploaded Video 2 ki LOCAL clock likhni hai. Absolute time calculate mat karo; application baad me offset add karegi.
 
-For EACH part, inspect dialogue, action order, camera shot, costume, props and background. Similar actors or location are NOT enough. A MATCH requires the same recording and same moment with concrete dialogue/action/frame evidence. Never calculate timestamps from an offset; read them from Video 2. If evidence is vague, partial, coincidental, or the exact footage is absent, return NOT_FOUND.
+PART MAP
+${partMap}
 
-Output exactly one final result line per part after your analysis:
-MATCH P<id> | SHORT mm:ss.mmm-mm:ss.mmm | MOVIE mm:ss.mmm-mm:ss.mmm | EVIDENCE: <exact dialogue/action/frame evidence>
-or
+HAR PART KE LIYE YE SEARCH METHOD FOLLOW KARO
+PASS 1 — PART FINGERPRINT:
+- Exact spoken dialogue ko verbatim quote karo; summarize ya translate mat karo.
+- Speaker order, pauses, distinctive music/SFX/ambient audio note karo.
+- Action sequence, cuts, camera movement, framing, costume, props, readable text aur stable background objects note karo.
+
+PASS 2 — EXHAUSTIVE MOVIE HUNT:
+- Video 2 ko beginning se end tak scan karo. Har part ko alag search karo; ek part ka result doosre par assume mat karo.
+- Pehle exact dialogue/audio cue locate karo, phir uske aas-paas frames confirm karo.
+- Audio absent/replaced ho to exact action order aur stable visual fingerprints se locate karo.
+- Dark scenes, fast cuts, close-ups, tiny inserts aur heavily cropped shots ko extra attention do; missing footage aksar yahin hoti hai.
+
+PASS 3 — SAME-RECORDING CONFIRMATION:
+MATCH tabhi hai jab underlying recording aur exact moment same ho. Strong proof me kam se kam ek ho:
+(a) wahi verbatim dialogue/audio cue at that position;
+(b) wahi distinctive actions same order me;
+(c) multiple stable visual fingerprints plus same shot progression.
+Sirf same actor, location, costume, generic action ya story moment MATCH nahi hai.
+
+TRANSFORM TOLERANCE — IN WAJAHON SE TRUE MATCH REJECT MAT KARO
+Crop, zoom, reframing, letterbox/aspect ratio, resolution, compression, blur, brightness/color grade, watermark, subtitles/text overlay, mirrored image, muted/replaced audio, added music, ya chhota speed change ignore karo jab underlying footage clearly same ho.
+
+STRICT RULES
+1. NO OFFSET EXTRAPOLATION: short time, part position, previous match, chunk location ya kisi formula se Video 2 timestamp guess/calculate karna forbidden hai. Frames/audio dekh kar Video 2 ki local clock read karo.
+2. ONE-TO-ONE WINDOW: MATCH window ka duration PART MAP ki exact duration ke barabar rakho. Sirf matching sub-shot mat do; listed part ka poora corresponding movie window do.
+3. DIALOGUE CHECK: Dialogue clear ho to same words Video 2 par sunai dene chahiye. Alag words = NOT_FOUND.
+4. SIMILAR IS NOT SAME: same people/place ka different take ya nearby moment = NOT_FOUND.
+5. NO FORCED MATCH: Is chunk me footage na hona normal hai. Vague, partial, coincidental ya uncertain evidence par NOT_FOUND do.
+6. ONE RESULT PER PART: Har listed P id ke liye exactly ek final line do. Koi part omit ya duplicate mat karo.
+7. FINAL SELF-CHECK: Har MATCH ko dobara verify karo: same recording? concrete evidence? local timestamp actually Video 2 se read kiya? duration exact? Inme se koi fail ho to NOT_FOUND me badlo.
+
+Pehle analysis kar sakte ho, lekin response ke end me machine-readable FINAL RESULTS block zaroor do. Har part ke liye exactly one line:
+MATCH P<id> | SHORT mm:ss.mmm-mm:ss.mmm | MOVIE mm:ss.mmm-mm:ss.mmm | EVIDENCE: <verbatim dialogue/audio/action/frame proof>
+ya
 NOT_FOUND P<id> | REASON: <concrete reason>
-Movie timestamps MUST use the ORIGINAL movie clock inside ${formatPromptTs(chunkStart)}-${formatPromptTs(chunkEnd)}. Do not omit any part.`
+
+MOVIE values strictly Video 2 local range 00:00.000-${formatPromptTs(chunkDuration)} me honi chahiye. SHORT values PART MAP ke short range ko exactly repeat karein.`
 }
 
 function formatPromptTs(sec: number): string {
@@ -748,20 +786,45 @@ export async function runGapFinderChunk(
   }
 }
 
-export function parseGapFinderOutput(raw: string, validParts: Set<number>, chunkStart: number, chunkEnd: number) {
+export function parseGapFinderOutput(raw: string, parts: GapFinderPartSpec[], chunkStart: number, chunkEnd: number) {
   const hits: Array<{ part: number; shortStart: number; shortEnd: number; movieStart: number; movieEnd: number; evidence: string }> = []
-  const pattern = /MATCH\s+P(\d+)\s*\|\s*SHORT\s+([\d:.]+)\s*-\s*([\d:.]+)\s*\|\s*MOVIE\s+([\d:.]+)\s*-\s*([\d:.]+)\s*\|\s*EVIDENCE:\s*(.+)/gi
-  for (const match of raw.matchAll(pattern)) {
+  const specs = new Map(parts.map((part) => [part.id, part]))
+  const acceptedParts = new Set<number>()
+  const chunkDuration = chunkEnd - chunkStart
+  const finalResultsAt = raw.toUpperCase().lastIndexOf('FINAL RESULTS')
+  const resultText = finalResultsAt >= 0 ? raw.slice(finalResultsAt) : raw
+  const pattern = /MATCH\s+P(\d+)\s*\|\s*SHORT\s+([\d:.]+)\s*(?:-|–|—|to)\s*([\d:.]+)\s*\|\s*MOVIE\s+([\d:.]+)\s*(?:-|–|—|to)\s*([\d:.]+)\s*\|\s*EVIDENCE:\s*(.+)/gi
+  for (const match of resultText.matchAll(pattern)) {
     const part = Number(match[1])
-    const shortStart = parseTs(match[2])
-    const shortEnd = parseTs(match[3])
-    const movieStart = parseTs(match[4])
-    const movieEnd = parseTs(match[5])
+    const spec = specs.get(part)
+    const reportedShortStart = parseTs(match[2])
+    const reportedShortEnd = parseTs(match[3])
+    const localMovieStart = parseTs(match[4])
+    const localMovieEnd = parseTs(match[5])
     const evidence = match[6].trim().slice(0, 600)
-    if (!validParts.has(part) || shortStart === null || shortEnd === null || movieStart === null || movieEnd === null) continue
-    if (shortEnd <= shortStart || movieEnd <= movieStart || movieStart < chunkStart - 0.5 || movieEnd > chunkEnd + 0.5) continue
-    if (evidence.length < 12 || /vague|similar scene|maybe|possibly/i.test(evidence)) continue
-    hits.push({ part, shortStart, shortEnd, movieStart, movieEnd, evidence })
+    if (!spec || acceptedParts.has(part) || reportedShortStart === null || reportedShortEnd === null || localMovieStart === null || localMovieEnd === null) continue
+
+    const targetDuration = spec.shortEnd - spec.shortStart
+    const reportedMovieDuration = localMovieEnd - localMovieStart
+    const durationTolerance = Math.max(0.25, targetDuration * 0.2)
+    const shortClockMatches = Math.abs(reportedShortStart - spec.shortStart) <= 0.25 && Math.abs(reportedShortEnd - spec.shortEnd) <= 0.25
+    const localClockValid = localMovieStart >= -0.05 && localMovieStart < chunkDuration && localMovieEnd <= chunkDuration + 0.25
+    if (!shortClockMatches || targetDuration <= 0 || reportedMovieDuration <= 0 || !localClockValid) continue
+    if (Math.abs(reportedMovieDuration - targetDuration) > durationTolerance) continue
+    if (evidence.length < 16 || /\b(?:vague|similar scene|maybe|possibly|uncertain|appears to)\b/i.test(evidence)) continue
+
+    const movieStart = chunkStart + Math.max(0, localMovieStart)
+    const movieEnd = movieStart + targetDuration
+    if (movieStart < chunkStart - 0.05 || movieEnd > chunkEnd + 0.05) continue
+    acceptedParts.add(part)
+    hits.push({
+      part,
+      shortStart: spec.shortStart,
+      shortEnd: spec.shortEnd,
+      movieStart,
+      movieEnd,
+      evidence,
+    })
   }
   return hits
 }
