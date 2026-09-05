@@ -221,8 +221,36 @@ export function getScan(id: string): Scan | null {
   return scan
 }
 
+/** Log retention: a real render alone emits ~80 scene lines on top of the scan's
+ *  own thousands, and the old 600/500 cap threw away almost all of them. When the
+ *  cap IS hit, INFO lines are dropped first — error/warn/success lines (the ones
+ *  that explain what went wrong) are kept until nothing else is left to drop. */
+const LOG_MAX = 4000
+const LOG_KEEP = 3500
+
+function trimLogs(logs: LogEntry[]): LogEntry[] {
+  if (logs.length <= LOG_MAX) return logs
+  let toDrop = logs.length - LOG_KEEP
+  const keep = new Array<boolean>(logs.length).fill(true)
+  // Oldest-first: drop info lines only.
+  for (let i = 0; i < logs.length && toDrop > 0; i++) {
+    if (logs[i].level === 'info') {
+      keep[i] = false
+      toDrop--
+    }
+  }
+  // Still too long (almost all lines are warn/error) — drop the oldest of those.
+  for (let i = 0; i < logs.length && toDrop > 0; i++) {
+    if (keep[i]) {
+      keep[i] = false
+      toDrop--
+    }
+  }
+  return logs.filter((_, i) => keep[i])
+}
+
 export function saveScan(scan: Scan, opts?: { immediate?: boolean }) {
-  if (scan.logs.length > 600) scan.logs = scan.logs.slice(-500)
+  scan.logs = trimLogs(scan.logs)
   scan.updatedAt = Date.now()
   writeJSON(scanFile(scan.id), scan)
   // Mirror to S3 (throttled, fire-and-forget) so results survive instance loss.

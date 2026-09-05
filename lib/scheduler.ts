@@ -1,7 +1,7 @@
 import path from 'node:path'
 import fs from 'node:fs'
 import type { GoogleGenAI } from '@google/genai'
-import type { Scan, ChunkState, ChunkMatch, CandidateGroup, ShortSegmentState, ScanReport } from './types'
+import type { Scan, ChunkState, ChunkMatch, CandidateGroup, ShortSegmentState, ScanReport, ShortCoverage } from './types'
 import {
   MODEL_POOL,
   CHUNK_MODEL_POOL,
@@ -973,6 +973,8 @@ class Scheduler {
       'success',
       `Scan complete: ${scan.matches.length} matched segment(s)${multi ? ` across ${segments.length} short minute(s)` : ''} — ${scan.prefilter?.mode === 'prefiltered' ? 'Twelve Labs pre-filtered scan' : 'Full scan'}`,
     )
+    // COVERAGE: kitna short actually merge me ja raha hai — MISSING hisse LOUD.
+    this.logCoverage(job)
     cleanupChunks(path.join(scanMediaDir(scan.id), 'chunks'))
     cleanupClips(path.join(scanMediaDir(scan.id), 'clips'))
     addLog(scan, 'info', 'Temporary chunk files cleaned up')
@@ -1700,9 +1702,24 @@ class Scheduler {
     }
   }
 
+  /**
+   * The ONE coverage line: how much of the short the current match set covers,
+   * with the exact MISSING list. warn when anything is missing, success at 100 %.
+   * Logged at scan end and with every partial report; the gap-backup pass logs
+   * it again afterwards with the recovered seconds.
+   */
+  private logCoverage(job: Job, extra?: string): ShortCoverage {
+    const { scan } = job
+    const cov = computeShortCoverage(scan)
+    const line = coverageLine(cov, extra)
+    addLog(scan, line.level, line.msg)
+    this.mark(job)
+    return cov
+  }
+
   /** Rewrite scan.matches for a finished group:
    *  confirmed → ONE verified match (rescan window when confirmedViaRescan),
-   *  rejected → all this group's matches removed,
+   *  rejected → best candidate KEPT in the merge, flagged rejected (verified=false),
    *  unverified → original candidate windows kept, flagged verified=false. */
   private applyGroupResult(job: Job, g: CandidateGroup) {
     const { scan } = job
@@ -1728,6 +1745,7 @@ class Scheduler {
         'info',
         `Partial results saved: ${scan.matches.length} match(es) (verified + unverified dono) — export/preview ab available hai, Resume karne par scan wahi se continue hoga`,
       )
+      this.logCoverage(job, '(partial — Resume se aur cover hoga)')
     }
     // Make the gaps LOUD: a partial report used to say "Chunks failed: 0" while
     // re-queued chunks (fetch failed / 429) never ran, and in-flight verifier

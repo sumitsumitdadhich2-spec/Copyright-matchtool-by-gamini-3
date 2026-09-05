@@ -5,7 +5,9 @@ import { CancelToken, FfmpegCancelled, engineCount, parallelMap, runFfmpeg, slic
 import { estimateBitrateBytes, placeWork, removeStageWork } from './work-dir'
 import { getScan, saveScan, scanMediaDir, addLog } from './store'
 import type { RenderJob, RenderResolution, RenderSettings, Scan } from './types'
-import { buildRenderSegments, totalStitchedSeconds, type RenderSegment } from './render-segments'
+import { buildRenderSegments, snapSegments, totalSnappedSeconds, type SnappedSegment } from './render-segments'
+import { coverageFromRanges, coverageLine, fmtShortTs, shortTotalOf } from './short-coverage'
+import { originLabel } from './candidate-pick'
 
 export { buildRenderSegments } from './render-segments'
 
@@ -77,6 +79,15 @@ export function renderOutputPath(scanId: string): string {
 
 const RENDER_STAGE = 'render-parts'
 
+/** HH:MM:SS.mmm on the ORIGINAL movie clock (scene logs). */
+function movieClock(sec: number): string {
+  const s = Math.max(0, sec)
+  const h = Math.floor(s / 3600)
+  const m = Math.floor((s % 3600) / 60)
+  const r = s - h * 3600 - m * 60
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${r.toFixed(3).padStart(6, '0')}`
+}
+
 function freshJob(settings: RenderSettings, totalOutputSeconds: number, segmentCount: number): RenderJob {
   return {
     status: 'rendering',
@@ -113,7 +124,9 @@ export async function startRender(scanId: string, settings: RenderSettings): Pro
     scan.renderJob.error = 'Previous render was interrupted'
   }
 
-  const segments = buildRenderSegments(scan)
+  // FRAME GRID: scenes are snapped to the output fps before anything is
+  // encoded, so the expected total is an exact frame count (see render-segments).
+  const segments = snapSegments(buildRenderSegments(scan), settings.fps)
   if (segments.length === 0) return 'No matched scenes to render'
 
   const mediaDir = scanMediaDir(scanId)
@@ -123,14 +136,38 @@ export async function startRender(scanId: string, settings: RenderSettings): Pro
   // Silent movie: audio stream refs would make ffmpeg fail — synthesize silence instead.
   const hasAudio = await probeHasAudio(movieFile)
 
-  const totalOut = totalStitchedSeconds(segments)
+  const totalOut = totalSnappedSeconds(segments, settings.fps)
   scan.renderJob = freshJob(settings, totalOut, segments.length)
   const engines = engineCount()
   addLog(
     scan,
     'info',
-    `Render started: ${segments.length} scenes, ${totalOut.toFixed(1)}s output, ${settings.resolution} @ ${settings.fps}fps, ${settings.videoBitrateKbps}kbps video / ${settings.audioBitrateKbps}kbps audio — ${Math.min(engines, segments.length)} part(s) at a time on ${engines} engines, precise re-encode (no stream copy)${scan.status === 'stopped' ? ' — PARTIAL export (scan stopped; ab tak ke matches)' : ''}`,
+    `Render started: ${segments.length} scenes, ${totalOut.toFixed(3)}s output (${segments.reduce((n, s) => n + s.frames, 0)} frames @ ${settings.fps}fps), ${settings.resolution}, ${settings.videoBitrateKbps}kbps video / ${settings.audioBitrateKbps}kbps audio — ${Math.min(engines, segments.length)} part(s) at a time on ${engines} engines, precise re-encode (no stream copy)${scan.status === 'stopped' ? ' — PARTIAL export (scan stopped; ab tak ke matches)' : ''}`,
   )
+  // COVERAGE of what is ACTUALLY being rendered (not just what the scan matched):
+  // overlap trimming and duplicate skipping happen in buildRenderSegments, so
+  // this is the honest "kitna short output me ja raha hai" number.
+  const shortTotal = shortTotalOf(scan)
+  if (shortTotal > 0) {
+    const cov = coverageFromRanges(
+      segments.map((s) => ({ start: s.shortStart, end: s.shortEnd })),
+      shortTotal,
+    )
+    const line = coverageLine(cov, '(render input)')
+    addLog(scan, line.level, line.msg)
+    if (cov.missingSec >= 0.15) {
+      addLog(
+        scan,
+        'warn',
+        `Expected output = ${totalOut.toFixed(3)} s (short is ${shortTotal.toFixed(3)} s, ${cov.missingSec.toFixed(1)} s NOT rendered) — missing: ${cov.gaps
+          .slice(0, 20)
+          .map((gp) => `${fmtShortTs(gp.start)}–${fmtShortTs(gp.end)}`)
+          .join(', ')}${cov.gaps.length > 20 ? ` … +${cov.gaps.length - 20} more` : ''}`,
+      )
+    }
+    scan.renderJob.coverage = cov
+    scan.renderJob.shortSeconds = shortTotal
+  }
   saveScan(scan)
 
   const token = new CancelToken()
@@ -142,17 +179,25 @@ export async function startRender(scanId: string, settings: RenderSettings): Pro
   return null
 }
 
-/** Part encode: frame-accurate cut + CRF 18 intermediate at the final geometry/fps. */
-function partArgs(movieFile: string, hasAudio: boolean, seg: RenderSegment, w: number, h: number, fps: number, partFile: string): string[] {
-  const dur = Math.max(0.1, seg.movieEnd - seg.movieStart)
+/** Part encode: frame-accurate cut + CRF 18 intermediate at the final geometry/fps.
+ *
+ *  EXACT LENGTH: the scene's snapped frame count is forced with `-frames:v` and
+ *  the audio is trimmed to the matching `frames / fps` seconds. Without this the
+ *  `fps=` filter rounded a 28.008-frame scene UP to 29 frames (+41 ms), which
+ *  stacked into +1.78 s of drift across a 77-scene render. A little extra input
+ *  is read (`-t` + one frame) so the last frame is always available to encode. */
+function partArgs(movieFile: string, hasAudio: boolean, seg: SnappedSegment, w: number, h: number, fps: number, partFile: string): string[] {
+  const snapDur = seg.snapDur
+  const readDur = snapDur + 2 / fps
   const args: string[] = ['-y', ...IN_FLAGS]
-  if (seg.movieStart > 0.0005) args.push('-ss', seg.movieStart.toFixed(3))
-  args.push('-t', dur.toFixed(3), '-i', movieFile)
-  if (!hasAudio) args.push('-f', 'lavfi', '-t', dur.toFixed(3), '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000')
+  if (seg.movieStart > 0.0005) args.push('-ss', seg.movieStart.toFixed(6))
+  args.push('-t', readDur.toFixed(6), '-i', movieFile)
+  if (!hasAudio) args.push('-f', 'lavfi', '-t', readDur.toFixed(6), '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000')
   args.push(
     '-filter_complex',
-    `[0:v]${scalePadFilter(w, h, fps)}[v];${hasAudio ? '[0:a]' : '[1:a]'}aresample=48000:async=1,aformat=channel_layouts=stereo[a]`,
+    `[0:v]${scalePadFilter(w, h, fps)}[v];${hasAudio ? '[0:a]' : '[1:a]'}aresample=48000:async=1,aformat=channel_layouts=stereo,atrim=0:${snapDur.toFixed(6)},asetpts=N/SR/TB[a]`,
     '-map', '[v]', '-map', '[a]',
+    '-frames:v', String(seg.frames),
     '-c:v', 'libx264', '-preset', 'medium', '-crf', '18',
     // Lossless PCM audio in parts: AAC priming/padding per part stacked up to
     // +2.3 s over 48 scenes (audio ran long, seams shifted, A/V drifted).
@@ -166,7 +211,7 @@ function partArgs(movieFile: string, hasAudio: boolean, seg: RenderSegment, w: n
 async function runRenderPipeline(
   scanId: string,
   settings: RenderSettings,
-  segments: RenderSegment[],
+  segments: SnappedSegment[],
   movieFile: string,
   hasAudio: boolean,
   totalOut: number,
@@ -217,7 +262,7 @@ async function runRenderPipeline(
     })
 
     await parallelMap(segments, async (seg, i) => {
-      const dur = Math.max(0.1, seg.movieEnd - seg.movieStart)
+      const dur = seg.snapDur
       const t0 = Date.now()
       await runFfmpeg(partArgs(movieFile, hasAudio, seg, w, h, settings.fps, partFiles[i]), {
         label: `render ${scanId.slice(0, 6)} part ${i + 1}/${segments.length}`,
@@ -227,12 +272,14 @@ async function runRenderPipeline(
       progress.complete(i, dur)
       const secs = (Date.now() - t0) / 1000
       const check = await verifyDuration(partFiles[i], dur, settings.fps)
-      persist((s) =>
-        addLog(
-          s,
-          check.ok ? 'info' : 'warn',
-          `Scene ${i + 1}/${segments.length}: ${seg.movieStart.toFixed(3)}s → ${seg.movieEnd.toFixed(3)}s (${dur.toFixed(2)}s) encoded in ${secs.toFixed(1)}s (${(dur / Math.max(0.1, secs)).toFixed(1)}x)${check.ok ? '' : ` — duration ${check.actual.toFixed(3)}s (off by ${(check.diff * 1000).toFixed(0)} ms)`}`,
-        ),
+      // Off-by is reported in FRAMES now — a snapped part should be exactly 0.
+      const offFrames = Math.round(check.diff * settings.fps)
+      const flags = `${seg.rejected ? ' rejected-kept' : ''}${seg.unverified ? ' unverified' : ''}`
+      // FORCED persist: the 800 ms throttle used to silently drop most of these
+      // (only 10 of 77 scene lines survived a real render).
+      log(
+        check.ok && offFrames === 0 ? 'info' : 'warn',
+        `Scene ${i + 1}/${segments.length}: movie ${movieClock(seg.movieStart)} → ${movieClock(seg.movieEnd)} (${dur.toFixed(3)}s, ${seg.frames}f) [short ${fmtShortTs(seg.shortStart)}] origin=${originLabel(seg.origin, seg.originWindow)}${flags} encoded in ${secs.toFixed(1)}s (${(dur / Math.max(0.1, secs)).toFixed(1)}x)${offFrames === 0 ? '' : ` — off by ${offFrames} frame(s) (${(check.diff * 1000).toFixed(0)} ms, actual ${check.actual.toFixed(3)}s)`}`,
       )
     })
     if (token.cancelled) throw new FfmpegCancelled()

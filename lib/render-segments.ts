@@ -1,10 +1,17 @@
-import type { Scan } from './types'
+import type { MatchOrigin, Scan } from './types'
 
 export interface RenderSegment {
   movieStart: number
   movieEnd: number
   shortStart: number
   shortEnd: number
+  /** provenance of the match this scene came from (first match of a merged run) */
+  origin?: MatchOrigin
+  originWindow?: number
+  /** REJECTED — KEPT: the verifier said DIFFERENT but the clip stays in the merge */
+  rejected?: boolean
+  /** the AI never managed to verify this window */
+  unverified?: boolean
 }
 
 /** Single source of truth for both instant preview and exported scene order.
@@ -58,11 +65,59 @@ export function buildRenderSegments(scan: Pick<Scan, 'matches'>): RenderSegment[
       }
     }
 
-    segments.push({ movieStart, movieEnd, shortStart, shortEnd })
+    segments.push({
+      movieStart,
+      movieEnd,
+      shortStart,
+      shortEnd,
+      origin: match.origin ?? 'chunk',
+      originWindow: match.originWindow,
+      rejected: match.rejected === true && match.userPick !== true ? true : undefined,
+      unverified: match.verified !== true && match.rejected !== true ? true : undefined,
+    })
   }
   return segments
 }
 
 export function totalStitchedSeconds(segments: RenderSegment[]): number {
   return segments.reduce((total, segment) => total + Math.max(0, segment.movieEnd - segment.movieStart), 0)
+}
+
+// ---------------------------------------------------------------------------
+// FRAME GRID SNAPPING
+//
+// Gemini reports millisecond timestamps, so a scene duration like 1.167 s is
+// 28.008 frames at 24 fps — ffmpeg's `fps=` filter emits the 29th frame and the
+// part runs +41 ms long. Over 77 scenes that stacked up to +1.78 s of drift on
+// a 2-minute render. Every scene is therefore snapped to the output frame grid
+// BEFORE encoding: an integer frame count is what gets encoded (`-frames:v`)
+// and what the expected total is computed from, so expected == actual.
+// ---------------------------------------------------------------------------
+
+export interface SnappedSegment extends RenderSegment {
+  /** exact number of output frames this scene contributes */
+  frames: number
+  /** frames / fps — the encoded duration, to the sample */
+  snapDur: number
+}
+
+/** Snap one duration to the frame grid (at least one frame). */
+export function snapFrames(dur: number, fps: number): { frames: number; snapDur: number } {
+  const frames = Math.max(1, Math.round(Math.max(0, dur) * fps))
+  return { frames, snapDur: frames / fps }
+}
+
+/** Snap every scene's START and DURATION to the output frame grid so seams
+ *  cannot shift and the total is an exact frame count. */
+export function snapSegments(segments: RenderSegment[], fps: number): SnappedSegment[] {
+  return segments.map((seg) => {
+    const movieStart = Math.max(0, Math.round(seg.movieStart * fps) / fps)
+    const { frames, snapDur } = snapFrames(seg.movieEnd - seg.movieStart, fps)
+    return { ...seg, movieStart, movieEnd: movieStart + snapDur, frames, snapDur }
+  })
+}
+
+/** Exact output length of a snapped scene list (sum of frame counts / fps). */
+export function totalSnappedSeconds(segments: SnappedSegment[], fps: number): number {
+  return segments.reduce((total, seg) => total + seg.frames, 0) / fps
 }
