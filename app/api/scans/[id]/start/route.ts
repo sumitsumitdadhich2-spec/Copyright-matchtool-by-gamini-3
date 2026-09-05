@@ -4,6 +4,7 @@ import { enqueueBackgroundScan } from '@/lib/background-queue'
 import { getAllUserApiKeys } from '@/lib/user-keys'
 import { deductTokens, refundTokens, SCAN_TOKEN_COST } from '@/lib/tokens'
 import { isMinuteFinderRunning, stopAndWaitMinuteFinder } from '@/lib/gemini-minute-finder'
+import { getScan } from '@/lib/store'
 
 export const runtime = 'nodejs'
 
@@ -12,6 +13,10 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
   const { id } = await ctx.params
+  const scan = getScan(id)
+  if (!scan || (session.role !== 'admin' && scan.ownerUsername !== session.username)) {
+    return NextResponse.json({ error: 'Not found' }, { status: 404 })
+  }
   let resume = false
   try {
     const body = (await req.json()) as { resume?: boolean }

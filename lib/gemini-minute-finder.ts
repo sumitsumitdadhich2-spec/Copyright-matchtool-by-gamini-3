@@ -390,7 +390,7 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
     log(
       id,
       'success',
-      `Movie copy ready: ${fmtDur(info.durationSec)}, ${fmtMB(info.sizeBytes)} (${info.reencoded ? 're-encoded 480p' : 'stream copy, original quality'})`,
+      `Movie copy ready: ${fmtDur(info.durationSec)}, ${fmtMB(info.sizeBytes)} (${info.reencoded ? 're-encoded 480p' : 'direct reuse, original quality'})`,
     )
   }
   if (ctrl.stopping) return

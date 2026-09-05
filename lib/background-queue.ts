@@ -20,15 +20,19 @@ function isQueued(scan: Scan) {
 }
 
 function ownerScans(username: string) {
-  return listScans().filter((summary) => getScan(summary.id)?.ownerUsername === username && isQueued(getScan(summary.id)!))
+  return listScans()
+    .map((summary) => getScan(summary.id))
+    .filter((scan): scan is Scan => scan !== null && scan.ownerUsername === username && isQueued(scan))
 }
 
 function setState(scan: Scan, state: QueueState, error?: string) {
+  const previous = scan.background || { enqueuedAt: Date.now(), state }
   scan.background = {
-    ...(scan.background || { enqueuedAt: Date.now() }),
+    ...previous,
     state,
     error: error || null,
-    ...(state === 'running' ? { startedAt: Date.now() } : {}),
+    position: state === 'queued' ? previous.position : undefined,
+    startedAt: state === 'running' ? Date.now() : previous.startedAt,
   }
   saveScan(scan)
 }
@@ -85,11 +89,19 @@ async function pump() {
   try {
     while (activeWorkers.size < MAX_ACTIVE_BACKGROUND_WORKERS) {
       refreshPositions()
+      const activeByOwner = new Map<string, number>()
+      for (const activeId of activeWorkers) {
+        const owner = getScan(activeId)?.ownerUsername
+        if (owner) activeByOwner.set(owner, (activeByOwner.get(owner) || 0) + 1)
+      }
       const candidates = listScans()
         .map((summary) => getScan(summary.id))
-        .filter((scan): scan is Scan => scan !== null && scan.background?.state === 'queued')
-        .sort((a, b) => (a.background?.enqueuedAt || 0) - (b.background?.enqueuedAt || 0))
-      const next = candidates.find((scan) => !activeWorkers.has(scan.id))
+        .filter((scan): scan is Scan => scan !== null && scan.background?.state === 'queued' && !activeWorkers.has(scan.id))
+        .sort((a, b) => {
+          const activeDifference = (activeByOwner.get(a.ownerUsername || '') || 0) - (activeByOwner.get(b.ownerUsername || '') || 0)
+          return activeDifference || (a.background?.enqueuedAt || 0) - (b.background?.enqueuedAt || 0)
+        })
+      const next = candidates[0]
       if (!next) break
       void runWorker(next.id).finally(() => void pump())
     }
@@ -138,7 +150,7 @@ export async function enqueueBackgroundScan(scanId: string, username: string, re
 
 export async function stopBackgroundScan(scanId: string) {
   const scan = getScan(scanId)
-  if (!scan?.background) return false
+  if (scan?.background?.state !== 'queued') return false
   if (activeWorkers.has(scanId)) return false
   scan.background = { ...scan.background, state: 'stopped', error: null, position: undefined }
   saveScan(scan)

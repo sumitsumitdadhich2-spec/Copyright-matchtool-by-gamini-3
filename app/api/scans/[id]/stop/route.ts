@@ -11,7 +11,7 @@ export async function POST(_req: Request, ctx: { params: Promise<{ id: string }>
   if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   const { id } = await ctx.params
   const scan = getScan(id)
-  if (!scan || (scan.ownerUsername && scan.ownerUsername !== session.username && session.role !== 'admin')) {
+  if (!scan || (session.role !== 'admin' && scan.ownerUsername !== session.username)) {
     return NextResponse.json({ error: 'Not found' }, { status: 404 })
   }
   if (scheduler.isRunning(id)) {

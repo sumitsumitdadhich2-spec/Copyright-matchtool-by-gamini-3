@@ -36,7 +36,7 @@ import { placeWork, removeStageWork } from './work-dir'
 //   * every output is verified with ffprobe: duration ≈ expected (±1 frame)
 // ---------------------------------------------------------------------------
 
-/** Every file sent to Gemini is hard-encoded at 24 fps (Gemini's default video rate). */
+/** Every generated scan copy is encoded at 24 fps; compatible full MP4 sources can bypass encoding. */
 const SCAN_FPS = 24
 const SCAN_FPS_STR = String(SCAN_FPS)
 
@@ -120,6 +120,7 @@ export async function probeResolution(file: string): Promise<{ width: number; he
 
 interface PrescanMediaProfile {
   format: string
+  majorBrand?: string
   videoCodec: string
   audioCodec?: string
   width: number
@@ -132,10 +133,10 @@ interface PrescanMediaProfile {
 async function probePrescanMedia(file: string): Promise<PrescanMediaProfile | null> {
   try {
     const out = await runFfprobe([
-      '-v', 'error', '-show_entries', 'format=format_name:stream=index,codec_type,codec_name,width,height,pix_fmt,avg_frame_rate',
+      '-v', 'error', '-show_entries', 'format=format_name:format_tags=major_brand:stream=index,codec_type,codec_name,width,height,pix_fmt,avg_frame_rate',
       '-of', 'json', file,
     ])
-    const parsed = JSON.parse(out) as { format?: { format_name?: string }; streams?: Array<Record<string, unknown>> }
+    const parsed = JSON.parse(out) as { format?: { format_name?: string; tags?: { major_brand?: string } }; streams?: Array<Record<string, unknown>> }
     const video = parsed.streams?.find((stream) => stream.codec_type === 'video')
     if (!video || typeof video.codec_name !== 'string' || typeof video.width !== 'number' || typeof video.height !== 'number') return null
     const audio = parsed.streams?.find((stream) => stream.codec_type === 'audio')
@@ -143,7 +144,8 @@ async function probePrescanMedia(file: string): Promise<PrescanMediaProfile | nu
     const [n, d] = rate.split('/').map(Number)
     const fps = d ? n / d : n
     return {
-      format: String(parsed.format?.format_name || '').split(',')[0],
+      format: String(parsed.format?.format_name || ''),
+      majorBrand: parsed.format?.tags?.major_brand?.trim().toLowerCase(),
       videoCodec: video.codec_name,
       audioCodec: typeof audio?.codec_name === 'string' ? audio.codec_name : undefined,
       width: video.width,
@@ -692,8 +694,8 @@ export const PRESCAN_MAX_BYTES = 1.9 * 1024 * 1024 * 1024
 
 /**
  * Build the UPLOAD COPY of the movie for the Gemini Minute Finder. A full-range
- * MP4/MOV that is already in a Gemini-friendly codec and under 1.9 GB is copied
- * directly; partial trims and incompatible/oversized sources use a precise 480p
+ * MP4 (not QuickTime MOV) already in a Gemini-friendly codec and under 1.9 GB
+ * is linked/copied directly; trims and incompatible/oversized sources use a precise 480p
  * / 24 fps / CRF 30 encode. If that result is still > 1.9 GB, the SAME parts
  * are re-joined at 360p / CRF 32 — no second cut.
  */
@@ -714,17 +716,24 @@ export async function preparePrescanMovieCopy(
   const sourceProfile = await probePrescanMedia(movieFile)
   const fullRange = trimStart <= 0.05 && Math.abs(rangeEnd - movieDuration) <= 0.05
   const directUploadSafe = sourceSize <= PRESCAN_MAX_BYTES && fullRange && sourceProfile &&
-    ['mp4', 'mov'].includes(sourceProfile.format) &&
+    sourceProfile.format.split(',').includes('mov') && sourceProfile.majorBrand !== undefined && sourceProfile.majorBrand !== 'qt' &&
     ['h264', 'hevc', 'vp9', 'av1'].includes(sourceProfile.videoCodec) &&
     (!sourceProfile.audioCodec || ['aac', 'mp3', 'opus', 'vorbis', 'ac3', 'eac3'].includes(sourceProfile.audioCodec)) &&
     sourceProfile.fps > 0 && sourceProfile.fps <= 60
 
   if (sourceProfile && directUploadSafe) {
-    fs.mkdirSync(path.dirname(outFile), { recursive: true })
+    await fs.promises.mkdir(path.dirname(outFile), { recursive: true })
+    await fs.promises.rm(outFile, { force: true })
     onProgress(0, 'Source already Gemini-compatible — skipping re-encode')
-    fs.copyFileSync(movieFile, outFile)
-    opts.onLog?.(`ffmpeg: prescan source compatible (${sourceProfile.videoCodec}/${sourceProfile.audioCodec || 'no audio'}, ${sourceProfile.width}x${sourceProfile.height}, ${sourceProfile.fps.toFixed(2)} fps) — direct copy`)
-    onProgress(100, 'Movie copy ready (direct copy)')
+    let reuseMode = 'hard link'
+    try {
+      await fs.promises.link(movieFile, outFile)
+    } catch {
+      reuseMode = 'async copy'
+      await fs.promises.copyFile(movieFile, outFile)
+    }
+    opts.onLog?.(`ffmpeg: prescan source compatible (${sourceProfile.videoCodec}/${sourceProfile.audioCodec || 'no audio'}, ${sourceProfile.width}x${sourceProfile.height}, ${sourceProfile.fps.toFixed(2)} fps) — ${reuseMode}`)
+    onProgress(100, `Movie copy ready (${reuseMode})`)
     return { durationSec: await probeDuration(outFile), sizeBytes: sourceSize, reencoded: false }
   }
 
