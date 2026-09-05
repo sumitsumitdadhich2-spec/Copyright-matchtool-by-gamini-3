@@ -173,19 +173,18 @@ export function MinuteSelectPanel({ scan, running, refresh }: { scan: Scan; runn
     return r.custom ? { start: toHms(r.start), end: toHms(r.end) } : { start: '', end: '' }
   }
 
+  const selectionSignature = segs.map((s) => (s.selected === false ? '0' : '1')).join('')
+  const rangeSignature = segs.map((s) => `${s.movieRangeStart ?? ''}-${s.movieRangeEnd ?? ''}`).join('|')
+
   // Sync local selection + ranges from the server state whenever the scan changes.
   useEffect(() => {
     setPicked(new Set(segs.filter((s) => s.selected !== false).map((s) => s.index)))
     const next: Record<number, RangeText> = {}
     for (const s of segs) next[s.index] = serverRangeText(s.index)
     setRanges(next)
+    // serverRangeText derives only from these stable scan/segment signatures.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    scan.id,
-    segs.length,
-    segs.map((s) => (s.selected === false ? '0' : '1')).join(''),
-    segs.map((s) => `${s.movieRangeStart ?? ''}-${s.movieRangeEnd ?? ''}`).join('|'),
-  ])
+  }, [scan.id, segs.length, selectionSignature, rangeSignature])
 
   if (segs.length <= 1) return null
 

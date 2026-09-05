@@ -41,9 +41,10 @@ import type {
 //
 //   [1] preparing  — ffmpeg upload-copy of the TRIMMED movie (≤ 1.9 GB)
 //   [2] uploading  — short + movie copy → Gemini Files API, ONCE PER API KEY
-//   [3] scanning   — fixed 20-minute windows; lanes = every key × the two
-//                    chunk models (gemini-3.6-flash / gemini-3.7-flash);
-//                    1 request / minute / lane (TPM 250K); shared window queue
+//   [3] scanning   — fixed 20-minute windows; lanes = every key × the three
+//                    chunk models (gemini-3.6-flash / gemini-3.7-flash /
+//                    gemini-3.8-flash); 1 request / minute / lane (TPM 250K);
+//                    shared window queue
 //   [3b] backup    — SECOND PASS: short parts that NO window matched (neither
 //                    MATCH nor POSSIBLE) are cut, concatenated (1 s black between
 //                    parts), uploaded per key and searched again in EVERY window
@@ -375,7 +376,7 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
     log(
       id,
       'info',
-      `Preparing movie upload copy: ${fmtDur(trimStart)} → ${fmtDur(trimEnd)} (${fmtDur(trimEnd - trimStart)}) — stream copy agar ≤1.9 GB, warna 480p re-encode`,
+      `Preparing movie upload copy: ${fmtDur(trimStart)} → ${fmtDur(trimEnd)} (${fmtDur(trimEnd - trimStart)}) — compatible full source ho to direct copy, warna precise 480p re-encode`,
     )
     let lastPct = -1
     const info = await preparePrescanMovieCopy(movieFile, copyPath, movieDuration, trimStart, trimEnd, (pct, note) => {
@@ -389,7 +390,7 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
     log(
       id,
       'success',
-      `Movie copy ready: ${fmtDur(info.durationSec)}, ${fmtMB(info.sizeBytes)} (${info.reencoded ? 're-encoded 480p' : 'stream copy, original quality'})`,
+      `Movie copy ready: ${fmtDur(info.durationSec)}, ${fmtMB(info.sizeBytes)} (${info.reencoded ? 're-encoded 480p' : 'direct reuse, original quality'})`,
     )
   }
   if (ctrl.stopping) return

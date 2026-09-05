@@ -11,6 +11,7 @@ const STATUS_CLS: Record<string, string> = {
   verifying: 'bg-primary/15 text-primary',
   stopped: 'bg-amber-500/15 text-amber-400',
   error: 'bg-destructive/15 text-destructive',
+  queued: 'bg-muted text-muted-foreground',
 }
 
 export function HistoryPanel({ activeId, onSelect, onNew }: { activeId: string | null; onSelect: (id: string) => void; onNew: () => void }) {
@@ -48,7 +49,7 @@ export function HistoryPanel({ activeId, onSelect, onNew }: { activeId: string |
                 <div className="flex items-center gap-2">
                   <span className="truncate font-medium">{s.movieName || 'Untitled scan'}</span>
                   <span className={`ml-auto shrink-0 rounded-full px-2 py-0.5 text-[10px] ${STATUS_CLS[s.status] || 'bg-muted text-muted-foreground'}`}>
-                    {s.status}
+                    {s.background?.state === 'queued' ? `queued${s.background.position ? ` #${s.background.position}` : ''}` : s.background?.state === 'running' ? 'background' : s.status}
                   </span>
                 </div>
                 <div className="mt-0.5 flex gap-2 text-muted-foreground">

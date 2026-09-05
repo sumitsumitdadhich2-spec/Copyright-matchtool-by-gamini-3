@@ -46,7 +46,7 @@ export function Dashboard() {
       const rendering = latest?.scan?.renderJob?.status === 'rendering'
       const segmenting =
         latest?.scan?.shortSegmentingProgress !== undefined && latest.scan.shortSegmentingProgress < 100
-      return st === 'scanning' || st === 'chunking' || latest?.running || rendering || segmenting ? 1500 : 5000
+      return st === 'scanning' || st === 'chunking' || latest?.running || latest?.scan?.background?.state === 'queued' || latest?.scan?.background?.state === 'running' || rendering || segmenting ? 1500 : 5000
     },
   })
 
@@ -55,12 +55,13 @@ export function Dashboard() {
   const minuteFinderMode: MinuteFinderMode = settings?.minuteFinder ?? 'gemini'
 
   const scan = data?.scan || null
-  const running = data?.running || false
+  const queued = scan?.background?.state === 'queued'
+  const running = data?.running || scan?.background?.state === 'running'
   const status = scan?.status
 
   // Scan is BLOCKED when a normal user's tokens are exhausted (admin is unlimited).
   const scanBlocked = user.role !== 'admin' && exhausted
-  const canStart = Boolean(scan && !running && status === 'ready' && scan.chunkCount > 0 && !scanBlocked)
+  const canStart = Boolean(scan && !running && !queued && status === 'ready' && scan.chunkCount > 0 && !scanBlocked)
   // Segments-aware: any incomplete minute (or any resumable chunk inside one) allows Resume.
   const hasResumableWork = Boolean(
     scan &&
@@ -73,7 +74,7 @@ export function Dashboard() {
         : scan.chunks.some((c) => c.status === 'pending' || c.status === 'scanning' || c.status === 'cancelled')),
   )
   const canResume = Boolean(
-    scan && !running && (status === 'stopped' || ((status === 'error' || status === 'scanning') && hasResumableWork)),
+    scan && !running && !queued && (status === 'stopped' || ((status === 'error' || status === 'scanning') && hasResumableWork)),
   )
   // Stop dab chuka hai lekin in-flight requests background me settle ho rahi hain —
   // partial results/export TURANT available hain, dobara Stop ki zaroorat nahi.
@@ -117,6 +118,12 @@ export function Dashboard() {
 
         <div className="ml-auto flex flex-wrap items-center gap-2">
           <TokenBadge tokens={tokens} />
+          {queued && (
+            <span className="flex items-center gap-1.5 rounded-full border border-border bg-muted px-3 py-1 text-xs font-medium text-muted-foreground">
+              <Loader2 className="size-3.5 animate-spin" aria-hidden />
+              Queued{scan?.background?.position ? ` · position ${scan.background.position}` : ''}
+            </span>
+          )}
           {(status === 'scanning' || status === 'verifying') && (
             <>
               <span className="pill-live flex items-center gap-1.5 rounded-full border border-primary/30 bg-primary/15 px-3 py-1 text-xs font-medium text-primary">

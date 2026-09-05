@@ -830,7 +830,7 @@ class Scheduler {
     for (let pass = 0; pass < MAX_PASSES; pass++) {
       job.earlyStopRevived = false
 
-      // PER-MINUTE CHUNK PASSES: within a minute the two dedicated CHUNK models
+      // PER-MINUTE CHUNK PASSES: within a minute the three dedicated CHUNK models
       // map chunks while the global verify workers check candidates in parallel.
       for (const seg of segments) {
         if (job.stopping) break
