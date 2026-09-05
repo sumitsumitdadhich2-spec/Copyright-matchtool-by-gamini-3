@@ -7,6 +7,7 @@ import type { Scan, RenderResolution } from '@/lib/types'
 import { fmtTime, fmtBytes } from '@/lib/format'
 import { buildRenderSegments, type RenderSegment } from '@/lib/render-segments'
 import { candidateOptionsFor, hasAlternatives } from '@/lib/candidate-pick'
+import { computeShortCoverage } from '@/lib/short-coverage'
 import { CandidateChooser } from './candidate-chooser'
 
 const RESOLUTIONS: { value: RenderResolution; label: string; defaultKbps: number }[] = [
@@ -25,6 +26,7 @@ export function RenderPanel({ scan }: { scan: Scan }) {
     () => segments.reduce((acc, s) => acc + Math.max(0, s.movieEnd - s.movieStart), 0),
     [segments],
   )
+  const coverage = useMemo(() => computeShortCoverage(scan), [scan])
 
   // ---- Render settings ----
   const [resolution, setResolution] = useState<RenderResolution>('1080p')
@@ -218,6 +220,10 @@ export function RenderPanel({ scan }: { scan: Scan }) {
         Sab matched movie scenes short ke order me ek video ki tarah — neeche instant preview (bina processing),
         aur real export ORIGINAL movie quality se ffmpeg ke saath.
       </p>
+      <div className="mt-2 rounded-md border border-border bg-background px-3 py-2 text-xs">
+        <span className="font-semibold">Expected vs rendered:</span> {coverage.coveredSec.toFixed(1)}s of {coverage.totalSec.toFixed(1)}s short coverage is represented by {segments.length} scene(s).
+        {coverage.gaps.length > 0 && <span className="text-warning"> Missing: {coverage.gaps.map((g) => `${fmtTime(g.start)}–${fmtTime(g.end)}`).join(', ')}</span>}
+      </div>
       {scan.status === 'stopped' && (
         <p className="mt-2 rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-warning">
           PARTIAL RESULTS — scan stop hua hai. Ab tak jitne matches mile hain (verified + unverified dono) unka

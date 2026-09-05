@@ -23,6 +23,7 @@ import { ReportPanel } from './report-panel'
 import { ComparePanel } from './compare-panel'
 import { RenderPanel } from './render-panel'
 import { HistoryPanel } from './history-panel'
+import { GapBackupPanel } from './gap-backup-panel'
 
 interface ScanResponse {
   scan: Scan
@@ -245,6 +246,7 @@ export function Dashboard() {
           <ModelBoard scan={scan} usage={data?.usage || null} />
           {scan && <CandidatesPanel scan={scan} />}
           {scan && scan.report && <ReportPanel scan={scan} />}
+          {scan && (scan.status === 'done' || scan.status === 'stopped') && <GapBackupPanel scan={scan} />}
           {scan && (scan.matches?.length ?? 0) > 0 && <ComparePanel scan={scan} />}
           {scan && (scan.status === 'done' || scan.status === 'stopped') && (scan.matches?.length ?? 0) > 0 && (
             <RenderPanel scan={scan} />
